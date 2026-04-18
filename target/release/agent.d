@@ -1,0 +1,1 @@
+/home/tcovert/src/agent_tools/target/release/agent: /home/tcovert/src/agent_tools/agent/src/db.rs /home/tcovert/src/agent_tools/agent/src/main.rs /home/tcovert/src/agent_tools/agent/src/memory.rs /home/tcovert/src/agent_tools/agent/src/metrics.rs /home/tcovert/src/agent_tools/agent/src/tasks.rs
