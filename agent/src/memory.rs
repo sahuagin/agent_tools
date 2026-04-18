@@ -490,13 +490,12 @@ fn migrate(conn: &Connection, args: MigrateArgs) -> Result<()> {
 
 fn parse_frontmatter(raw: &str) -> Option<(String, String, String, String)> {
     let raw = raw.trim_start();
-    if !raw.starts_with("---") {
-        return None;
-    }
-    let rest = raw.trim_start_matches('-').trim_start_matches('\n');
+    let rest = raw.strip_prefix("---")?.trim_start_matches('\n');
     let end = rest.find("\n---")?;
     let front = &rest[..end];
-    let body = rest[end..].trim_start_matches('\n').trim_start_matches('-').trim_start_matches('\n');
+    // skip "\n---" (4 bytes) then any trailing newline on the closing delimiter line
+    let after_close = rest[end + 4..].trim_start_matches('\n');
+    let body = after_close;
 
     let mut type_ = String::new();
     let mut name = String::new();

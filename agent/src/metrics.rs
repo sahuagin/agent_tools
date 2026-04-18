@@ -1,7 +1,7 @@
 use anyhow::Result;
 use chrono::Utc;
 use clap::{Args, Subcommand};
-use rusqlite::{params, Connection};
+use rusqlite::{params, types::ToSql, Connection};
 use uuid::Uuid;
 
 #[derive(Args)]
@@ -135,14 +135,18 @@ fn record_usage(conn: &Connection, args: RecordUsageArgs) -> Result<()> {
 fn report(conn: &Connection, args: ReportArgs) -> Result<()> {
     let cutoff = now() - (args.days as i64 * 86400);
 
-    let mut clauses = vec![format!("c.created_at >= {cutoff}")];
+    let mut clauses = vec!["c.created_at >= ?".to_string()];
+    let mut param_boxes: Vec<Box<dyn ToSql>> = vec![Box::new(cutoff)];
     if let Some(ref m) = args.model {
-        clauses.push(format!("c.model = '{m}'"));
+        clauses.push("c.model = ?".to_string());
+        param_boxes.push(Box::new(m.clone()));
     }
     if let Some(ref t) = args.task_type {
-        clauses.push(format!("c.task_type = '{t}'"));
+        clauses.push("c.task_type = ?".to_string());
+        param_boxes.push(Box::new(t.clone()));
     }
     let where_ = clauses.join(" AND ");
+    let params: Vec<&dyn ToSql> = param_boxes.iter().map(|b| b.as_ref()).collect();
 
     let sql = format!(
         "SELECT
@@ -166,7 +170,7 @@ fn report(conn: &Connection, args: ReportArgs) -> Result<()> {
     );
 
     let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map([], |r| {
+    let rows = stmt.query_map(params.as_slice(), |r| {
         Ok((
             r.get::<_, String>(0)?,
             r.get::<_, String>(1)?,
