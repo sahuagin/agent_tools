@@ -44,11 +44,23 @@ fn migrate(conn: &Connection) -> Result<()> {
         .unwrap_or(0);
 
     if version < 1 {
+        conn.execute_batch("BEGIN")?;
         conn.execute_batch(SCHEMA_V1)?;
         conn.execute(
             "INSERT INTO schema_version (version, applied) VALUES (1, ?)",
             [chrono::Utc::now().timestamp()],
         )?;
+        conn.execute_batch("COMMIT")?;
+    }
+
+    if version < 2 {
+        conn.execute_batch("BEGIN")?;
+        conn.execute_batch(SCHEMA_V2)?;
+        conn.execute(
+            "INSERT INTO schema_version (version, applied) VALUES (2, ?)",
+            [chrono::Utc::now().timestamp()],
+        )?;
+        conn.execute_batch("COMMIT")?;
     }
 
     Ok(())
@@ -131,4 +143,13 @@ CREATE TABLE usage_events (
     cost_usd      REAL NOT NULL DEFAULT 0.0,
     created_at    INTEGER NOT NULL
 );
+";
+
+const SCHEMA_V2: &str = "
+CREATE UNIQUE INDEX IF NOT EXISTS idx_schema_version_version ON schema_version(version);
+CREATE INDEX IF NOT EXISTS idx_memories_type_active_updated ON memories(type, is_active, updated_at);
+CREATE INDEX IF NOT EXISTS idx_tasks_updated_at ON tasks(updated_at);
+CREATE INDEX IF NOT EXISTS idx_tasks_status_updated ON tasks(status, updated_at);
+CREATE INDEX IF NOT EXISTS idx_completions_task_id ON completions(task_id);
+CREATE INDEX IF NOT EXISTS idx_usage_completion_id ON usage_events(completion_id);
 ";

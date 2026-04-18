@@ -190,23 +190,16 @@ fn update(conn: &Connection, args: UpdateArgs) -> Result<()> {
 }
 
 fn search(conn: &Connection, args: SearchArgs) -> Result<()> {
-    let type_clause = if let Some(ref t) = args.r#type {
-        format!("AND m.type = '{t}'")
-    } else {
-        String::new()
-    };
-
-    let sql = format!(
-        "SELECT m.id, m.type, m.name, m.description, m.content, m.tags, m.updated_at
+    let sql = "SELECT m.id, m.type, m.name, m.description, m.content, m.tags, m.updated_at
          FROM memories_fts fts
          JOIN memories m ON m.rowid = fts.rowid
-         WHERE memories_fts MATCH ?1 AND m.is_active = 1 {type_clause}
+         WHERE memories_fts MATCH ?1 AND m.is_active = 1
+           AND (?2 IS NULL OR m.type = ?2)
          ORDER BY rank
-         LIMIT ?2"
-    );
+         LIMIT ?3";
 
-    let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(params![args.query, args.limit as i64], |r| {
+    let mut stmt = conn.prepare(sql)?;
+    let rows = stmt.query_map(params![args.query, args.r#type, args.limit as i64], |r| {
         Ok((
             r.get::<_, String>(0)?,
             r.get::<_, String>(1)?,
@@ -234,18 +227,11 @@ fn search(conn: &Connection, args: SearchArgs) -> Result<()> {
 }
 
 fn recent(conn: &Connection, args: RecentArgs) -> Result<()> {
-    let type_clause = if let Some(ref t) = args.r#type {
-        format!("AND type = '{t}'")
-    } else {
-        String::new()
-    };
-    let sql = format!(
-        "SELECT id, type, name, description, updated_at FROM memories
-         WHERE is_active = 1 {type_clause}
-         ORDER BY updated_at DESC LIMIT ?1"
-    );
-    let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map([args.n as i64], |r| {
+    let sql = "SELECT id, type, name, description, updated_at FROM memories
+         WHERE is_active = 1 AND (?1 IS NULL OR type = ?1)
+         ORDER BY updated_at DESC LIMIT ?2";
+    let mut stmt = conn.prepare(sql)?;
+    let rows = stmt.query_map(params![args.r#type, args.n as i64], |r| {
         Ok((
             r.get::<_, String>(0)?,
             r.get::<_, String>(1)?,
@@ -265,23 +251,22 @@ fn recent(conn: &Connection, args: RecentArgs) -> Result<()> {
 }
 
 fn list(conn: &Connection, args: ListArgs) -> Result<()> {
-    let mut clauses = vec!["is_active = 1".to_string()];
-    if let Some(ref t) = args.r#type {
-        clauses.push(format!("type = '{t}'"));
-    }
-    if let Some(ref cwd) = args.cwd {
-        clauses.push(format!("cwd LIKE '%{cwd}%'"));
-    }
-    if let Some(ref tag) = args.tag {
-        clauses.push(format!("tags LIKE '%{tag}%'"));
-    }
-    let where_ = clauses.join(" AND ");
-    let sql = format!(
-        "SELECT id, type, name, description, tags, updated_at FROM memories
-         WHERE {where_} ORDER BY updated_at DESC LIMIT ?1"
-    );
-    let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map([args.limit as i64], |r| {
+    let cwd_pat = args.cwd.as_ref().map(|c| {
+        let e = c.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
+        format!("%{e}%")
+    });
+    let tag_pat = args.tag.as_ref().map(|t| {
+        let e = t.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
+        format!("%{e}%")
+    });
+    let sql = "SELECT id, type, name, description, tags, updated_at FROM memories
+         WHERE is_active = 1
+           AND (?1 IS NULL OR type = ?1)
+           AND (?2 IS NULL OR cwd LIKE ?2 ESCAPE '\\')
+           AND (?3 IS NULL OR tags LIKE ?3 ESCAPE '\\')
+         ORDER BY updated_at DESC LIMIT ?4";
+    let mut stmt = conn.prepare(sql)?;
+    let rows = stmt.query_map(params![args.r#type, cwd_pat, tag_pat, args.limit as i64], |r| {
         Ok((
             r.get::<_, String>(0)?,
             r.get::<_, String>(1)?,

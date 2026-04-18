@@ -98,6 +98,8 @@ fn create(conn: &Connection, args: CreateArgs) -> Result<()> {
 
 fn update(conn: &Connection, args: UpdateArgs) -> Result<()> {
     let ts = now();
+    conn.execute_batch("BEGIN")?;
+    let result = (|| {
 
     if let Some(ref status) = args.status {
         if !VALID_STATUSES.contains(&status.as_str()) {
@@ -133,6 +135,13 @@ fn update(conn: &Connection, args: UpdateArgs) -> Result<()> {
     }
 
     Ok(())
+    })();
+    if result.is_ok() {
+        conn.execute_batch("COMMIT")?;
+    } else {
+        conn.execute_batch("ROLLBACK")?;
+    }
+    result
 }
 
 fn list(conn: &Connection, args: ListArgs) -> Result<()> {
@@ -144,8 +153,9 @@ fn list(conn: &Connection, args: ListArgs) -> Result<()> {
         param_boxes.push(Box::new(s.clone()));
     }
     if let Some(ref cwd) = args.cwd {
-        clauses.push("cwd LIKE ?".to_string());
-        param_boxes.push(Box::new(format!("%{cwd}%")));
+        let escaped = cwd.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
+        clauses.push("cwd LIKE ? ESCAPE '\\'".to_string());
+        param_boxes.push(Box::new(format!("%{escaped}%")));
     }
     param_boxes.push(Box::new(args.limit as i64));
     let where_ = clauses.join(" AND ");

@@ -149,7 +149,14 @@ fn report(conn: &Connection, args: ReportArgs) -> Result<()> {
     let params: Vec<&dyn ToSql> = param_boxes.iter().map(|b| b.as_ref()).collect();
 
     let sql = format!(
-        "SELECT
+        "WITH u_agg AS (
+            SELECT completion_id,
+                   SUM(cost_usd)                        AS cost_usd,
+                   SUM(input_tokens + output_tokens)     AS total_tokens,
+                   SUM(cache_read)                       AS cache_read
+            FROM usage_events GROUP BY completion_id
+         )
+         SELECT
             c.model,
             c.provider,
             c.task_type,
@@ -158,12 +165,12 @@ fn report(conn: &Connection, args: ReportArgs) -> Result<()> {
             AVG(c.wall_ms) as avg_wall_ms,
             AVG(c.tool_calls) as avg_tools,
             SUM(u.cost_usd) as total_cost,
-            AVG(u.input_tokens + u.output_tokens) as avg_tokens,
-            AVG(CASE WHEN u.input_tokens + u.output_tokens > 0
-                THEN CAST(u.cache_read AS REAL) / (u.input_tokens + u.output_tokens)
+            AVG(u.total_tokens) as avg_tokens,
+            AVG(CASE WHEN u.total_tokens > 0
+                THEN CAST(u.cache_read AS REAL) / u.total_tokens
                 ELSE NULL END) as avg_cache_ratio
          FROM completions c
-         LEFT JOIN usage_events u ON u.completion_id = c.id
+         LEFT JOIN u_agg u ON u.completion_id = c.id
          WHERE {where_}
          GROUP BY c.model, c.provider, c.task_type
          ORDER BY total_cost DESC"
@@ -234,7 +241,8 @@ fn list(conn: &Connection, args: ListArgs) -> Result<()> {
         let ms_str = wall_ms.map(|v| format!("{v}ms")).unwrap_or_default();
         let cost_str = cost.map(|v| format!("${v:.4}")).unwrap_or_default();
         println!("[{id}] {ts}  {status:12} {model} ({task_type})  {ms_str}  {cost_str}");
-        println!("  {}", &objective[..objective.len().min(80)]);
+        let obj_short: String = objective.chars().take(80).collect();
+        println!("  {obj_short}");
     }
     Ok(())
 }
