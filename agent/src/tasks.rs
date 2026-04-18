@@ -1,7 +1,7 @@
 use anyhow::{bail, Result};
 use chrono::Utc;
 use clap::{Args, Subcommand};
-use rusqlite::{params, Connection};
+use rusqlite::{params, types::ToSql, Connection};
 use uuid::Uuid;
 
 #[derive(Args)]
@@ -113,17 +113,23 @@ fn update(conn: &Connection, args: UpdateArgs) -> Result<()> {
     }
 
     if let Some(ref result) = args.result {
-        conn.execute(
+        let n = conn.execute(
             "UPDATE tasks SET result=?1, updated_at=?2 WHERE id=?3",
             params![result, ts, args.id],
         )?;
+        if n == 0 {
+            bail!("no task with id={}", args.id);
+        }
     }
 
     if let Some(ref cid) = args.completion_id {
-        conn.execute(
+        let n = conn.execute(
             "UPDATE tasks SET completion_id=?1, updated_at=?2 WHERE id=?3",
             params![cid, ts, args.id],
         )?;
+        if n == 0 {
+            bail!("no task with id={}", args.id);
+        }
     }
 
     Ok(())
@@ -131,20 +137,25 @@ fn update(conn: &Connection, args: UpdateArgs) -> Result<()> {
 
 fn list(conn: &Connection, args: ListArgs) -> Result<()> {
     let cutoff = now() - (args.days as i64 * 86400);
-    let mut clauses = vec![format!("updated_at >= {cutoff}")];
+    let mut clauses = vec!["updated_at >= ?".to_string()];
+    let mut param_boxes: Vec<Box<dyn ToSql>> = vec![Box::new(cutoff)];
     if let Some(ref s) = args.status {
-        clauses.push(format!("status = '{s}'"));
+        clauses.push("status = ?".to_string());
+        param_boxes.push(Box::new(s.clone()));
     }
     if let Some(ref cwd) = args.cwd {
-        clauses.push(format!("cwd LIKE '%{cwd}%'"));
+        clauses.push("cwd LIKE ?".to_string());
+        param_boxes.push(Box::new(format!("%{cwd}%")));
     }
+    param_boxes.push(Box::new(args.limit as i64));
     let where_ = clauses.join(" AND ");
     let sql = format!(
         "SELECT id, status, task_type, objective, cwd, updated_at FROM tasks
-         WHERE {where_} ORDER BY updated_at DESC LIMIT ?1"
+         WHERE {where_} ORDER BY updated_at DESC LIMIT ?"
     );
+    let params: Vec<&dyn ToSql> = param_boxes.iter().map(|b| b.as_ref()).collect();
     let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map([args.limit as i64], |r| {
+    let rows = stmt.query_map(params.as_slice(), |r| {
         Ok((
             r.get::<_, String>(0)?,
             r.get::<_, String>(1)?,
