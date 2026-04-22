@@ -1,4 +1,5 @@
 mod db;
+mod embed;
 mod memory;
 mod metrics;
 mod tasks;

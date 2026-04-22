@@ -73,6 +73,16 @@ fn migrate(conn: &Connection) -> Result<()> {
         conn.execute_batch("COMMIT")?;
     }
 
+    if version < 4 {
+        conn.execute_batch("BEGIN")?;
+        conn.execute_batch(SCHEMA_V4)?;
+        conn.execute(
+            "INSERT INTO schema_version (version, applied) VALUES (4, ?)",
+            [chrono::Utc::now().timestamp()],
+        )?;
+        conn.execute_batch("COMMIT")?;
+    }
+
     Ok(())
 }
 
@@ -182,4 +192,17 @@ CREATE TABLE memory_context_log (
     returned    TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX idx_mcl_created ON memory_context_log(created_at DESC);
+";
+
+const SCHEMA_V4: &str = "
+CREATE TABLE memory_embeddings (
+    memory_id    TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+    model        TEXT NOT NULL,
+    dims         INTEGER NOT NULL,
+    content_hash TEXT NOT NULL,
+    embedded_at  INTEGER NOT NULL,
+    vector       BLOB NOT NULL,
+    PRIMARY KEY (memory_id, model)
+);
+CREATE INDEX idx_me_model ON memory_embeddings(model);
 ";

@@ -1,3 +1,4 @@
+use crate::embed;
 use anyhow::{bail, Result};
 use chrono::Utc;
 use clap::{Args, Subcommand};
@@ -30,6 +31,10 @@ pub enum MemoryAction {
     ContextStats(ContextStatsArgs),
     /// Rebuild the topic index for all active memories
     RebuildIndex,
+    /// Semantic recall via embedding similarity
+    Recall(RecallArgs),
+    /// (Re-)embed memories using the configured embedder
+    Reindex(ReindexArgs),
     /// Export all active memories as markdown
     Export,
     /// Import existing markdown memory files into the database
@@ -130,6 +135,31 @@ pub struct MigrateArgs {
     pub dry_run: bool,
 }
 
+#[derive(Args)]
+pub struct RecallArgs {
+    /// Free-form query — semantically nearest memories are returned
+    pub query: String,
+    /// Number of results to return
+    #[arg(long, default_value = "5")]
+    pub k: usize,
+    /// Restrict to a memory type (user/feedback/project/reference)
+    #[arg(long)]
+    pub r#type: Option<String>,
+    /// Also run the FTS5 lexical search for side-by-side comparison
+    #[arg(long)]
+    pub compare: bool,
+}
+
+#[derive(Args)]
+pub struct ReindexArgs {
+    /// Only embed memories that are missing an embedding for the active model
+    #[arg(long)]
+    pub missing: bool,
+    /// Batch size for embedding calls
+    #[arg(long, default_value = "16")]
+    pub batch: usize,
+}
+
 struct Memory {
     id: String,
     type_: String,
@@ -162,6 +192,8 @@ pub fn run(conn: Connection, cmd: MemoryCmd) -> Result<()> {
         MemoryAction::Context(args) => context(&conn, args),
         MemoryAction::ContextStats(args) => context_stats(&conn, args),
         MemoryAction::RebuildIndex => rebuild_full_index(&conn),
+        MemoryAction::Recall(args) => recall(&conn, args),
+        MemoryAction::Reindex(args) => reindex(&conn, args),
         MemoryAction::Export => export(&conn),
         MemoryAction::Migrate(args) => migrate(&conn, args),
     }
@@ -381,6 +413,8 @@ fn add(conn: &Connection, args: AddArgs) -> Result<()> {
         params![id, args.r#type, args.name, args.description, args.content, args.source, args.tags, args.cwd, ts],
     )?;
     rebuild_index_for(conn, &id)?;
+    let text = embed::memory_embed_text(&args.name, &args.description, &args.content);
+    embed::try_embed_one(conn, &id, &text);
     println!("{id}");
     Ok(())
 }
@@ -425,6 +459,20 @@ fn update(conn: &Connection, args: UpdateArgs) -> Result<()> {
     }
 
     rebuild_index_for(conn, &args.id)?;
+
+    // Re-embed from the post-update state
+    let row: Option<(String, String, String)> = conn
+        .query_row(
+            "SELECT name, description, content FROM memories WHERE id = ?1 AND is_active = 1",
+            params![args.id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .ok();
+    if let Some((name, desc, content)) = row {
+        let text = embed::memory_embed_text(&name, &desc, &content);
+        embed::try_embed_one(conn, &args.id, &text);
+    }
+
     Ok(())
 }
 
@@ -829,4 +877,153 @@ fn indent(s: &str, prefix: &str) -> String {
         .map(|l| format!("{prefix}{l}"))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+// ── Embedding-based recall ───────────────────────────────────────────────────
+
+fn recall(conn: &Connection, args: RecallArgs) -> Result<()> {
+    let embedder = embed::select_embedder();
+    let model = embedder.model_id().to_string();
+
+    let query_vec = embedder
+        .embed(&[args.query.clone()])?
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("embedder returned no vector"))?;
+
+    let sql = "SELECT m.id, m.type, m.name, m.description, m.updated_at, e.vector
+               FROM memory_embeddings e
+               JOIN memories m ON m.id = e.memory_id
+               WHERE m.is_active = 1 AND e.model = ?1
+                 AND (?2 IS NULL OR m.type = ?2)";
+    let mut stmt = conn.prepare(sql)?;
+    let rows = stmt.query_map(params![model, args.r#type], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+            r.get::<_, String>(3)?,
+            r.get::<_, i64>(4)?,
+            r.get::<_, Vec<u8>>(5)?,
+        ))
+    })?;
+
+    let mut scored: Vec<(String, String, String, String, i64, f32)> = Vec::new();
+    for row in rows {
+        let (id, type_, name, desc, updated_at, blob) = row?;
+        let v = embed::blob_to_f32(&blob);
+        let sim = embed::cosine(&query_vec, &v);
+        scored.push((id, type_, name, desc, updated_at, sim));
+    }
+
+    if scored.is_empty() {
+        eprintln!(
+            "no embeddings found for model '{model}'. Run `agent memory reindex` first."
+        );
+        return Ok(());
+    }
+
+    scored.sort_by(|a, b| b.5.partial_cmp(&a.5).unwrap_or(std::cmp::Ordering::Equal));
+    scored.truncate(args.k);
+
+    println!("## Semantic recall (model: {})\n", model);
+    for (id, type_, name, desc, updated_at, sim) in &scored {
+        println!(
+            "[{sim:.3}] [{id}] ({type_}) {name} — {desc}  [{}]",
+            fmt_ts(*updated_at)
+        );
+    }
+
+    if args.compare {
+        println!("\n## FTS5 lexical comparison\n");
+        search(
+            conn,
+            SearchArgs {
+                query: args.query.clone(),
+                r#type: args.r#type.clone(),
+                limit: args.k,
+            },
+        )?;
+    }
+
+    Ok(())
+}
+
+fn reindex(conn: &Connection, args: ReindexArgs) -> Result<()> {
+    let embedder = embed::select_embedder();
+    let model = embedder.model_id().to_string();
+
+    let row_to_tuple = |r: &rusqlite::Row| -> rusqlite::Result<(String, String, String, String)> {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+            r.get::<_, String>(3)?,
+        ))
+    };
+
+    let rows: Vec<(String, String, String, String)> = if args.missing {
+        let mut stmt = conn.prepare(
+            "SELECT m.id, m.name, m.description, m.content
+             FROM memories m
+             LEFT JOIN memory_embeddings e
+               ON e.memory_id = m.id AND e.model = ?1
+             WHERE m.is_active = 1 AND e.memory_id IS NULL",
+        )?;
+        let out: rusqlite::Result<Vec<_>> =
+            stmt.query_map(params![model], row_to_tuple)?.collect();
+        out?
+    } else {
+        let mut stmt = conn.prepare(
+            "SELECT id, name, description, content
+             FROM memories
+             WHERE is_active = 1",
+        )?;
+        let out: rusqlite::Result<Vec<_>> = stmt.query_map([], row_to_tuple)?.collect();
+        out?
+    };
+
+    let total = rows.len();
+    if total == 0 {
+        eprintln!("nothing to embed (model={model})");
+        return Ok(());
+    }
+    eprintln!("embedding {total} memories with {model} (batch={})...", args.batch);
+
+    let batch = args.batch.max(1);
+    let mut done = 0usize;
+    let mut failed = 0usize;
+    for chunk in rows.chunks(batch) {
+        let texts: Vec<String> = chunk
+            .iter()
+            .map(|(_, n, d, c)| embed::memory_embed_text(n, d, c))
+            .collect();
+
+        let vectors = match embedder.embed(&texts) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("  batch failed: {e}");
+                failed += chunk.len();
+                continue;
+            }
+        };
+
+        let now_ts = now();
+        for ((id, name, desc, content), vec) in chunk.iter().zip(vectors.iter()) {
+            let text = embed::memory_embed_text(name, desc, content);
+            let hash = embed::content_hash(&text);
+            let blob = embed::f32_to_blob(vec);
+            conn.execute(
+                "INSERT OR REPLACE INTO memory_embeddings
+                 (memory_id, model, dims, content_hash, embedded_at, vector)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![id, &model, vec.len() as i64, hash, now_ts, blob],
+            )?;
+            done += 1;
+        }
+        eprintln!("  {done}/{total} done");
+    }
+
+    eprintln!("reindex complete: {done} embedded, {failed} failed");
+    Ok(())
 }
