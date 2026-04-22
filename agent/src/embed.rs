@@ -128,7 +128,23 @@ pub struct OpenRouterEmbedder {
 
 impl OpenRouterEmbedder {
     pub fn from_env() -> Option<Self> {
-        let api_key = std::env::var("OPENROUTER_API_KEY").ok()?;
+        // Fallback chain for the api key:
+        //   1. $OPENROUTER_API_KEY   — process env (fast path)
+        //   2. ~/.config/agent/config.toml [openrouter].api_key
+        //
+        // Why fallback: long-running parent processes (claude-code,
+        // pi, anything inheriting env from the user's shell) cache
+        // the env value at spawn. After a key rotation, the env in
+        // the running process stays stale even though config.toml
+        // is updated. Subprocess invocations of `agent memory ...`
+        // (and any embedding-using path) inherit the stale env →
+        // 401s on every embedding call. Reading config.toml as
+        // fallback lets the rotated key take effect immediately
+        // without restarting every consumer.
+        let api_key = std::env::var("OPENROUTER_API_KEY")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .or_else(read_openrouter_key_from_config_toml)?;
         let model = std::env::var("AGENT_EMBED_MODEL")
             .unwrap_or_else(|_| "baai/bge-large-en-v1.5".to_string());
         let dims: usize = std::env::var("AGENT_EMBED_DIMS")
@@ -139,6 +155,51 @@ impl OpenRouterEmbedder {
             .unwrap_or_else(|_| "https://openrouter.ai/api/v1".to_string());
         Some(Self { api_key, model, base_url, dims })
     }
+}
+
+/// Read `[openrouter].api_key` from `~/.config/agent/config.toml` as a
+/// fallback when the env var is missing or stale. Hand-rolled mini-parser
+/// so we don't add a `toml` crate dep just for one fallback path.
+///
+/// Returns `None` on any failure (file missing, key missing, permissions).
+fn read_openrouter_key_from_config_toml() -> Option<String> {
+    let home = std::env::var("HOME").ok()?;
+    let path = format!("{}/.config/agent/config.toml", home);
+    let content = std::fs::read_to_string(&path).ok()?;
+
+    let mut in_openrouter = false;
+    for raw in content.lines() {
+        let line = raw.trim();
+        if line.starts_with('#') || line.is_empty() {
+            continue;
+        }
+        if line.starts_with('[') && line.ends_with(']') {
+            in_openrouter = line == "[openrouter]";
+            continue;
+        }
+        if !in_openrouter {
+            continue;
+        }
+        // Match: api_key = "..." (or single-quoted; whitespace tolerant)
+        let (key, value) = match line.split_once('=') {
+            Some(p) => p,
+            None => continue,
+        };
+        if key.trim() != "api_key" {
+            continue;
+        }
+        // Strip an optional inline comment after the value (`val # comment`).
+        let value = value.split('#').next().unwrap_or("").trim();
+        // Strip surrounding quotes (either kind).
+        let stripped = value
+            .trim_start_matches(['"', '\''])
+            .trim_end_matches(['"', '\'']);
+        if stripped.is_empty() {
+            return None;
+        }
+        return Some(stripped.to_string());
+    }
+    None
 }
 
 #[derive(Serialize)]
@@ -162,6 +223,35 @@ impl Embedder for OpenRouterEmbedder {
         &self.model
     }
     fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        // Try with the configured key (env value, captured at construction).
+        match self.embed_with_key(texts, &self.api_key) {
+            Ok(v) => Ok(v),
+            Err(e) => {
+                // On HTTP 401 specifically, the env key is likely stale (long-
+                // running parent process cached an old value at spawn). Try
+                // exactly once more with the fresh value from
+                // ~/.config/agent/config.toml. If THAT also 401s the key is
+                // genuinely revoked — propagate the original error.
+                let msg = format!("{e}");
+                if msg.contains("HTTP 401") {
+                    if let Some(fallback) = read_openrouter_key_from_config_toml() {
+                        if fallback != self.api_key {
+                            eprintln!(
+                                "info: embedding got 401 with env key; \
+                                 retrying with config.toml fallback key"
+                            );
+                            return self.embed_with_key(texts, &fallback);
+                        }
+                    }
+                }
+                Err(e)
+            }
+        }
+    }
+}
+
+impl OpenRouterEmbedder {
+    fn embed_with_key(&self, texts: &[String], key: &str) -> Result<Vec<Vec<f32>>> {
         let url = format!("{}/embeddings", self.base_url);
         let body = EmbeddingRequest {
             model: &self.model,
@@ -170,7 +260,7 @@ impl Embedder for OpenRouterEmbedder {
         let json = serde_json::to_value(&body)?;
 
         let resp = match ureq::post(&url)
-            .set("Authorization", &format!("Bearer {}", self.api_key))
+            .set("Authorization", &format!("Bearer {}", key))
             .set("Content-Type", "application/json")
             .send_json(json)
         {
