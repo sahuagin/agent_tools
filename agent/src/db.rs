@@ -63,6 +63,16 @@ fn migrate(conn: &Connection) -> Result<()> {
         conn.execute_batch("COMMIT")?;
     }
 
+    if version < 3 {
+        conn.execute_batch("BEGIN")?;
+        conn.execute_batch(SCHEMA_V3)?;
+        conn.execute(
+            "INSERT INTO schema_version (version, applied) VALUES (3, ?)",
+            [chrono::Utc::now().timestamp()],
+        )?;
+        conn.execute_batch("COMMIT")?;
+    }
+
     Ok(())
 }
 
@@ -152,4 +162,24 @@ CREATE INDEX IF NOT EXISTS idx_tasks_updated_at ON tasks(updated_at);
 CREATE INDEX IF NOT EXISTS idx_tasks_status_updated ON tasks(status, updated_at);
 CREATE INDEX IF NOT EXISTS idx_completions_task_id ON completions(task_id);
 CREATE INDEX IF NOT EXISTS idx_usage_completion_id ON usage_events(completion_id);
+";
+
+const SCHEMA_V3: &str = "
+CREATE TABLE memory_topic_index (
+    term       TEXT NOT NULL,
+    memory_id  TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+    weight     REAL NOT NULL DEFAULT 1.0,
+    PRIMARY KEY (term, memory_id)
+);
+CREATE INDEX idx_mti_term ON memory_topic_index(term);
+
+CREATE TABLE memory_context_log (
+    id          INTEGER PRIMARY KEY,
+    created_at  INTEGER NOT NULL,
+    cwd         TEXT NOT NULL DEFAULT '',
+    signals     TEXT NOT NULL DEFAULT '',
+    n_scored    INTEGER NOT NULL DEFAULT 0,
+    returned    TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX idx_mcl_created ON memory_context_log(created_at DESC);
 ";

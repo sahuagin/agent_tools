@@ -1,7 +1,8 @@
 use anyhow::{bail, Result};
 use chrono::Utc;
 use clap::{Args, Subcommand};
-use rusqlite::{params, Connection};
+use rusqlite::{params, params_from_iter, types::Value, Connection};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use uuid::Uuid;
 
@@ -25,6 +26,10 @@ pub enum MemoryAction {
     List(ListArgs),
     /// Output relevant memories for session start (hook use)
     Context(ContextArgs),
+    /// Show recent context call log (for tuning)
+    ContextStats(ContextStatsArgs),
+    /// Rebuild the topic index for all active memories
+    RebuildIndex,
     /// Export all active memories as markdown
     Export,
     /// Import existing markdown memory files into the database
@@ -97,9 +102,22 @@ pub struct ListArgs {
 pub struct ContextArgs {
     #[arg(long, default_value = "")]
     pub cwd: String,
-    /// Limit per category
+    /// Extra space-separated signal terms to boost retrieval
+    #[arg(long, default_value = "")]
+    pub signals: String,
+    /// Limit per category (project/reference)
     #[arg(long, default_value = "5")]
     pub limit: usize,
+    /// Print scoring detail to stderr for tuning
+    #[arg(long)]
+    pub verbose: bool,
+}
+
+#[derive(Args)]
+pub struct ContextStatsArgs {
+    /// Number of recent context calls to show
+    #[arg(long, default_value = "10")]
+    pub n: usize,
 }
 
 #[derive(Args)]
@@ -142,10 +160,213 @@ pub fn run(conn: Connection, cmd: MemoryCmd) -> Result<()> {
         MemoryAction::Recent(args) => recent(&conn, args),
         MemoryAction::List(args) => list(&conn, args),
         MemoryAction::Context(args) => context(&conn, args),
+        MemoryAction::ContextStats(args) => context_stats(&conn, args),
+        MemoryAction::RebuildIndex => rebuild_full_index(&conn),
         MemoryAction::Export => export(&conn),
         MemoryAction::Migrate(args) => migrate(&conn, args),
     }
 }
+
+// ── Tokenizer ────────────────────────────────────────────────────────────────
+
+const STOPWORDS: &[&str] = &[
+    "the", "and", "for", "with", "from", "that", "this", "have", "been",
+    "were", "they", "their", "what", "when", "where", "which", "will",
+    "your", "about", "into", "through", "before", "after", "above", "below",
+    "between", "each", "more", "also", "than", "then", "some", "other",
+    "such", "only", "same", "both", "over", "here", "there", "just", "used",
+    "using", "use", "via", "per", "can", "has", "not", "all", "but", "are",
+    "was", "its", "our", "you", "her", "him", "his", "she", "they", "who",
+    "src", "home", "tcovert",
+];
+
+fn tokenize(text: &str) -> Vec<String> {
+    text.split(|c: char| !c.is_alphanumeric())
+        .filter(|w| w.len() >= 2)
+        .map(|w| w.to_lowercase())
+        .filter(|w| !STOPWORDS.contains(&w.as_str()))
+        .collect()
+}
+
+fn signals_from_cwd(cwd: &str) -> Vec<String> {
+    // Extract terms from the last two path components so
+    // e.g. /home/tcovert/src/pi-claude-poc → ["pi", "claude", "poc", "src"]
+    let parts: Vec<&str> = cwd.trim_end_matches('/').split('/').collect();
+    let tail = parts.iter().rev().take(2).copied().collect::<Vec<_>>().join("-");
+    tokenize(&tail)
+}
+
+// ── Topic index ───────────────────────────────────────────────────────────────
+
+fn rebuild_index_for(conn: &Connection, memory_id: &str) -> Result<()> {
+    conn.execute(
+        "DELETE FROM memory_topic_index WHERE memory_id = ?1",
+        params![memory_id],
+    )?;
+
+    let m: Option<Memory> = {
+        let mut stmt = conn.prepare(
+            "SELECT id, type, name, description, content, source, tags, cwd,
+                    is_active, created_at, updated_at
+             FROM memories WHERE id = ?1 AND is_active = 1",
+        )?;
+        let mut rows = stmt.query_map(params![memory_id], row_to_memory)?;
+        rows.next().transpose()?
+    };
+
+    let m = match m {
+        Some(m) => m,
+        None => return Ok(()), // inactive or gone — index entries already deleted
+    };
+
+    let mut term_weights: HashMap<String, f64> = HashMap::new();
+
+    for t in tokenize(&m.tags) {
+        *term_weights.entry(t).or_default() += 3.0;
+    }
+    for t in tokenize(&m.name) {
+        *term_weights.entry(t).or_default() += 2.0;
+    }
+    for t in tokenize(&m.description) {
+        *term_weights.entry(t).or_default() += 1.5;
+    }
+    let preview: String = m.content.chars().take(300).collect();
+    for t in tokenize(&preview) {
+        *term_weights.entry(t).or_default() += 1.0;
+    }
+    if !m.cwd.is_empty() {
+        for t in signals_from_cwd(&m.cwd) {
+            *term_weights.entry(t).or_default() += 2.0;
+        }
+    }
+
+    for (term, weight) in term_weights {
+        conn.execute(
+            "INSERT OR REPLACE INTO memory_topic_index (term, memory_id, weight)
+             VALUES (?1, ?2, ?3)",
+            params![term, memory_id, weight],
+        )?;
+    }
+
+    Ok(())
+}
+
+fn rebuild_full_index(conn: &Connection) -> Result<()> {
+    conn.execute_batch("DELETE FROM memory_topic_index")?;
+    let ids: Vec<String> = {
+        let mut stmt = conn.prepare("SELECT id FROM memories WHERE is_active = 1")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    let n = ids.len();
+    for id in &ids {
+        rebuild_index_for(conn, id)?;
+    }
+    eprintln!("rebuilt index: {n} memories");
+    Ok(())
+}
+
+// ── Scored retrieval ──────────────────────────────────────────────────────────
+
+fn score_context_memories(
+    conn: &Connection,
+    signal_terms: &[String],
+    type_: &str,
+    limit: usize,
+) -> Result<Vec<(Memory, f64)>> {
+    let now_ts = now();
+
+    if signal_terms.is_empty() {
+        // No signals — fall back to pure recency
+        let memories = query_by_type(conn, type_, limit)?;
+        return Ok(memories
+            .into_iter()
+            .map(|m| {
+                let days = ((now_ts - m.updated_at) as f64 / 86400.0).max(0.0);
+                let score = 1.0 / (1.0 + days.ln_1p());
+                (m, score)
+            })
+            .collect());
+    }
+
+    // Build: ?1=type, ?2=fetch_limit, ?3..=terms
+    let placeholders = (3..=signal_terms.len() + 2)
+        .map(|i| format!("?{i}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let sql = format!(
+        "SELECT m.id, m.type, m.name, m.description, m.content, m.source,
+                m.tags, m.cwd, m.is_active, m.created_at, m.updated_at,
+                SUM(mti.weight) AS raw_score
+         FROM memories m
+         JOIN memory_topic_index mti ON mti.memory_id = m.id
+         WHERE m.type = ?1 AND m.is_active = 1
+           AND mti.term IN ({placeholders})
+         GROUP BY m.id
+         ORDER BY raw_score DESC
+         LIMIT ?2"
+    );
+
+    let mut dyn_params: Vec<Value> = vec![
+        Value::Text(type_.to_string()),
+        Value::Integer((limit * 4) as i64), // fetch extra, re-rank after decay
+    ];
+    for t in signal_terms {
+        dyn_params.push(Value::Text(t.clone()));
+    }
+
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params_from_iter(dyn_params.iter()), |r| {
+        Ok((row_to_memory(r)?, r.get::<_, f64>(11)?))
+    })?;
+
+    let mut scored: Vec<(Memory, f64)> = rows
+        .map(|r| {
+            let (m, raw) = r?;
+            let days = ((now_ts - m.updated_at) as f64 / 86400.0).max(0.0);
+            let recency = 1.0 / (1.0 + days.ln_1p());
+            Ok((m, raw * recency))
+        })
+        .collect::<Result<_>>()?;
+
+    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    scored.truncate(limit);
+    Ok(scored)
+}
+
+// ── Context log ───────────────────────────────────────────────────────────────
+
+fn log_context_call(
+    conn: &Connection,
+    cwd: &str,
+    signals: &[String],
+    n_scored: usize,
+    returned: &[(String, String, f64)], // (id, name, score)
+) -> Result<()> {
+    let returned_json = serde_json::to_string(
+        &returned
+            .iter()
+            .map(|(id, name, score)| {
+                serde_json::json!({"id": id, "name": name, "score": score})
+            })
+            .collect::<Vec<_>>(),
+    )?;
+    conn.execute(
+        "INSERT INTO memory_context_log (created_at, cwd, signals, n_scored, returned)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            now(),
+            cwd,
+            signals.join(" "),
+            n_scored as i64,
+            returned_json
+        ],
+    )?;
+    Ok(())
+}
+
+// ── CRUD ──────────────────────────────────────────────────────────────────────
 
 fn add(conn: &Connection, args: AddArgs) -> Result<()> {
     let valid_types = ["user", "feedback", "project", "reference"];
@@ -159,6 +380,7 @@ fn add(conn: &Connection, args: AddArgs) -> Result<()> {
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1, ?9, ?9)",
         params![id, args.r#type, args.name, args.description, args.content, args.source, args.tags, args.cwd, ts],
     )?;
+    rebuild_index_for(conn, &id)?;
     println!("{id}");
     Ok(())
 }
@@ -168,26 +390,45 @@ fn update(conn: &Connection, args: UpdateArgs) -> Result<()> {
     let mut updated = 0;
 
     if let Some(name) = args.name {
-        updated += conn.execute("UPDATE memories SET name=?1, updated_at=?2 WHERE id=?3", params![name, ts, args.id])?;
+        updated += conn.execute(
+            "UPDATE memories SET name=?1, updated_at=?2 WHERE id=?3",
+            params![name, ts, args.id],
+        )?;
     }
     if let Some(desc) = args.description {
-        updated += conn.execute("UPDATE memories SET description=?1, updated_at=?2 WHERE id=?3", params![desc, ts, args.id])?;
+        updated += conn.execute(
+            "UPDATE memories SET description=?1, updated_at=?2 WHERE id=?3",
+            params![desc, ts, args.id],
+        )?;
     }
     if let Some(content) = args.content {
-        updated += conn.execute("UPDATE memories SET content=?1, updated_at=?2 WHERE id=?3", params![content, ts, args.id])?;
+        updated += conn.execute(
+            "UPDATE memories SET content=?1, updated_at=?2 WHERE id=?3",
+            params![content, ts, args.id],
+        )?;
     }
     if let Some(tags) = args.tags {
-        updated += conn.execute("UPDATE memories SET tags=?1, updated_at=?2 WHERE id=?3", params![tags, ts, args.id])?;
+        updated += conn.execute(
+            "UPDATE memories SET tags=?1, updated_at=?2 WHERE id=?3",
+            params![tags, ts, args.id],
+        )?;
     }
     if let Some(active) = args.active {
-        updated += conn.execute("UPDATE memories SET is_active=?1, updated_at=?2 WHERE id=?3", params![active as i64, ts, args.id])?;
+        updated += conn.execute(
+            "UPDATE memories SET is_active=?1, updated_at=?2 WHERE id=?3",
+            params![active as i64, ts, args.id],
+        )?;
     }
 
     if updated == 0 {
         bail!("no memory found with id={}", args.id);
     }
+
+    rebuild_index_for(conn, &args.id)?;
     Ok(())
 }
+
+// ── Queries ───────────────────────────────────────────────────────────────────
 
 fn search(conn: &Connection, args: SearchArgs) -> Result<()> {
     let sql = "SELECT m.id, m.type, m.name, m.description, m.content, m.tags, m.updated_at
@@ -199,23 +440,24 @@ fn search(conn: &Connection, args: SearchArgs) -> Result<()> {
          LIMIT ?3";
 
     let mut stmt = conn.prepare(sql)?;
-    let rows = stmt.query_map(params![args.query, args.r#type, args.limit as i64], |r| {
-        Ok((
-            r.get::<_, String>(0)?,
-            r.get::<_, String>(1)?,
-            r.get::<_, String>(2)?,
-            r.get::<_, String>(3)?,
-            r.get::<_, String>(4)?,
-            r.get::<_, String>(5)?,
-            r.get::<_, i64>(6)?,
-        ))
-    })?;
+    let rows = stmt.query_map(
+        params![args.query, args.r#type, args.limit as i64],
+        |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, String>(5)?,
+                r.get::<_, i64>(6)?,
+            ))
+        },
+    )?;
 
     for row in rows {
         let (id, type_, name, desc, content, tags, updated_at) = row?;
-        let ts = chrono::DateTime::from_timestamp(updated_at, 0)
-            .map(|d| d.format("%Y-%m-%d").to_string())
-            .unwrap_or_default();
+        let ts = fmt_ts(updated_at);
         println!("[{id}] ({type_}) {name} — {desc}  [{ts}]");
         if !tags.is_empty() {
             println!("  tags: {tags}");
@@ -242,10 +484,7 @@ fn recent(conn: &Connection, args: RecentArgs) -> Result<()> {
     })?;
     for row in rows {
         let (id, type_, name, desc, updated_at) = row?;
-        let ts = chrono::DateTime::from_timestamp(updated_at, 0)
-            .map(|d| d.format("%Y-%m-%d").to_string())
-            .unwrap_or_default();
-        println!("[{id}] ({type_}) {name} — {desc}  [{ts}]");
+        println!("[{id}] ({type_}) {name} — {desc}  [{}]", fmt_ts(updated_at));
     }
     Ok(())
 }
@@ -266,40 +505,82 @@ fn list(conn: &Connection, args: ListArgs) -> Result<()> {
            AND (?3 IS NULL OR tags LIKE ?3 ESCAPE '\\')
          ORDER BY updated_at DESC LIMIT ?4";
     let mut stmt = conn.prepare(sql)?;
-    let rows = stmt.query_map(params![args.r#type, cwd_pat, tag_pat, args.limit as i64], |r| {
-        Ok((
-            r.get::<_, String>(0)?,
-            r.get::<_, String>(1)?,
-            r.get::<_, String>(2)?,
-            r.get::<_, String>(3)?,
-            r.get::<_, String>(4)?,
-            r.get::<_, i64>(5)?,
-        ))
-    })?;
+    let rows =
+        stmt.query_map(params![args.r#type, cwd_pat, tag_pat, args.limit as i64], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, i64>(5)?,
+            ))
+        })?;
     for row in rows {
         let (id, type_, name, desc, tags, updated_at) = row?;
-        let ts = chrono::DateTime::from_timestamp(updated_at, 0)
-            .map(|d| d.format("%Y-%m-%d").to_string())
-            .unwrap_or_default();
-        let tag_str = if tags.is_empty() { String::new() } else { format!("  [{}]", tags) };
-        println!("[{id}] ({type_}) {name}{tag_str} — {desc}  [{ts}]");
+        let tag_str = if tags.is_empty() {
+            String::new()
+        } else {
+            format!("  [{}]", tags)
+        };
+        println!("[{id}] ({type_}) {name}{tag_str} — {desc}  [{}]", fmt_ts(updated_at));
     }
     Ok(())
 }
 
-fn context(conn: &Connection, args: ContextArgs) -> Result<()> {
-    // feedback: always inject all active ones (they're behavioral rules)
-    let feedback = query_by_type(conn, "feedback", 20)?;
-    // user: always inject
-    let user = query_by_type(conn, "user", 5)?;
-    // project: recent ones relevant to cwd
-    let project = query_recent_by_type_cwd(conn, "project", &args.cwd, args.limit)?;
-    // reference: cwd-relevant
-    let reference = query_recent_by_type_cwd(conn, "reference", &args.cwd, 3)?;
+// ── Context ───────────────────────────────────────────────────────────────────
 
-    if feedback.is_empty() && user.is_empty() && project.is_empty() && reference.is_empty() {
+fn context(conn: &Connection, args: ContextArgs) -> Result<()> {
+    // Build signal term set
+    let mut signal_terms = signals_from_cwd(&args.cwd);
+    if !args.signals.is_empty() {
+        signal_terms.extend(tokenize(&args.signals));
+    }
+    signal_terms.sort();
+    signal_terms.dedup();
+
+    // feedback and user: always all-active, no scoring needed
+    let feedback = query_by_type(conn, "feedback", 20)?;
+    let user = query_by_type(conn, "user", 5)?;
+
+    // project and reference: topic-scored
+    let project_limit = args.limit.max(5);
+    let ref_limit = (args.limit / 2).max(3);
+
+    let scored_project = score_context_memories(conn, &signal_terms, "project", project_limit)?;
+    let scored_reference = score_context_memories(conn, &signal_terms, "reference", ref_limit)?;
+
+    if args.verbose {
+        eprintln!("[context] signals: {}", signal_terms.join(", "));
+        eprintln!("[context] project ({} returned):", scored_project.len());
+        for (m, s) in &scored_project {
+            eprintln!("  {:.2}  {} — {}", s, m.id, m.description);
+        }
+        eprintln!("[context] reference ({} returned):", scored_reference.len());
+        for (m, s) in &scored_reference {
+            eprintln!("  {:.2}  {} — {}", s, m.id, m.description);
+        }
+    }
+
+    if feedback.is_empty()
+        && user.is_empty()
+        && scored_project.is_empty()
+        && scored_reference.is_empty()
+    {
         return Ok(());
     }
+
+    // Log this call for tuning
+    let n_scored = scored_project.len() + scored_reference.len();
+    let mut returned_log: Vec<(String, String, f64)> = Vec::new();
+    for (m, s) in &scored_project {
+        returned_log.push((m.id.clone(), m.name.clone(), *s));
+    }
+    for (m, s) in &scored_reference {
+        returned_log.push((m.id.clone(), m.name.clone(), *s));
+    }
+    // Non-fatal — don't let a log write break context output
+    let _ = log_context_call(conn, &args.cwd, &signal_terms, n_scored, &returned_log);
 
     println!("## Active Memory Context\n");
 
@@ -318,17 +599,17 @@ fn context(conn: &Connection, args: ContextArgs) -> Result<()> {
         }
     }
 
-    if !project.is_empty() {
+    if !scored_project.is_empty() {
         println!("### Project Context\n");
-        for m in &project {
+        for (m, _) in &scored_project {
             println!("**{}**: {}", m.name, m.description);
             println!("{}\n", m.content);
         }
     }
 
-    if !reference.is_empty() {
+    if !scored_reference.is_empty() {
         println!("### References\n");
-        for m in &reference {
+        for (m, _) in &scored_reference {
             println!("**{}**: {}\n", m.name, m.content);
         }
     }
@@ -336,48 +617,48 @@ fn context(conn: &Connection, args: ContextArgs) -> Result<()> {
     Ok(())
 }
 
-fn query_by_type(conn: &Connection, type_: &str, limit: usize) -> Result<Vec<Memory>> {
+fn context_stats(conn: &Connection, args: ContextStatsArgs) -> Result<()> {
     let mut stmt = conn.prepare(
-        "SELECT id, type, name, description, content, source, tags, cwd, is_active, created_at, updated_at
-         FROM memories WHERE type = ?1 AND is_active = 1 ORDER BY updated_at DESC LIMIT ?2",
+        "SELECT id, created_at, cwd, signals, n_scored, returned
+         FROM memory_context_log
+         ORDER BY created_at DESC
+         LIMIT ?1",
     )?;
-    let mapped = stmt.query_map(params![type_, limit as i64], row_to_memory)?;
-    collect_memories(mapped)
+    let rows = stmt.query_map(params![args.n as i64], |r| {
+        Ok((
+            r.get::<_, i64>(0)?,
+            r.get::<_, i64>(1)?,
+            r.get::<_, String>(2)?,
+            r.get::<_, String>(3)?,
+            r.get::<_, i64>(4)?,
+            r.get::<_, String>(5)?,
+        ))
+    })?;
+
+    for row in rows {
+        let (id, created_at, cwd, signals, n_scored, returned_json) = row?;
+        let cwd_short = cwd.split('/').last().unwrap_or(&cwd).to_string();
+        println!(
+            "#{id}  {}  cwd={}  signals=[{}]  scored={}",
+            fmt_ts(created_at),
+            cwd_short,
+            signals,
+            n_scored
+        );
+
+        if let Ok(entries) = serde_json::from_str::<Vec<serde_json::Value>>(&returned_json) {
+            for e in &entries {
+                let name = e["name"].as_str().unwrap_or("?");
+                let score = e["score"].as_f64().unwrap_or(0.0);
+                println!("  {score:.2}  {name}");
+            }
+        }
+        println!();
+    }
+    Ok(())
 }
 
-fn query_recent_by_type_cwd(conn: &Connection, type_: &str, cwd: &str, limit: usize) -> Result<Vec<Memory>> {
-    let mut stmt = conn.prepare(
-        "SELECT id, type, name, description, content, source, tags, cwd, is_active, created_at, updated_at
-         FROM memories WHERE type = ?1 AND is_active = 1
-         ORDER BY (CASE WHEN cwd != '' AND ?2 LIKE '%' || cwd || '%' THEN 1 ELSE 2 END), updated_at DESC
-         LIMIT ?3",
-    )?;
-    let mapped = stmt.query_map(params![type_, cwd, limit as i64], row_to_memory)?;
-    collect_memories(mapped)
-}
-
-fn row_to_memory(r: &rusqlite::Row) -> rusqlite::Result<Memory> {
-    Ok(Memory {
-        id: r.get(0)?,
-        type_: r.get(1)?,
-        name: r.get(2)?,
-        description: r.get(3)?,
-        content: r.get(4)?,
-        source: r.get(5)?,
-        tags: r.get(6)?,
-        cwd: r.get(7)?,
-        is_active: r.get::<_, i64>(8)? != 0,
-        created_at: r.get(9)?,
-        updated_at: r.get(10)?,
-    })
-}
-
-fn collect_memories<I>(iter: I) -> Result<Vec<Memory>>
-where
-    I: Iterator<Item = rusqlite::Result<Memory>>,
-{
-    iter.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
-}
+// ── Export / migrate ──────────────────────────────────────────────────────────
 
 fn export(conn: &Connection) -> Result<()> {
     let mut stmt = conn.prepare(
@@ -459,6 +740,7 @@ fn migrate(conn: &Connection, args: MigrateArgs) -> Result<()> {
                      VALUES (?1, ?2, ?3, ?4, ?5, 'curated', '', '', 1, ?6, ?6)",
                     params![id, type_, name, description, content, ts],
                 )?;
+                rebuild_index_for(conn, id)?;
                 println!("imported: [{id}] ({type_}) {name}");
                 imported += 1;
             }
@@ -473,12 +755,51 @@ fn migrate(conn: &Connection, args: MigrateArgs) -> Result<()> {
     Ok(())
 }
 
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+fn query_by_type(conn: &Connection, type_: &str, limit: usize) -> Result<Vec<Memory>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, type, name, description, content, source, tags, cwd, is_active, created_at, updated_at
+         FROM memories WHERE type = ?1 AND is_active = 1 ORDER BY updated_at DESC LIMIT ?2",
+    )?;
+    let mapped = stmt.query_map(params![type_, limit as i64], row_to_memory)?;
+    collect_memories(mapped)
+}
+
+fn row_to_memory(r: &rusqlite::Row) -> rusqlite::Result<Memory> {
+    Ok(Memory {
+        id: r.get(0)?,
+        type_: r.get(1)?,
+        name: r.get(2)?,
+        description: r.get(3)?,
+        content: r.get(4)?,
+        source: r.get(5)?,
+        tags: r.get(6)?,
+        cwd: r.get(7)?,
+        is_active: r.get::<_, i64>(8)? != 0,
+        created_at: r.get(9)?,
+        updated_at: r.get(10)?,
+    })
+}
+
+fn collect_memories<I>(iter: I) -> Result<Vec<Memory>>
+where
+    I: Iterator<Item = rusqlite::Result<Memory>>,
+{
+    iter.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+}
+
+fn fmt_ts(ts: i64) -> String {
+    chrono::DateTime::from_timestamp(ts, 0)
+        .map(|d| d.format("%Y-%m-%d").to_string())
+        .unwrap_or_default()
+}
+
 fn parse_frontmatter(raw: &str) -> Option<(String, String, String, String)> {
     let raw = raw.trim_start();
     let rest = raw.strip_prefix("---")?.trim_start_matches('\n');
     let end = rest.find("\n---")?;
     let front = &rest[..end];
-    // skip "\n---" (4 bytes) then any trailing newline on the closing delimiter line
     let after_close = rest[end + 4..].trim_start_matches('\n');
     let body = after_close;
 
@@ -504,5 +825,8 @@ fn parse_frontmatter(raw: &str) -> Option<(String, String, String, String)> {
 }
 
 fn indent(s: &str, prefix: &str) -> String {
-    s.lines().map(|l| format!("{prefix}{l}")).collect::<Vec<_>>().join("\n")
+    s.lines()
+        .map(|l| format!("{prefix}{l}"))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
