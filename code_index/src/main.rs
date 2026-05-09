@@ -6,7 +6,7 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use code_index::embed::{embed_pending_concurrent, select_embedder};
-use code_index::ingest::ingest;
+use code_index::ingest::ingest_with;
 use code_index::recall::recall;
 use code_index::store::SqliteStore;
 
@@ -49,6 +49,11 @@ enum Command {
         /// the upstream's rate limit. Set to 1 to disable concurrency.
         #[arg(long, default_value_t = 8)]
         embed_concurrency: usize,
+        /// Skip the project's `.gitignore` / `.ignore` / `.git/info/exclude`
+        /// rules when walking. Useful when you want to index ignored paths
+        /// (e.g. a vendored dependency you do want searchable).
+        #[arg(long)]
+        no_gitignore: bool,
     },
     /// Semantic recall over indexed chunks. Returns ranked (id, score) pairs.
     Recall {
@@ -108,9 +113,10 @@ fn main() -> Result<()> {
             no_embed,
             embed_batch_size,
             embed_concurrency,
+            no_gitignore,
         } => {
             let mut store = open_store(cli.db.as_deref())?;
-            let stats = ingest(&path, &mut store, None)?;
+            let stats = ingest_with(&path, &mut store, None, !no_gitignore)?;
             let embedded = if no_embed {
                 0
             } else {

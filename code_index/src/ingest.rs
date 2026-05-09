@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 
 use crate::chunker::{fnv1a_64, Chunker, SupportedLanguage};
-use crate::walker::walk_sources;
+use crate::walker::walk_sources_with;
 use crate::{Chunk, ChunkId, Store};
 
 /// Outcome of an ingest run, surfaced for logging or programmatic use.
@@ -44,14 +44,24 @@ pub struct IngestStats {
 pub type EmbedCallback<'a> = dyn FnMut(ChunkId, &Chunk) -> Result<()> + 'a;
 
 /// Walk `root`, chunk per-file, persist to `store`. Calls `on_chunk` for
-/// each upserted chunk if provided.
+/// each upserted chunk if provided. Honors `.gitignore` etc. by default.
 pub fn ingest(
     root: &Path,
     store: &mut dyn Store,
     on_chunk: Option<&mut EmbedCallback<'_>>,
 ) -> Result<IngestStats> {
+    ingest_with(root, store, on_chunk, true)
+}
+
+/// Like `ingest`, but lets the caller disable VCS-ignore honoring.
+pub fn ingest_with(
+    root: &Path,
+    store: &mut dyn Store,
+    on_chunk: Option<&mut EmbedCallback<'_>>,
+    respect_gitignore: bool,
+) -> Result<IngestStats> {
     let mut stats = IngestStats::default();
-    let files = walk_sources(root)
+    let files = walk_sources_with(root, respect_gitignore)
         .with_context(|| format!("walking {}", root.display()))?;
     stats.files_walked = files.len();
 
