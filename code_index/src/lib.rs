@@ -13,7 +13,9 @@ use serde::{Deserialize, Serialize};
 
 pub mod chunker;
 pub mod graph;
+pub mod ingest;
 pub mod store;
+pub mod walker;
 
 // ──────────────────────────────────────────────────────────────────────────
 // Identity & enums

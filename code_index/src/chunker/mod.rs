@@ -21,7 +21,7 @@ use crate::{Chunk, ChunkId, ChunkKind};
 
 mod extract;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SupportedLanguage {
     Rust,
     Python,

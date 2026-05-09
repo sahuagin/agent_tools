@@ -5,6 +5,8 @@
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use code_index::ingest::ingest;
+use code_index::store::SqliteStore;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -74,12 +76,28 @@ enum AnalyzerOp {
     Set { name: String },
 }
 
+fn open_store(db: Option<&std::path::Path>) -> Result<SqliteStore> {
+    match db {
+        Some(p) => SqliteStore::open_at(p),
+        None => SqliteStore::open_default(),
+    }
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Ingest { path } => {
-            let _ = path;
-            todo!("ingest: walk + chunk + embed + persist")
+            let mut store = open_store(cli.db.as_deref())?;
+            let stats = ingest(&path, &mut store, None)?;
+            println!(
+                "{}: {} files walked, {} unchanged, {} re-chunked, {} chunks upserted",
+                path.display(),
+                stats.files_walked,
+                stats.files_unchanged,
+                stats.files_chunked,
+                stats.chunks_upserted,
+            );
+            Ok(())
         }
         Command::Recall { query, limit, full } => {
             let _ = (query, limit, full);
