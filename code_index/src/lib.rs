@@ -12,6 +12,7 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 pub mod graph;
+pub mod store;
 
 // ──────────────────────────────────────────────────────────────────────────
 // Identity & enums

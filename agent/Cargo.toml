@@ -2,6 +2,8 @@
 name = "agent"
 version = "0.1.0"
 edition = "2021"
+license = "BSD-3-Clause"
+repository = "https://github.com/sahuagin/agent_tools"
 
 [[bin]]
 name = "agent"
