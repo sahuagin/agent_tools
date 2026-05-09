@@ -139,13 +139,16 @@ fn chunk_kind_to_str(k: ChunkKind) -> &'static str {
     match k {
         ChunkKind::Function => "function",
         ChunkKind::Method => "method",
+        ChunkKind::Class => "class",
         ChunkKind::Struct => "struct",
         ChunkKind::Enum => "enum",
         ChunkKind::Trait => "trait",
         ChunkKind::Impl => "impl",
+        ChunkKind::Interface => "interface",
         ChunkKind::Type => "type",
         ChunkKind::Module => "module",
         ChunkKind::Constant => "constant",
+        ChunkKind::Macro => "macro",
         ChunkKind::Test => "test",
         ChunkKind::Other => "other",
     }
@@ -155,13 +158,16 @@ fn chunk_kind_from_str(s: &str) -> ChunkKind {
     match s {
         "function" => ChunkKind::Function,
         "method" => ChunkKind::Method,
+        "class" => ChunkKind::Class,
         "struct" => ChunkKind::Struct,
         "enum" => ChunkKind::Enum,
         "trait" => ChunkKind::Trait,
         "impl" => ChunkKind::Impl,
+        "interface" => ChunkKind::Interface,
         "type" => ChunkKind::Type,
         "module" => ChunkKind::Module,
         "constant" => ChunkKind::Constant,
+        "macro" => ChunkKind::Macro,
         "test" => ChunkKind::Test,
         _ => ChunkKind::Other,
     }

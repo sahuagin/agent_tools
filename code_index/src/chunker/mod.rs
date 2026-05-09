@@ -1,0 +1,355 @@
+//! AST-aware code chunker driven by vendored `tags.scm` queries.
+//!
+//! Each supported language has a tree-sitter grammar and a vendored
+//! `tags.scm` (under `queries/<lang>/tags.scm`) lifted from the upstream
+//! tree-sitter-* repo. The chunker compiles the query once per language
+//! at construction time and reuses it for each `extract` call.
+//!
+//! Tags-format convention (github-tree-sitter-tags / tree-sitter-cli):
+//!   `@name`            → name token of the definition (identifier)
+//!   `@definition.X`    → entire definition span; X ∈ {function, method,
+//!                          class, interface, module, constant, macro, ...}
+//!   `@reference.X`     → references; ignored at the chunker stage. Edge
+//!                          extraction is a later pass.
+
+use std::path::Path;
+
+use anyhow::{Context, Result};
+use tree_sitter::{Language, Parser, Query, QueryCursor};
+
+use crate::{Chunk, ChunkId, ChunkKind};
+
+mod extract;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SupportedLanguage {
+    Rust,
+    Python,
+}
+
+impl SupportedLanguage {
+    /// Map a file extension (without leading dot) to a supported language.
+    pub fn from_extension(ext: &str) -> Option<Self> {
+        match ext {
+            "rs" => Some(Self::Rust),
+            "py" | "pyi" => Some(Self::Python),
+            _ => None,
+        }
+    }
+
+    pub fn from_path(path: &Path) -> Option<Self> {
+        path.extension()
+            .and_then(|e| e.to_str())
+            .and_then(Self::from_extension)
+    }
+
+    pub fn ts_language(self) -> Language {
+        match self {
+            Self::Rust => tree_sitter_rust::LANGUAGE.into(),
+            Self::Python => tree_sitter_python::LANGUAGE.into(),
+        }
+    }
+
+    pub fn tags_scm(self) -> &'static str {
+        match self {
+            Self::Rust => include_str!("queries/rust/tags.scm"),
+            Self::Python => include_str!("queries/python/tags.scm"),
+        }
+    }
+}
+
+pub struct Chunker {
+    language: SupportedLanguage,
+    ts_language: Language,
+    query: Query,
+}
+
+impl Chunker {
+    pub fn for_language(language: SupportedLanguage) -> Result<Self> {
+        let ts_language = language.ts_language();
+        let query = Query::new(&ts_language, language.tags_scm())
+            .with_context(|| format!("compiling tags.scm for {language:?}"))?;
+        Ok(Self {
+            language,
+            ts_language,
+            query,
+        })
+    }
+
+    /// Construct a chunker by inferring the language from the file's
+    /// extension. Returns `None` if the extension isn't supported, which
+    /// callers should treat as "skip this file" rather than an error.
+    pub fn for_path(path: &Path) -> Option<Result<Self>> {
+        SupportedLanguage::from_path(path).map(Self::for_language)
+    }
+
+    pub fn language(&self) -> SupportedLanguage {
+        self.language
+    }
+
+    /// Parse `source` and emit a `Chunk` for each `@definition.X` match.
+    /// `Chunk.id` is set to `ChunkId(0)` — the caller assigns ids by
+    /// upserting into a `Store`.
+    pub fn extract(&self, source: &[u8], file: &Path) -> Result<Vec<Chunk>> {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&self.ts_language)
+            .context("Parser::set_language")?;
+        let tree = parser
+            .parse(source, None)
+            .context("tree-sitter failed to parse source")?;
+        let mut cursor = QueryCursor::new();
+        Ok(extract::collect_chunks(
+            &self.query,
+            &mut cursor,
+            tree.root_node(),
+            source,
+            file,
+        ))
+    }
+}
+
+/// FNV-1a 64-bit hash over arbitrary bytes. Used as the chunk content
+/// signature for staleness detection. Deterministic across processes
+/// (unlike SipHash with random keys), zero deps, ~5 lines.
+pub(crate) fn fnv1a_64(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in bytes {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
+/// Map a `@definition.X` tag suffix to a `ChunkKind`.
+///
+/// Upstream tags.scm conventions collapse some kinds (e.g. tree-sitter-rust
+/// tags structs/enums/unions/type-aliases all as `class`). We preserve the
+/// less-specific mapping at this stage; refinement based on parent node
+/// type is a future enhancement.
+pub(crate) fn chunk_kind_from_tag(tag: &str) -> ChunkKind {
+    match tag {
+        "function" => ChunkKind::Function,
+        "method" => ChunkKind::Method,
+        "class" => ChunkKind::Class,
+        "struct" => ChunkKind::Struct,
+        "enum" => ChunkKind::Enum,
+        "trait" => ChunkKind::Trait,
+        "impl" => ChunkKind::Impl,
+        "interface" => ChunkKind::Interface,
+        "type" => ChunkKind::Type,
+        "module" => ChunkKind::Module,
+        "constant" => ChunkKind::Constant,
+        "macro" => ChunkKind::Macro,
+        "test" => ChunkKind::Test,
+        _ => ChunkKind::Other,
+    }
+}
+
+/// Helper used by `extract::collect_chunks` to construct a `Chunk` once
+/// the name and definition spans have been paired from a query match.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_chunk(
+    file: &Path,
+    name: &str,
+    span_text: &str,
+    line_start: usize,
+    line_end: usize,
+    kind: ChunkKind,
+) -> Chunk {
+    Chunk {
+        id: ChunkId(0),
+        file: file.to_path_buf(),
+        // tree-sitter is 0-indexed; convert to 1-indexed lines for human
+        // and tooling friendliness (matches what most editors display).
+        lines: (line_start + 1)..(line_end + 1),
+        kind,
+        name: name.to_string(),
+        signature_hash: fnv1a_64(span_text.as_bytes()),
+        text: span_text.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn extension_dispatch_picks_correct_language() {
+        assert_eq!(
+            SupportedLanguage::from_extension("rs"),
+            Some(SupportedLanguage::Rust)
+        );
+        assert_eq!(
+            SupportedLanguage::from_extension("py"),
+            Some(SupportedLanguage::Python)
+        );
+        assert_eq!(
+            SupportedLanguage::from_extension("pyi"),
+            Some(SupportedLanguage::Python)
+        );
+        assert_eq!(SupportedLanguage::from_extension("md"), None);
+    }
+
+    #[test]
+    fn for_path_returns_none_for_unsupported_extension() {
+        assert!(Chunker::for_path(&PathBuf::from("README.md")).is_none());
+        assert!(Chunker::for_path(&PathBuf::from("data.json")).is_none());
+    }
+
+    #[test]
+    fn for_path_works_for_supported_extension() {
+        let r = Chunker::for_path(&PathBuf::from("src/lib.rs"))
+            .expect("rs is supported")
+            .expect("compiles");
+        assert_eq!(r.language(), SupportedLanguage::Rust);
+    }
+
+    #[test]
+    fn rust_extracts_struct_function_and_trait() {
+        let src = r#"
+pub struct FixedBuffer { data: Vec<u8> }
+
+pub fn make_buffer() -> FixedBuffer {
+    FixedBuffer { data: vec![] }
+}
+
+pub trait Readable {
+    fn read(&self) -> &[u8];
+}
+"#;
+        let chunker = Chunker::for_language(SupportedLanguage::Rust).expect("compile");
+        let chunks = chunker
+            .extract(src.as_bytes(), &PathBuf::from("test.rs"))
+            .expect("extract");
+
+        let names: Vec<&str> = chunks.iter().map(|c| c.name.as_str()).collect();
+        assert!(
+            names.contains(&"FixedBuffer"),
+            "expected struct in chunks, got: {names:?}"
+        );
+        assert!(
+            names.contains(&"make_buffer"),
+            "expected function in chunks, got: {names:?}"
+        );
+        assert!(
+            names.contains(&"Readable"),
+            "expected trait in chunks, got: {names:?}"
+        );
+
+        // Verify kinds are set sensibly. Upstream tags.scm uses
+        // @definition.class for structs and @definition.interface for
+        // traits.
+        let by_name: std::collections::HashMap<_, _> =
+            chunks.iter().map(|c| (c.name.as_str(), c.kind)).collect();
+        assert_eq!(by_name["FixedBuffer"], ChunkKind::Class);
+        assert_eq!(by_name["make_buffer"], ChunkKind::Function);
+        assert_eq!(by_name["Readable"], ChunkKind::Interface);
+    }
+
+    #[test]
+    fn rust_chunk_text_contains_full_definition_body() {
+        let src = "pub fn answer() -> i32 { 42 }\n";
+        let chunker = Chunker::for_language(SupportedLanguage::Rust).expect("compile");
+        let chunks = chunker
+            .extract(src.as_bytes(), &PathBuf::from("a.rs"))
+            .expect("extract");
+        let answer = chunks
+            .iter()
+            .find(|c| c.name == "answer")
+            .expect("answer present");
+        assert!(answer.text.contains("42"));
+        assert!(answer.text.starts_with("pub fn answer"));
+    }
+
+    #[test]
+    fn rust_methods_inside_impl_are_tagged_as_method_not_function() {
+        // tree-sitter-rust tags.scm carries this distinction:
+        //   (function_item ...) → @definition.function
+        //   (declaration_list (function_item ...)) → @definition.method
+        let src = r#"
+struct S;
+impl S {
+    fn inside(&self) -> i32 { 7 }
+}
+fn outside() -> i32 { 8 }
+"#;
+        let chunker = Chunker::for_language(SupportedLanguage::Rust).expect("compile");
+        let chunks = chunker
+            .extract(src.as_bytes(), &PathBuf::from("a.rs"))
+            .expect("extract");
+        let kinds: std::collections::HashMap<_, _> =
+            chunks.iter().map(|c| (c.name.as_str(), c.kind)).collect();
+        assert_eq!(kinds.get("inside"), Some(&ChunkKind::Method));
+        assert_eq!(kinds.get("outside"), Some(&ChunkKind::Function));
+    }
+
+    #[test]
+    fn python_extracts_class_function_and_constant() {
+        let src = r#"
+GREETING = "hello"
+
+def shout(msg):
+    return msg.upper()
+
+class Speaker:
+    def say(self, msg):
+        print(msg)
+"#;
+        let chunker = Chunker::for_language(SupportedLanguage::Python).expect("compile");
+        let chunks = chunker
+            .extract(src.as_bytes(), &PathBuf::from("speaker.py"))
+            .expect("extract");
+
+        let by_name: std::collections::HashMap<_, _> =
+            chunks.iter().map(|c| (c.name.as_str(), c.kind)).collect();
+        assert_eq!(by_name.get("GREETING"), Some(&ChunkKind::Constant));
+        assert_eq!(by_name.get("shout"), Some(&ChunkKind::Function));
+        assert_eq!(by_name.get("Speaker"), Some(&ChunkKind::Class));
+    }
+
+    #[test]
+    fn signature_hash_is_stable_and_content_dependent() {
+        let chunker = Chunker::for_language(SupportedLanguage::Rust).expect("compile");
+        let src_a = "fn x() -> i32 { 1 }\n";
+        let src_b = "fn x() -> i32 { 2 }\n";
+
+        let a = chunker
+            .extract(src_a.as_bytes(), &PathBuf::from("a.rs"))
+            .unwrap();
+        let b = chunker
+            .extract(src_b.as_bytes(), &PathBuf::from("a.rs"))
+            .unwrap();
+        let a2 = chunker
+            .extract(src_a.as_bytes(), &PathBuf::from("a.rs"))
+            .unwrap();
+
+        assert_eq!(a[0].signature_hash, a2[0].signature_hash, "stable");
+        assert_ne!(a[0].signature_hash, b[0].signature_hash, "content-sensitive");
+    }
+
+    #[test]
+    fn empty_source_yields_no_chunks() {
+        let chunker = Chunker::for_language(SupportedLanguage::Rust).expect("compile");
+        let chunks = chunker
+            .extract(b"", &PathBuf::from("empty.rs"))
+            .expect("extract");
+        assert!(chunks.is_empty());
+    }
+
+    #[test]
+    fn lines_are_one_indexed() {
+        let src = "\n\nfn foo() {}\n";
+        let chunker = Chunker::for_language(SupportedLanguage::Rust).expect("compile");
+        let chunks = chunker
+            .extract(src.as_bytes(), &PathBuf::from("a.rs"))
+            .expect("extract");
+        let foo = chunks
+            .iter()
+            .find(|c| c.name == "foo")
+            .expect("foo present");
+        // foo starts on the third line (1-indexed: 3); ends on same line.
+        assert_eq!(foo.lines, 3..3);
+    }
+}

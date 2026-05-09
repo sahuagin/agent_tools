@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
+pub mod chunker;
 pub mod graph;
 pub mod store;
 
@@ -26,13 +27,16 @@ pub struct ChunkId(pub i64);
 pub enum ChunkKind {
     Function,
     Method,
+    Class,
     Struct,
     Enum,
     Trait,
     Impl,
+    Interface,
     Type,
     Module,
     Constant,
+    Macro,
     Test,
     Other,
 }
