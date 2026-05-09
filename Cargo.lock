@@ -221,9 +221,11 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "sha2",
  "tree-sitter",
  "tree-sitter-python",
  "tree-sitter-rust",
+ "ureq",
 ]
 
 [[package]]

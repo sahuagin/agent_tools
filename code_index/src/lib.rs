@@ -12,8 +12,10 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 pub mod chunker;
+pub mod embed;
 pub mod graph;
 pub mod ingest;
+pub mod recall;
 pub mod store;
 pub mod walker;
 
@@ -106,6 +108,9 @@ pub trait Store {
         query: &[f32],
         k: usize,
     ) -> Result<Vec<(ChunkId, f32)>>;
+    /// Chunks that don't yet have an embedding for `model`. Used by the
+    /// embedding pass to find work after a re-chunk.
+    fn chunks_missing_embedding(&self, model: &str) -> Result<Vec<Chunk>>;
 
     // manifest / staleness
     fn file_signature(&self, file: &Path) -> Result<Option<u64>>;

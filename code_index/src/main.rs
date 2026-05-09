@@ -5,7 +5,9 @@
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use code_index::embed::{embed_pending, select_embedder};
 use code_index::ingest::ingest;
+use code_index::recall::recall;
 use code_index::store::SqliteStore;
 
 #[derive(Parser, Debug)]
@@ -32,6 +34,10 @@ enum Command {
     /// Walk a path, chunk via tree-sitter, embed, and persist to the store.
     Ingest {
         path: std::path::PathBuf,
+        /// Skip embedding pass — useful for offline indexing or when you
+        /// just want chunk metadata in the DB.
+        #[arg(long)]
+        no_embed: bool,
     },
     /// Semantic recall over indexed chunks. Returns ranked (id, score) pairs.
     Recall {
@@ -86,22 +92,54 @@ fn open_store(db: Option<&std::path::Path>) -> Result<SqliteStore> {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Command::Ingest { path } => {
+        Command::Ingest { path, no_embed } => {
             let mut store = open_store(cli.db.as_deref())?;
             let stats = ingest(&path, &mut store, None)?;
+            let embedded = if no_embed {
+                0
+            } else {
+                let embedder = select_embedder();
+                embed_pending(&mut store, embedder.as_ref(), 32)?
+            };
             println!(
-                "{}: {} files walked, {} unchanged, {} re-chunked, {} chunks upserted",
+                "{}: {} files walked, {} unchanged, {} re-chunked, {} chunks, {} embedded",
                 path.display(),
                 stats.files_walked,
                 stats.files_unchanged,
                 stats.files_chunked,
                 stats.chunks_upserted,
+                embedded,
             );
             Ok(())
         }
         Command::Recall { query, limit, full } => {
-            let _ = (query, limit, full);
-            todo!("recall: embed query + Store::recall_top_k + optional materialize")
+            let store = open_store(cli.db.as_deref())?;
+            let embedder = select_embedder();
+            let hits = recall(&store, embedder.as_ref(), &query, limit, full)?;
+            if hits.is_empty() {
+                println!("(no hits — has the path been ingested with embeddings?)");
+            }
+            for h in hits {
+                if let Some(c) = &h.chunk {
+                    println!(
+                        "{:.4}  {:?} {}  {}:{}-{}",
+                        h.score,
+                        c.kind,
+                        c.name,
+                        c.file.display(),
+                        c.lines.start,
+                        c.lines.end,
+                    );
+                    if full {
+                        println!("---");
+                        println!("{}", c.text);
+                        println!("---");
+                    }
+                } else {
+                    println!("{:.4}  ChunkId({})", h.score, h.id.0);
+                }
+            }
+            Ok(())
         }
         Command::Graph { op } => match op {
             GraphOp::Build => todo!("graph build: hydrate Graph + analyzer.build_edges"),

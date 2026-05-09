@@ -419,6 +419,42 @@ impl Store for SqliteStore {
         Ok(out)
     }
 
+    fn chunks_missing_embedding(&self, model: &str) -> Result<Vec<Chunk>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT c.id, c.file, c.line_start, c.line_end, c.kind, c.name,
+                    c.signature_hash, c.text
+             FROM chunks c
+             WHERE NOT EXISTS (
+                SELECT 1 FROM chunk_embeddings e
+                WHERE e.chunk_id = c.id AND e.model = ?
+             )",
+        )?;
+        let rows = stmt.query_map(params![model], |row| {
+            let id: i64 = row.get(0)?;
+            let file: String = row.get(1)?;
+            let line_start: i64 = row.get(2)?;
+            let line_end: i64 = row.get(3)?;
+            let kind: String = row.get(4)?;
+            let name: String = row.get(5)?;
+            let sig: i64 = row.get(6)?;
+            let text: String = row.get(7)?;
+            Ok(Chunk {
+                id: ChunkId(id),
+                file: PathBuf::from(file),
+                lines: (line_start as usize)..(line_end as usize),
+                kind: chunk_kind_from_str(&kind),
+                name,
+                signature_hash: sig as u64,
+                text,
+            })
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
     fn file_signature(&self, file: &Path) -> Result<Option<u64>> {
         let f = file.to_string_lossy().to_string();
         let result: Result<i64, _> = self.conn.query_row(
