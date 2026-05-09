@@ -5,7 +5,7 @@
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use code_index::embed::{embed_pending, select_embedder};
+use code_index::embed::{embed_pending_concurrent, select_embedder};
 use code_index::ingest::ingest;
 use code_index::recall::recall;
 use code_index::store::SqliteStore;
@@ -38,6 +38,17 @@ enum Command {
         /// just want chunk metadata in the DB.
         #[arg(long)]
         no_embed: bool,
+        /// Embedding batch size. Lower values reduce blast radius when one
+        /// batch trips an upstream (you find the offending chunk faster);
+        /// higher values amortize HTTP overhead.
+        #[arg(long, default_value_t = 16)]
+        embed_batch_size: usize,
+        /// In-flight HTTP request concurrency for embedding. Each worker
+        /// blocks on its own socket; the kernel parks them in `sbwait`
+        /// independently. Real wall-clock scales ~linearly until you hit
+        /// the upstream's rate limit. Set to 1 to disable concurrency.
+        #[arg(long, default_value_t = 8)]
+        embed_concurrency: usize,
     },
     /// Semantic recall over indexed chunks. Returns ranked (id, score) pairs.
     Recall {
@@ -92,14 +103,24 @@ fn open_store(db: Option<&std::path::Path>) -> Result<SqliteStore> {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Command::Ingest { path, no_embed } => {
+        Command::Ingest {
+            path,
+            no_embed,
+            embed_batch_size,
+            embed_concurrency,
+        } => {
             let mut store = open_store(cli.db.as_deref())?;
             let stats = ingest(&path, &mut store, None)?;
             let embedded = if no_embed {
                 0
             } else {
                 let embedder = select_embedder();
-                embed_pending(&mut store, embedder.as_ref(), 32)?
+                embed_pending_concurrent(
+                    &mut store,
+                    embedder.as_ref(),
+                    embed_batch_size,
+                    embed_concurrency,
+                )?
             };
             println!(
                 "{}: {} files walked, {} unchanged, {} re-chunked, {} chunks, {} embedded",

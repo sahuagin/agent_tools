@@ -175,10 +175,36 @@ impl OpenRouterEmbedder {
             .send_json(json);
         match resp {
             Ok(r) => {
-                let parsed: EmbeddingResponse = r
-                    .into_json()
-                    .map_err(|e| anyhow!("parsing embedding response: {e}"))?;
-                Ok(parsed.data.into_iter().map(|d| d.embedding).collect())
+                // Read the body as a string first so a parse failure can
+                // surface what we actually got back. OpenRouter (and some
+                // upstreams it proxies) occasionally returns an error
+                // envelope `{"error": {...}}` with HTTP 200, which used to
+                // hit our serde deserialize as `missing field "data"` with
+                // no hint at the actual cause. Now we try the happy-path
+                // shape, fall back to error-envelope parsing, and as a last
+                // resort include a truncated body sample in the error.
+                let body_text = r.into_string().map_err(|e| {
+                    anyhow!("reading embedding response body: {e}")
+                })?;
+                if let Ok(parsed) = serde_json::from_str::<EmbeddingResponse>(&body_text) {
+                    return Ok(parsed.data.into_iter().map(|d| d.embedding).collect());
+                }
+                if let Ok(envelope) =
+                    serde_json::from_str::<ErrorEnvelope>(&body_text)
+                {
+                    return Err(anyhow!(
+                        "OpenRouter returned error envelope: {} (code: {})",
+                        envelope.error.message,
+                        envelope.error.code.unwrap_or(0),
+                    ));
+                }
+                let preview: String = body_text.chars().take(800).collect();
+                Err(anyhow!(
+                    "OpenRouter response did not match expected shape \
+                     (no `data` field, no error envelope). Body preview \
+                     ({} bytes): {preview}",
+                    body_text.len(),
+                ))
             }
             Err(ureq::Error::Status(code, r)) => {
                 let body = r.into_string().unwrap_or_default();
@@ -187,6 +213,18 @@ impl OpenRouterEmbedder {
             Err(e) => Err(anyhow!("OpenRouter request error: {e}")),
         }
     }
+}
+
+#[derive(Deserialize)]
+struct ErrorEnvelope {
+    error: ErrorBody,
+}
+
+#[derive(Deserialize)]
+struct ErrorBody {
+    message: String,
+    #[serde(default)]
+    code: Option<i64>,
 }
 
 /// Hand-rolled `[openrouter].api_key` parser over `~/.config/agent/config.toml`.
@@ -230,12 +268,45 @@ fn read_openrouter_key_from_config_toml() -> Option<String> {
 }
 
 // ──────────────────────────────────────────────────────────────────────────
+// Embed-input shaping
+// ──────────────────────────────────────────────────────────────────────────
+
+/// Conservative cap on the text we hand to the embedder per chunk. Most
+/// embedding providers cap input around 8k tokens; 24k chars is a safe
+/// upper bound at typical code/English token-density of ~3-4 chars per
+/// token. Matches `agent::embed::EMBED_CHAR_LIMIT`. The full chunk body
+/// is still stored — only the *embed input* is truncated.
+pub const EMBED_CHAR_LIMIT: usize = 24_000;
+
+/// Build the text that goes to the embedder for a chunk. Prefixes the
+/// name (strong identifier signal that bare bodies miss when the body
+/// is short) and truncates the body to `EMBED_CHAR_LIMIT` on a char
+/// boundary so we never hand a partial multibyte sequence to JSON
+/// serialization.
+pub fn embed_input_for(chunk: &Chunk) -> String {
+    let body = if chunk.text.len() > EMBED_CHAR_LIMIT {
+        let mut end = EMBED_CHAR_LIMIT;
+        while end > 0 && !chunk.text.is_char_boundary(end) {
+            end -= 1;
+        }
+        &chunk.text[..end]
+    } else {
+        &chunk.text[..]
+    };
+    format!("{}\n{}", chunk.name, body)
+}
+
+// ──────────────────────────────────────────────────────────────────────────
 // Two-pass embedding entry point
 // ──────────────────────────────────────────────────────────────────────────
 
 /// Find every chunk in `store` that lacks an embedding for the
 /// `embedder`'s model, batch them, embed, persist. Returns the count
 /// embedded.
+///
+/// Sequential. For I/O-bound workloads at scale, use
+/// [`embed_pending_concurrent`] — it fans batches across a thread pool
+/// so HTTP latency overlaps instead of stacking.
 ///
 /// Two-pass design (ingest first → embed second) keeps storage and
 /// HTTP concerns separated and avoids a borrow-checker tangle when
@@ -252,11 +323,11 @@ pub fn embed_pending(
     let model = embedder.model_id().to_string();
     let pending = store.chunks_missing_embedding(&model)?;
     let total = pending.len();
+    let started = std::time::Instant::now();
+    let mut done = 0usize;
+    let mut last_logged = 0usize;
     for batch in pending.chunks(batch_size) {
-        let texts: Vec<String> = batch
-            .iter()
-            .map(|c| format!("{}\n{}", c.name, c.text))
-            .collect();
+        let texts: Vec<String> = batch.iter().map(embed_input_for).collect();
         let vectors = embedder.embed(&texts)?;
         if vectors.len() != batch.len() {
             return Err(anyhow!(
@@ -268,8 +339,149 @@ pub fn embed_pending(
         for (chunk, vec) in batch.iter().zip(vectors.iter()) {
             store.upsert_embedding(chunk.id, &model, vec)?;
         }
+        done += batch.len();
+        // Log progress at most every 100 chunks (or on the final batch),
+        // so big runs are inspectable without spamming small ones.
+        if done == total || done - last_logged >= 100 {
+            let elapsed = started.elapsed().as_secs_f64().max(0.01);
+            let rate = done as f64 / elapsed;
+            let remaining = total.saturating_sub(done);
+            let eta_sec = (remaining as f64 / rate.max(0.01)) as u64;
+            eprintln!(
+                "embed: {done}/{total} chunks ({rate:.1}/s, eta ~{}m{:02}s)",
+                eta_sec / 60,
+                eta_sec % 60,
+            );
+            last_logged = done;
+        }
     }
     Ok(total)
+}
+
+/// Like `embed_pending`, but fans `concurrency` HTTP batches in flight
+/// across `std::thread::scope` workers. Embedding work is I/O-bound
+/// (each call blocks on socket I/O); concurrency lets latency overlap
+/// instead of stacking sequentially. Persistence to the store stays
+/// single-writer on the main thread — sqlite doesn't love concurrent
+/// writers and the writes are local-and-fast anyway.
+///
+/// Batches are distributed round-robin across per-worker channels, so
+/// no Mutex on a shared receiver. Workers exit when their channel
+/// closes (the feeder dropping its tx). Errors from any batch abort
+/// the run; in-flight batches will still complete (the scope blocks
+/// until all spawned threads return) but their results are discarded.
+pub fn embed_pending_concurrent(
+    store: &mut dyn Store,
+    embedder: &(dyn Embedder + Sync),
+    batch_size: usize,
+    concurrency: usize,
+) -> Result<usize> {
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Instant;
+
+    let batch_size = batch_size.max(1);
+    let concurrency = concurrency.max(1);
+    let model = embedder.model_id().to_string();
+    let pending = store.chunks_missing_embedding(&model)?;
+    let total = pending.len();
+    if total == 0 {
+        return Ok(0);
+    }
+    if concurrency == 1 {
+        // Single-worker: no point setting up the pool; fall through.
+        return embed_pending(store, embedder, batch_size);
+    }
+
+    let batches: Vec<Vec<Chunk>> = pending
+        .chunks(batch_size)
+        .map(|c| c.to_vec())
+        .collect();
+    let batch_count = batches.len();
+
+    type WorkerOk = (Vec<ChunkId>, Vec<Vec<f32>>);
+    let (result_tx, result_rx) = mpsc::sync_channel::<Result<WorkerOk>>(concurrency * 2);
+
+    let started = Instant::now();
+
+    thread::scope(|s| -> Result<usize> {
+        // Per-worker work channels — round-robin distribution avoids a
+        // shared-receiver Mutex. Per-channel capacity of 2 keeps each
+        // worker primed with one in-flight + one queued, no more.
+        let mut worker_txs: Vec<mpsc::SyncSender<Vec<Chunk>>> =
+            Vec::with_capacity(concurrency);
+        for _ in 0..concurrency {
+            let (tx, rx) = mpsc::sync_channel::<Vec<Chunk>>(2);
+            worker_txs.push(tx);
+            let result_tx = result_tx.clone();
+            s.spawn(move || {
+                while let Ok(batch) = rx.recv() {
+                    let texts: Vec<String> = batch.iter().map(embed_input_for).collect();
+                    let ids: Vec<ChunkId> = batch.iter().map(|c| c.id).collect();
+                    let res = embedder.embed(&texts).map(|vecs| (ids, vecs));
+                    if result_tx.send(res).is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+        // Drop the original result_tx so the channel closes once all
+        // worker clones drop.
+        drop(result_tx);
+
+        // Feeder thread: round-robin batches across workers. Closes
+        // each worker's channel by dropping all worker_txs at scope exit.
+        s.spawn(move || {
+            let n_workers = concurrency;
+            for (i, batch) in batches.into_iter().enumerate() {
+                // Bounded send — blocks if a worker's queue is full,
+                // which provides natural backpressure.
+                if worker_txs[i % n_workers].send(batch).is_err() {
+                    return;
+                }
+            }
+            // worker_txs drops here; workers' rx loops exit.
+        });
+
+        // Main thread: drain results, persist sequentially, log progress.
+        let mut done = 0usize;
+        let mut last_logged = 0usize;
+        for _ in 0..batch_count {
+            let r = match result_rx.recv() {
+                Ok(r) => r,
+                Err(e) => return Err(anyhow!("result channel closed early: {e}")),
+            };
+            match r {
+                Ok((ids, vecs)) => {
+                    if vecs.len() != ids.len() {
+                        return Err(anyhow!(
+                            "embedder returned {} vectors for {} ids",
+                            vecs.len(),
+                            ids.len()
+                        ));
+                    }
+                    for (id, vec) in ids.iter().zip(vecs.iter()) {
+                        store.upsert_embedding(*id, &model, vec)?;
+                    }
+                    done += ids.len();
+                    if done == total || done - last_logged >= 100 {
+                        let elapsed = started.elapsed().as_secs_f64().max(0.01);
+                        let rate = done as f64 / elapsed;
+                        let remaining = total.saturating_sub(done);
+                        let eta_sec = (remaining as f64 / rate.max(0.01)) as u64;
+                        eprintln!(
+                            "embed: {done}/{total} chunks ({rate:.1}/s, eta ~{}m{:02}s)",
+                            eta_sec / 60,
+                            eta_sec % 60,
+                        );
+                        last_logged = done;
+                    }
+                }
+                Err(e) => return Err(e.context("embedder failed for batch")),
+            }
+        }
+        Ok(done)
+    })
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -312,7 +524,7 @@ impl<'a> BatchedEmbedSink<'a> {
     }
 
     pub fn enqueue(&mut self, id: ChunkId, chunk: &Chunk) -> Result<()> {
-        let text = format!("{}\n{}", chunk.name, chunk.text);
+        let text = embed_input_for(chunk);
         self.pending_ids.push(id);
         self.pending_texts.push(text);
         if self.pending_ids.len() >= self.batch_size {
@@ -444,5 +656,93 @@ mod tests {
         let mut sink = BatchedEmbedSink::new(&m, &mut s);
         sink.flush().unwrap();
         assert_eq!(sink.flushed, 0);
+    }
+
+    #[test]
+    fn embed_pending_concurrent_persists_all_pending_chunks() {
+        let mut s = SqliteStore::open_in_memory().unwrap();
+        for i in 0..50 {
+            s.upsert_chunk(&dummy_chunk(&format!("c{i}"), "body"))
+                .unwrap();
+        }
+        let m = MockEmbedder::default();
+        let count = embed_pending_concurrent(&mut s, &m, 8, 4).unwrap();
+        assert_eq!(count, 50);
+
+        // All chunks now have an embedding for the mock model.
+        let still_pending = s.chunks_missing_embedding(m.model_id()).unwrap();
+        assert!(still_pending.is_empty());
+    }
+
+    #[test]
+    fn embed_pending_concurrent_is_resumable() {
+        // Embed half via the sequential path; resume via the concurrent
+        // one. Result: all 30 chunks embedded exactly once.
+        let mut s = SqliteStore::open_in_memory().unwrap();
+        let mut ids = Vec::new();
+        for i in 0..30 {
+            ids.push(
+                s.upsert_chunk(&dummy_chunk(&format!("c{i}"), "body"))
+                    .unwrap(),
+            );
+        }
+        let m = MockEmbedder::default();
+
+        // First pass — embed only the first 15 manually so we have a
+        // partial state to resume from.
+        for id in &ids[..15] {
+            let v = m.embed(&["partial".into()]).unwrap()[0].clone();
+            s.upsert_embedding(*id, m.model_id(), &v).unwrap();
+        }
+        assert_eq!(
+            s.chunks_missing_embedding(m.model_id()).unwrap().len(),
+            15,
+            "15 should still be pending"
+        );
+
+        let count = embed_pending_concurrent(&mut s, &m, 4, 3).unwrap();
+        assert_eq!(count, 15, "should only embed the previously-missing 15");
+        assert!(s.chunks_missing_embedding(m.model_id()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn embed_pending_concurrent_with_one_worker_works() {
+        // The concurrency=1 short-circuit returns through embed_pending;
+        // verify the result is the same shape as the multi-worker path.
+        let mut s = SqliteStore::open_in_memory().unwrap();
+        for i in 0..10 {
+            s.upsert_chunk(&dummy_chunk(&format!("c{i}"), "body"))
+                .unwrap();
+        }
+        let m = MockEmbedder::default();
+        let count = embed_pending_concurrent(&mut s, &m, 4, 1).unwrap();
+        assert_eq!(count, 10);
+    }
+
+    #[test]
+    fn embed_pending_concurrent_returns_zero_when_nothing_pending() {
+        let mut s = SqliteStore::open_in_memory().unwrap();
+        s.upsert_chunk(&dummy_chunk("only", "body")).unwrap();
+        let m = MockEmbedder::default();
+        // First pass embeds it.
+        embed_pending_concurrent(&mut s, &m, 4, 4).unwrap();
+        // Second pass has nothing to do.
+        let count = embed_pending_concurrent(&mut s, &m, 4, 4).unwrap();
+        assert_eq!(count, 0);
+    }
+
+    /// Stress: many workers + many small batches. Confirms we don't
+    /// deadlock or drop chunks under high distribution.
+    #[test]
+    fn embed_pending_concurrent_does_not_drop_chunks_under_high_concurrency() {
+        let mut s = SqliteStore::open_in_memory().unwrap();
+        for i in 0..200 {
+            s.upsert_chunk(&dummy_chunk(&format!("c{i}"), "body"))
+                .unwrap();
+        }
+        let m = MockEmbedder::default();
+        let count = embed_pending_concurrent(&mut s, &m, 4, 16).unwrap();
+        assert_eq!(count, 200);
+        assert!(s.chunks_missing_embedding(m.model_id()).unwrap().is_empty());
     }
 }
