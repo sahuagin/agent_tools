@@ -385,6 +385,89 @@ class Speaker:
     }
 
     #[test]
+    fn small_module_chunks_are_kept() {
+        // Module declaration (no body) should survive.
+        let src = "pub mod fixed_buffer;\n";
+        let chunker = Chunker::for_language(SupportedLanguage::Rust).expect("compile");
+        let chunks = chunker
+            .extract(src.as_bytes(), &PathBuf::from("a.rs"))
+            .expect("extract");
+        assert!(
+            chunks.iter().any(|c| c.kind == ChunkKind::Module && c.name == "fixed_buffer"),
+            "small module declarations are useful navigation anchors"
+        );
+    }
+
+    #[test]
+    fn oversize_module_chunks_are_dropped() {
+        // 50 inner functions, each with ~1KB body → mod body ~50KB,
+        // exceeding MODULE_CHUNK_LIMIT_BYTES (32KB). Inner functions
+        // each well under the limit; they MUST still be captured.
+        let inner_body = "    let _x = 0;\n".repeat(60); // ~960 bytes
+        let mut body = String::new();
+        for i in 0..50 {
+            body.push_str(&format!("fn filler_{i}() {{\n{inner_body}}}\n"));
+        }
+        let src = format!("pub mod tests {{\n{body}}}\n");
+        assert!(
+            src.len() > 32 * 1024,
+            "test source must exceed module limit, got {}",
+            src.len()
+        );
+
+        let chunker = Chunker::for_language(SupportedLanguage::Rust).expect("compile");
+        let chunks = chunker
+            .extract(src.as_bytes(), &PathBuf::from("a.rs"))
+            .expect("extract");
+
+        // The Module chunk for `tests` should be dropped.
+        let module_chunks: Vec<_> = chunks
+            .iter()
+            .filter(|c| c.kind == ChunkKind::Module)
+            .collect();
+        assert!(
+            module_chunks.is_empty(),
+            "oversize module chunks must be dropped, got: {:?}",
+            module_chunks.iter().map(|c| (&c.name, c.text.len())).collect::<Vec<_>>()
+        );
+
+        // Inner functions are still captured. Note: tree-sitter-rust's
+        // tags.scm tags inner fns inside any `declaration_list` (mod
+        // body, impl body, etc.) as `@definition.method`, NOT
+        // `@definition.function` — `Function` is reserved for top-level
+        // bare fns. So we accept either kind here.
+        let inner_count = chunks
+            .iter()
+            .filter(|c| {
+                c.name.starts_with("filler_")
+                    && (c.kind == ChunkKind::Function || c.kind == ChunkKind::Method)
+            })
+            .count();
+        assert_eq!(
+            inner_count, 50,
+            "all 50 inner fns must be captured separately, regardless of kind"
+        );
+    }
+
+    #[test]
+    fn oversize_function_chunks_are_kept() {
+        // A 50KB function is big but legitimately one retrieval unit;
+        // unlike modules, oversize functions are NOT dropped.
+        let body = "    let _x = 0;\n".repeat(3500); // ~52KB body
+        let src = format!("fn huge() {{\n{body}}}\n");
+        let chunker = Chunker::for_language(SupportedLanguage::Rust).expect("compile");
+        let chunks = chunker
+            .extract(src.as_bytes(), &PathBuf::from("a.rs"))
+            .expect("extract");
+        let huge = chunks.iter().find(|c| c.name == "huge");
+        assert!(
+            huge.is_some(),
+            "oversize function chunks are kept; only modules are dropped"
+        );
+        assert!(huge.unwrap().text.len() > 32 * 1024);
+    }
+
+    #[test]
     fn lines_are_one_indexed() {
         let src = "\n\nfn foo() {}\n";
         let chunker = Chunker::for_language(SupportedLanguage::Rust).expect("compile");

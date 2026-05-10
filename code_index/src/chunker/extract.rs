@@ -20,6 +20,29 @@ use super::{
     RawReference,
 };
 
+/// Module-level chunks larger than this are dropped at chunker time.
+///
+/// Why module-specific: a module's body is the concatenation of all its
+/// inner definitions, and those inner definitions are ALREADY captured as
+/// their own (function, struct, method, etc.) chunks. Indexing a giant
+/// `mod tests { ... }` block as a single chunk on top of its already-
+/// captured inner test functions is pure redundancy — bloats the FTS5
+/// lexical index disproportionately, embeds an opaque mass of code, and
+/// makes `--full` recall on a module hit dump kilobytes of test
+/// scaffolding the user almost certainly didn't want.
+///
+/// 32KB keeps short module declarations (`pub mod foo;`, small inline
+/// modules) which are useful as navigation anchors, while dropping the
+/// pathological cases. Empirically (pi_agent_rust 2026-05-09): 53 module
+/// chunks above this threshold consuming 4.6 MB of chunks.text bloat;
+/// all of them aggregate inner items already captured separately.
+///
+/// Other kinds (function/method/class) can have legitimately huge
+/// instances (a 50KB generated parser fn IS a real retrieval unit) —
+/// they aren't filtered. The 24k embed-input cap in `embed::embed_input_for`
+/// is the bound that matters at embedding time for those kinds.
+pub(crate) const MODULE_CHUNK_LIMIT_BYTES: usize = 32 * 1024;
+
 /// Run the query over `root` and produce both definition chunks and
 /// raw (un-resolved) references. References are post-attributed to
 /// their containing chunk via byte-range containment.
@@ -65,6 +88,14 @@ pub(super) fn collect_chunks_and_references(
             // Definition: build a Chunk, dedup by span, prefer specific kinds.
             let Ok(span_text) = span.utf8_text(source) else { continue };
             let kind = chunk_kind_from_tag(tag);
+
+            // Skip oversize module chunks — see MODULE_CHUNK_LIMIT_BYTES
+            // doc for rationale. Inner items appear as their own chunks
+            // already; the module-as-aggregate is redundant at this size.
+            if kind == ChunkKind::Module && span_text.len() > MODULE_CHUNK_LIMIT_BYTES {
+                continue;
+            }
+
             let chunk = build_chunk(
                 file,
                 name_text,
