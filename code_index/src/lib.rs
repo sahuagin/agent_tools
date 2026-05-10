@@ -12,6 +12,7 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 pub mod chunker;
+pub mod edges;
 pub mod embed;
 pub mod graph;
 pub mod ingest;
@@ -51,6 +52,7 @@ pub enum EdgeKind {
     Calls,
     References,
     Implements,
+    Imports,
     DefinedIn,
     ImportedBy,
     TestOf,
@@ -123,6 +125,18 @@ pub trait Store {
         query: &str,
         k: usize,
     ) -> Result<Vec<(ChunkId, f32)>>;
+
+    /// All file paths that have been ingested (per the file_manifest).
+    /// Used by the edge-build pass to know which files to re-parse for
+    /// reference extraction.
+    fn list_known_files(&self) -> Result<Vec<PathBuf>>;
+
+    /// Lookup chunks by exact `name` match. Used for name-based edge
+    /// resolution: the FROM is determined by parent-walk during
+    /// reference extraction, the TO is found by name-matching against
+    /// every known chunk. Multiple matches are common (e.g. `new`,
+    /// `default`); the caller decides how to disambiguate.
+    fn find_chunks_by_name(&self, name: &str) -> Result<Vec<Chunk>>;
 
     // manifest / staleness
     fn file_signature(&self, file: &Path) -> Result<Option<u64>>;

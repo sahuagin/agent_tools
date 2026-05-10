@@ -17,7 +17,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use tree_sitter::{Language, Parser, Query, QueryCursor};
 
-use crate::{Chunk, ChunkId, ChunkKind};
+use crate::{Chunk, ChunkId, ChunkKind, EdgeKind};
 
 mod extract;
 
@@ -91,6 +91,19 @@ impl Chunker {
     /// `Chunk.id` is set to `ChunkId(0)` — the caller assigns ids by
     /// upserting into a `Store`.
     pub fn extract(&self, source: &[u8], file: &Path) -> Result<Vec<Chunk>> {
+        Ok(self.extract_with_references(source, file)?.chunks)
+    }
+
+    /// Parse `source` and emit BOTH `@definition.X` chunks AND
+    /// `@reference.X` raw references. Each reference is attributed to
+    /// its containing definition via byte-range containment (parent
+    /// walk via `Node::start_byte`/`end_byte`). Cross-file resolution
+    /// is the caller's job — see `crate::edges`.
+    pub fn extract_with_references(
+        &self,
+        source: &[u8],
+        file: &Path,
+    ) -> Result<ExtractResult> {
         let mut parser = Parser::new();
         parser
             .set_language(&self.ts_language)
@@ -99,13 +112,46 @@ impl Chunker {
             .parse(source, None)
             .context("tree-sitter failed to parse source")?;
         let mut cursor = QueryCursor::new();
-        Ok(extract::collect_chunks(
+        Ok(extract::collect_chunks_and_references(
             &self.query,
             &mut cursor,
             tree.root_node(),
             source,
             file,
         ))
+    }
+}
+
+/// Output of [`Chunker::extract_with_references`] — all the chunks plus
+/// the references they contain.
+#[derive(Debug, Clone)]
+pub struct ExtractResult {
+    pub chunks: Vec<Chunk>,
+    pub references: Vec<RawReference>,
+}
+
+/// A reference captured by a `@reference.X` tag in a `tags.scm` query,
+/// before name resolution. Carries the index of the containing chunk
+/// (or `None` if the reference is at file scope, outside any captured
+/// definition span).
+#[derive(Debug, Clone)]
+pub struct RawReference {
+    /// The name being referenced (e.g. "into_owned", "FixedBuffer").
+    pub name: String,
+    /// What kind of edge this would be after resolution.
+    pub kind: EdgeKind,
+    /// Index into `ExtractResult.chunks`; the chunk whose span contains
+    /// this reference. `None` for file-level references.
+    pub containing_chunk_idx: Option<usize>,
+}
+
+pub(crate) fn edge_kind_from_reference_tag(tag: &str) -> EdgeKind {
+    match tag {
+        "call" => EdgeKind::Calls,
+        "module" => EdgeKind::Imports,
+        "implementation" => EdgeKind::Implements,
+        // class, macro, type, interface, etc. — collapse to References for v1.
+        _ => EdgeKind::References,
     }
 }
 

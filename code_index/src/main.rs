@@ -5,6 +5,7 @@
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use code_index::edges::build_edges;
 use code_index::embed::{embed_pending_concurrent, select_embedder};
 use code_index::ingest::ingest_with;
 use code_index::recall::{recall_with_mode, RecallMode};
@@ -182,7 +183,19 @@ fn main() -> Result<()> {
             Ok(())
         }
         Command::Graph { op } => match op {
-            GraphOp::Build => todo!("graph build: hydrate Graph + analyzer.build_edges"),
+            GraphOp::Build => {
+                let mut store = open_store(cli.db.as_deref())?;
+                let stats = build_edges(&mut store)?;
+                println!(
+                    "graph build: {} files processed ({} skipped), {} references found, {} edges emitted, {} unresolved",
+                    stats.files_processed,
+                    stats.files_skipped,
+                    stats.references_found,
+                    stats.edges_emitted,
+                    stats.references_unresolved,
+                );
+                Ok(())
+            }
             GraphOp::Communities => todo!("graph communities: analyzer.community_detection"),
             GraphOp::Path { from, to } => {
                 let _ = (from, to);

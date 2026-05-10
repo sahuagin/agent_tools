@@ -187,6 +187,7 @@ fn edge_kind_to_str(k: EdgeKind) -> &'static str {
         EdgeKind::Calls => "calls",
         EdgeKind::References => "references",
         EdgeKind::Implements => "implements",
+        EdgeKind::Imports => "imports",
         EdgeKind::DefinedIn => "defined_in",
         EdgeKind::ImportedBy => "imported_by",
         EdgeKind::TestOf => "test_of",
@@ -198,6 +199,7 @@ fn edge_kind_from_str(s: &str) -> Option<EdgeKind> {
         "calls" => EdgeKind::Calls,
         "references" => EdgeKind::References,
         "implements" => EdgeKind::Implements,
+        "imports" => EdgeKind::Imports,
         "defined_in" => EdgeKind::DefinedIn,
         "imported_by" => EdgeKind::ImportedBy,
         "test_of" => EdgeKind::TestOf,
@@ -511,6 +513,49 @@ impl Store for SqliteStore {
             // Flip sign so callers see a positive "higher is better"
             // score consistent with cosine.
             out.push((ChunkId(id), -(rank as f32)));
+        }
+        Ok(out)
+    }
+
+    fn list_known_files(&self) -> Result<Vec<PathBuf>> {
+        let mut stmt = self.conn.prepare("SELECT file FROM file_manifest")?;
+        let rows = stmt.query_map([], |row| {
+            let f: String = row.get(0)?;
+            Ok(PathBuf::from(f))
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    fn find_chunks_by_name(&self, name: &str) -> Result<Vec<Chunk>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, file, line_start, line_end, kind, signature_hash, text
+             FROM chunks WHERE name = ?",
+        )?;
+        let rows = stmt.query_map(params![name], |row| {
+            let id: i64 = row.get(0)?;
+            let file: String = row.get(1)?;
+            let line_start: i64 = row.get(2)?;
+            let line_end: i64 = row.get(3)?;
+            let kind: String = row.get(4)?;
+            let sig: i64 = row.get(5)?;
+            let text: String = row.get(6)?;
+            Ok(Chunk {
+                id: ChunkId(id),
+                file: PathBuf::from(file),
+                lines: (line_start as usize)..(line_end as usize),
+                kind: chunk_kind_from_str(&kind),
+                name: name.to_string(),
+                signature_hash: sig as u64,
+                text,
+            })
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
         }
         Ok(out)
     }
