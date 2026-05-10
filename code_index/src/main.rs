@@ -8,7 +8,7 @@ use code_index::edges::build_edges;
 use code_index::embed::{embed_pending_concurrent, select_embedder};
 use code_index::graph::Graph;
 use code_index::ingest::ingest_with;
-use code_index::recall::{recall_with_mode, RecallMode};
+use code_index::recall::{recall_tuned, RecallMode, RecallTuning, DEFAULT_TEST_PENALTY};
 use code_index::store::SqliteStore;
 use code_index::{ChunkId, Store};
 
@@ -71,6 +71,20 @@ enum Command {
         /// `semantic` (embedding cosine only), or `lexical` (FTS5 BM25 only).
         #[arg(long, default_value = "hybrid")]
         mode: String,
+        /// Disable the default down-weight on test chunks. Tests
+        /// over-rank for natural-language queries because their function
+        /// names tend to be descriptive prose; default behavior applies a
+        /// 0.5x multiplier to test scores so source code surfaces ahead
+        /// of equivalent test matches. Pass `--no-test-penalty` to opt
+        /// out (e.g. when you ARE looking for tests).
+        #[arg(long)]
+        no_test_penalty: bool,
+        /// Drop test chunks from results entirely. Stronger than
+        /// `--no-test-penalty`'s opposite — even with the penalty active,
+        /// tests can show up among low-scoring tail; this filter removes
+        /// them outright.
+        #[arg(long)]
+        exclude_tests: bool,
     },
     /// Graph operations — build edges, run analyzers, inspect communities.
     Graph {
@@ -248,12 +262,19 @@ fn main() -> Result<()> {
             limit,
             full,
             mode,
+            no_test_penalty,
+            exclude_tests,
         } => {
             let store = open_store(cli.db.as_deref())?;
             let embedder = select_embedder();
             let mode = RecallMode::from_str(&mode)
                 .ok_or_else(|| anyhow::anyhow!("invalid --mode {mode:?}; expected hybrid|semantic|lexical"))?;
-            let hits = recall_with_mode(&store, embedder.as_ref(), &query, limit, full, mode)?;
+            let tuning = RecallTuning {
+                test_penalty: if no_test_penalty { 1.0 } else { DEFAULT_TEST_PENALTY },
+                exclude_tests,
+            };
+            let hits =
+                recall_tuned(&store, embedder.as_ref(), &query, limit, full, mode, tuning)?;
             if hits.is_empty() {
                 println!("(no hits — has the path been ingested with embeddings?)");
             }

@@ -19,11 +19,25 @@
 use anyhow::{Context, Result};
 
 use crate::embed::Embedder;
-use crate::{Chunk, ChunkId, Store};
+use crate::{Chunk, ChunkId, ChunkKind, Store};
 
 /// Reciprocal Rank Fusion smoothing constant. 60 is the value from
 /// Cormack/Clarke/Buettcher 2009 and the de-facto default everywhere.
 const RRF_K: f32 = 60.0;
+
+/// Default multiplier applied to test-chunk scores after RRF fusion.
+/// 0.5 keeps tests visible but ranks them behind equivalent-strength
+/// real-source matches.
+///
+/// Why this defaults to <1: empirically (flywheel-3p4 dogfood, see bead
+/// at-ix1) tests over-rank for natural-language queries because their
+/// function names tend to be descriptive prose
+/// (`shared_dispatch_unknown_tool_returns_invalid_request`,
+/// `rpc_errors_on_unknown_command_and_missing_params`) which match
+/// query phrasing strongly, while real source code uses terse
+/// identifiers that match weakly. Penalizing tests is a coarse-but-
+/// effective way to surface the source they exercise.
+pub const DEFAULT_TEST_PENALTY: f32 = 0.5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecallMode {
@@ -59,6 +73,72 @@ pub struct Hit {
     pub chunk: Option<Chunk>,
 }
 
+/// Tuning knobs that don't fit the basic mode/k/materialize triple.
+/// Defaults match the recommended behavior; pass `..Default::default()`
+/// to override individual fields.
+#[derive(Debug, Clone, Copy)]
+pub struct RecallTuning {
+    /// Multiplier applied to test-chunk scores after RRF. 1.0 disables
+    /// the penalty. Defaults to `DEFAULT_TEST_PENALTY` (0.5).
+    pub test_penalty: f32,
+    /// Drop test chunks from results entirely (vs. just down-weighting).
+    /// When set, takes precedence over `test_penalty`.
+    pub exclude_tests: bool,
+}
+
+impl Default for RecallTuning {
+    fn default() -> Self {
+        Self {
+            test_penalty: DEFAULT_TEST_PENALTY,
+            exclude_tests: false,
+        }
+    }
+}
+
+/// Heuristic — does this chunk look like test code? We tag tests via
+/// three signals (any one is enough):
+///
+/// 1. `ChunkKind::Test` — explicit. Rare today (most upstream tags.scm
+///    files don't emit `@definition.test`), but reserved for when they
+///    do.
+/// 2. File path contains a tests directory: `/tests/`, `/__tests__/`,
+///    `/test/` (singular too), `/spec/`, ending in `_test.<ext>` or
+///    `.test.<ext>` or `.spec.<ext>`.
+/// 3. Function/method name starts with `test_` or `should_`.
+///
+/// The combination misclassifies some non-test chunks (e.g. a function
+/// named `test_connection` that's part of real connection logic), but
+/// the conservative choice of penalty (0.5 not 0) means even false
+/// positives stay reachable.
+pub(crate) fn looks_like_test(chunk: &Chunk) -> bool {
+    if chunk.kind == ChunkKind::Test {
+        return true;
+    }
+    let name_lower = chunk.name.to_ascii_lowercase();
+    if name_lower.starts_with("test_") || name_lower.starts_with("should_") {
+        return true;
+    }
+    let path_lower = chunk.file.to_string_lossy().to_ascii_lowercase();
+
+    // Path components named for testing — checking any component (not
+    // a substring of the full path) means `tests/integration.rs` matches
+    // even without a leading slash, and arbitrary nested paths like
+    // `src/lib/tests/foo.rs` match too.
+    let test_dirs = ["tests", "test", "__tests__", "spec", "specs"];
+    for component in path_lower.split('/') {
+        if test_dirs.contains(&component) {
+            return true;
+        }
+    }
+
+    // Filename-shape suffixes: `_test.rs`, `.test.ts`, `.spec.ts`, `_test.py`.
+    let ext_markers = ["_test.", ".test.", ".spec.", "_spec."];
+    if ext_markers.iter().any(|m| path_lower.contains(m)) {
+        return true;
+    }
+    false
+}
+
 /// Default recall path — Hybrid mode. Equivalent to
 /// `recall_with_mode(... RecallMode::Hybrid ...)`. Kept for backwards
 /// compatibility with callers that don't care about mode selection.
@@ -80,14 +160,44 @@ pub fn recall_with_mode(
     materialize: bool,
     mode: RecallMode,
 ) -> Result<Vec<Hit>> {
+    recall_tuned(
+        store,
+        embedder,
+        query,
+        k,
+        materialize,
+        mode,
+        RecallTuning::default(),
+    )
+}
+
+pub fn recall_tuned(
+    store: &dyn Store,
+    embedder: &dyn Embedder,
+    query: &str,
+    k: usize,
+    materialize: bool,
+    mode: RecallMode,
+    tuning: RecallTuning,
+) -> Result<Vec<Hit>> {
     // For hybrid we deliberately pull a wider window from each side
     // than the caller's k so RRF has more candidates to fuse over.
     // 2x the requested k is a common heuristic; keeps cost bounded
     // while giving the merge meaningful overlap to work with.
-    let pool_k = if matches!(mode, RecallMode::Hybrid) {
-        k.saturating_mul(2).max(k)
+    //
+    // We also OVER-PULL when test filtering is active — if we'll drop
+    // some fraction of candidates, we want enough left to fill the
+    // requested k. 4x is conservative; tests are typically <30% of a
+    // codebase's chunks so 4x ensures we still hit k after filtering.
+    let scale = if tuning.exclude_tests || tuning.test_penalty < 1.0 {
+        4
     } else {
-        k
+        2
+    };
+    let pool_k = if matches!(mode, RecallMode::Hybrid) {
+        k.saturating_mul(scale).max(k)
+    } else {
+        k.saturating_mul(scale).max(k)
     };
 
     let semantic = match mode {
@@ -101,11 +211,18 @@ pub fn recall_with_mode(
             .with_context(|| "recall_lexical")?,
     };
 
-    let scored: Vec<(ChunkId, f32)> = match mode {
+    let mut scored: Vec<(ChunkId, f32)> = match mode {
         RecallMode::Semantic => semantic,
         RecallMode::Lexical => lexical,
-        RecallMode::Hybrid => fuse_rrf(&semantic, &lexical, k),
+        RecallMode::Hybrid => fuse_rrf(&semantic, &lexical, pool_k),
     };
+
+    // Apply test-aware filtering / weighting. We need chunk metadata
+    // (file path, name, kind) for each candidate, so this happens as a
+    // post-pass. Cost: O(pool_k) chunk lookups; ~0.5ms each — negligible.
+    if tuning.exclude_tests || tuning.test_penalty < 1.0 {
+        scored = apply_test_tuning(store, scored, &tuning)?;
+    }
 
     let truncated = scored.into_iter().take(k);
     let mut hits = Vec::with_capacity(k);
@@ -120,6 +237,35 @@ pub fn recall_with_mode(
         hits.push(Hit { id, score, chunk });
     }
     Ok(hits)
+}
+
+fn apply_test_tuning(
+    store: &dyn Store,
+    scored: Vec<(ChunkId, f32)>,
+    tuning: &RecallTuning,
+) -> Result<Vec<(ChunkId, f32)>> {
+    let mut out: Vec<(ChunkId, f32)> = Vec::with_capacity(scored.len());
+    for (id, score) in scored {
+        let chunk = match store.get_chunk(id)? {
+            Some(c) => c,
+            None => {
+                // Chunk vanished between recall and post-pass (race);
+                // pass through unchanged. Materialization step will
+                // catch this if it matters to the caller.
+                out.push((id, score));
+                continue;
+            }
+        };
+        let is_test = looks_like_test(&chunk);
+        if is_test && tuning.exclude_tests {
+            continue;
+        }
+        let weight = if is_test { tuning.test_penalty } else { 1.0 };
+        out.push((id, score * weight));
+    }
+    // Re-sort after weighting; truncation happens in the caller.
+    out.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    Ok(out)
 }
 
 fn recall_semantic_inner(
@@ -325,5 +471,139 @@ mod tests {
         let m = MockEmbedder::default();
         let hits = recall(&s, &m, "anything", 10, true).unwrap();
         assert!(hits.is_empty());
+    }
+
+    // ── test-tuning suite ──────────────────────────────────────────
+
+    fn test_chunk(name: &str, file: &str, kind: ChunkKind) -> Chunk {
+        Chunk {
+            id: ChunkId(0),
+            file: file.into(),
+            lines: 1..2,
+            kind,
+            name: name.into(),
+            signature_hash: 0,
+            text: format!("body of {name}"),
+        }
+    }
+
+    #[test]
+    fn looks_like_test_classifies_via_path() {
+        let c = test_chunk("foo", "src/lib/tests/it.rs", ChunkKind::Function);
+        assert!(looks_like_test(&c));
+        let c = test_chunk("foo", "tests/integration.rs", ChunkKind::Function);
+        assert!(looks_like_test(&c));
+        let c = test_chunk("foo", "src/foo_test.rs", ChunkKind::Function);
+        assert!(looks_like_test(&c));
+        let c = test_chunk("foo", "src/foo.test.ts", ChunkKind::Function);
+        assert!(looks_like_test(&c));
+    }
+
+    #[test]
+    fn looks_like_test_classifies_via_name_prefix() {
+        let c = test_chunk("test_connection", "src/auth.rs", ChunkKind::Function);
+        assert!(looks_like_test(&c));
+        let c = test_chunk("should_work", "src/auth.rs", ChunkKind::Function);
+        assert!(looks_like_test(&c));
+    }
+
+    #[test]
+    fn looks_like_test_returns_false_for_real_source() {
+        let c = test_chunk("FixedBuffer", "src/buffer.rs", ChunkKind::Class);
+        assert!(!looks_like_test(&c));
+        let c = test_chunk("compute_metrics", "src/metrics.rs", ChunkKind::Function);
+        assert!(!looks_like_test(&c));
+    }
+
+    #[test]
+    fn test_penalty_demotes_tests_below_equivalent_real_source() {
+        // Construct: one test chunk and one real-source chunk that, with
+        // mock embedding, end up at similar RRF scores. With penalty=0.5
+        // the test should rank lower.
+        let mut s = SqliteStore::open_in_memory().unwrap();
+        s.upsert_chunk(&test_chunk(
+            "compute_value",
+            "src/lib.rs",
+            ChunkKind::Function,
+        ))
+        .unwrap();
+        s.upsert_chunk(&test_chunk(
+            "test_compute_value",
+            "tests/lib_test.rs",
+            ChunkKind::Function,
+        ))
+        .unwrap();
+        let m = MockEmbedder::default();
+        embed_pending(&mut s, &m, 8).unwrap();
+
+        let with_penalty = recall_tuned(
+            &s,
+            &m,
+            "compute_value",
+            5,
+            true,
+            RecallMode::Hybrid,
+            RecallTuning::default(),
+        )
+        .unwrap();
+        assert_eq!(with_penalty.len(), 2);
+        assert_eq!(
+            with_penalty[0].chunk.as_ref().unwrap().name,
+            "compute_value",
+            "real source ranks above test under default penalty"
+        );
+
+        let no_penalty = recall_tuned(
+            &s,
+            &m,
+            "compute_value",
+            5,
+            true,
+            RecallMode::Hybrid,
+            RecallTuning {
+                test_penalty: 1.0,
+                exclude_tests: false,
+            },
+        )
+        .unwrap();
+        // With penalty disabled, both still appear; ordering depends on
+        // mock cosine + BM25 scores (unstable across our mock). We only
+        // assert both are present.
+        assert_eq!(no_penalty.len(), 2);
+    }
+
+    #[test]
+    fn exclude_tests_drops_them_entirely() {
+        let mut s = SqliteStore::open_in_memory().unwrap();
+        s.upsert_chunk(&test_chunk(
+            "compute_value",
+            "src/lib.rs",
+            ChunkKind::Function,
+        ))
+        .unwrap();
+        s.upsert_chunk(&test_chunk(
+            "test_compute_value",
+            "tests/lib_test.rs",
+            ChunkKind::Function,
+        ))
+        .unwrap();
+        let m = MockEmbedder::default();
+        embed_pending(&mut s, &m, 8).unwrap();
+
+        let hits = recall_tuned(
+            &s,
+            &m,
+            "compute_value",
+            5,
+            true,
+            RecallMode::Hybrid,
+            RecallTuning {
+                test_penalty: DEFAULT_TEST_PENALTY,
+                exclude_tests: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(hits.len(), 1, "test chunk should be filtered out");
+        assert_eq!(hits[0].chunk.as_ref().unwrap().name, "compute_value");
     }
 }
