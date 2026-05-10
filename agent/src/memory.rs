@@ -3,7 +3,8 @@ use anyhow::{bail, Context, Result};
 use chrono::Utc;
 use clap::{Args, Subcommand};
 use rusqlite::{params, params_from_iter, types::Value, Connection};
-use std::collections::HashMap;
+use serde::Deserialize;
+use std::collections::{BTreeSet, HashMap};
 use std::io::Read;
 use std::path::PathBuf;
 use uuid::Uuid;
@@ -20,6 +21,22 @@ pub enum MemoryAction {
     Add(AddArgs),
     /// Update an existing memory
     Update(UpdateArgs),
+    /// Show full memory contents by id or exact name
+    Show(ShowArgs),
+    /// Archive a memory: hide from normal retrieval but keep restorable
+    Archive(LifecycleArgs),
+    /// Move a memory to trash: hide from normal retrieval, pending purge
+    Trash(LifecycleArgs),
+    /// Restore an archived or trashed memory to active retrieval
+    Restore(LifecycleArgs),
+    /// Show lifecycle/change events for a memory
+    Events(EventsArgs),
+    /// Review-friendly patch/event history with diff hints
+    PatchLog(EventsArgs),
+    /// Render before/after diff for a memory event
+    Diff(DiffArgs),
+    /// Apply selected candidates from a machine-readable memory plan
+    ApplyPlan(ApplyPlanArgs),
     /// Full-text search memories
     Search(SearchArgs),
     /// Most recently updated memories
@@ -34,6 +51,8 @@ pub enum MemoryAction {
     RebuildIndex,
     /// Semantic recall via embedding similarity
     Recall(RecallArgs),
+    /// Analyze recall query log for coverage gaps and hotspots
+    RecallStats(RecallStatsArgs),
     /// (Re-)embed memories using the configured embedder
     Reindex(ReindexArgs),
     /// Export all active memories as markdown
@@ -91,6 +110,99 @@ pub struct UpdateArgs {
 }
 
 #[derive(Args)]
+pub struct ShowArgs {
+    /// Memory id or exact memory name
+    pub key: String,
+    /// Include inactive memories in lookup
+    #[arg(long)]
+    pub inactive: bool,
+    /// Emit JSON instead of human-readable text
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Args)]
+pub struct LifecycleArgs {
+    /// Memory id
+    pub id: String,
+    /// Reason recorded in memory_events
+    #[arg(long, default_value = "")]
+    pub reason: String,
+    /// Source report or artifact path recorded in memory_events
+    #[arg(long, default_value = "")]
+    pub source_report: String,
+}
+
+#[derive(Args)]
+pub struct EventsArgs {
+    /// Memory id
+    pub id: String,
+    #[arg(long, default_value = "20")]
+    pub limit: usize,
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Args)]
+pub struct DiffArgs {
+    /// Memory id
+    pub id: String,
+    /// Specific memory_events.id to diff; defaults to latest event for memory
+    #[arg(long)]
+    pub event: Option<i64>,
+    /// Emit JSON diff instead of human-readable text
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Args)]
+pub struct ApplyPlanArgs {
+    /// JSON apply-plan path
+    pub file: PathBuf,
+    /// Candidate id to apply. Repeatable. Required unless --dry-run.
+    #[arg(long = "select")]
+    pub select: Vec<String>,
+    /// Print selected actions without mutating memory
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
+#[derive(Deserialize)]
+struct ApplyPlan {
+    candidates: Vec<ApplyCandidate>,
+}
+
+#[derive(Deserialize)]
+struct ApplyCandidate {
+    id: String,
+    action: String,
+    #[serde(default)]
+    memory_id: Option<String>,
+    #[serde(default, rename = "type")]
+    type_: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    content: Option<String>,
+    #[serde(default)]
+    tags: Option<String>,
+    #[serde(default)]
+    cwd: Option<String>,
+    #[serde(default)]
+    source: Option<String>,
+    #[serde(default)]
+    scope: Option<String>,
+    #[serde(default)]
+    active: Option<bool>,
+    #[serde(default)]
+    reason: Option<String>,
+    #[serde(default)]
+    source_report: Option<String>,
+}
+
+#[derive(Args)]
 pub struct SearchArgs {
     pub query: String,
     #[arg(long)]
@@ -118,6 +230,9 @@ pub struct ListArgs {
     pub tag: Option<String>,
     #[arg(long)]
     pub cwd: Option<String>,
+    /// Lifecycle state to list: active, archived, or trashed
+    #[arg(long)]
+    pub lifecycle: Option<String>,
     #[arg(long, default_value = "50")]
     pub limit: usize,
 }
@@ -174,6 +289,37 @@ pub struct RecallArgs {
     /// Restrict to a scope (work/personal/shared/*). Spans all scopes if omitted.
     #[arg(long)]
     pub scope: Option<String>,
+    /// Emit JSON instead of human-readable text (for programmatic use)
+    #[arg(long)]
+    pub json: bool,
+    /// Include full content body in results (default: id/name/description only)
+    #[arg(long)]
+    pub full: bool,
+}
+
+#[derive(Args)]
+pub struct RecallStatsArgs {
+    /// Show queries where top_score was below threshold (weak-recall queries)
+    #[arg(long)]
+    pub gaps: bool,
+    /// Threshold for --gaps (cosine similarity)
+    #[arg(long, default_value = "0.45")]
+    pub gaps_threshold: f64,
+    /// Group queries by first significant token; rank by avg top_score
+    #[arg(long)]
+    pub hotspots: bool,
+    /// Show queries where recall surfaced a high-scoring result FTS missed (requires --compare in original call)
+    #[arg(long)]
+    pub recall_vs_search: bool,
+    /// Threshold for --recall-vs-search (cosine similarity floor)
+    #[arg(long, default_value = "0.6")]
+    pub rvs_threshold: f64,
+    /// Restrict to last N days
+    #[arg(long, default_value = "30")]
+    pub days: i64,
+    /// Limit rows shown per view
+    #[arg(long, default_value = "20")]
+    pub limit: usize,
 }
 
 #[derive(Args)]
@@ -196,6 +342,7 @@ struct Memory {
     tags: String,
     cwd: String,
     is_active: bool,
+    lifecycle: String,
     created_at: i64,
     updated_at: i64,
 }
@@ -296,6 +443,14 @@ pub fn run(conn: Connection, cmd: MemoryCmd) -> Result<()> {
     match cmd.action {
         MemoryAction::Add(args) => add(&conn, args),
         MemoryAction::Update(args) => update(&conn, args),
+        MemoryAction::Show(args) => show(&conn, args),
+        MemoryAction::Archive(args) => set_lifecycle(&conn, args, "archived"),
+        MemoryAction::Trash(args) => set_lifecycle(&conn, args, "trashed"),
+        MemoryAction::Restore(args) => set_lifecycle(&conn, args, "active"),
+        MemoryAction::Events(args) => events(&conn, args),
+        MemoryAction::PatchLog(args) => patch_log(&conn, args),
+        MemoryAction::Diff(args) => diff(&conn, args),
+        MemoryAction::ApplyPlan(args) => apply_plan(&conn, args),
         MemoryAction::Search(args) => search(&conn, args),
         MemoryAction::Recent(args) => recent(&conn, args),
         MemoryAction::List(args) => list(&conn, args),
@@ -303,6 +458,7 @@ pub fn run(conn: Connection, cmd: MemoryCmd) -> Result<()> {
         MemoryAction::ContextStats(args) => context_stats(&conn, args),
         MemoryAction::RebuildIndex => rebuild_full_index(&conn),
         MemoryAction::Recall(args) => recall(&conn, args),
+        MemoryAction::RecallStats(args) => recall_stats(&conn, args),
         MemoryAction::Reindex(args) => reindex(&conn, args),
         MemoryAction::Export => export(&conn),
         MemoryAction::Migrate(args) => migrate(&conn, args),
@@ -353,8 +509,8 @@ fn rebuild_index_for(conn: &Connection, memory_id: &str) -> Result<()> {
     let m: Option<Memory> = {
         let mut stmt = conn.prepare(
             "SELECT id, type, name, description, content, source, tags, cwd,
-                    is_active, created_at, updated_at
-             FROM memories WHERE id = ?1 AND is_active = 1",
+                    is_active, lifecycle, created_at, updated_at
+             FROM memories WHERE id = ?1 AND is_active = 1 AND lifecycle = 'active'",
         )?;
         let mut rows = stmt.query_map(params![memory_id], row_to_memory)?;
         rows.next().transpose()?
@@ -446,11 +602,11 @@ fn score_context_memories(
 
     let sql = format!(
         "SELECT m.id, m.type, m.name, m.description, m.content, m.source,
-                m.tags, m.cwd, m.is_active, m.created_at, m.updated_at,
+                m.tags, m.cwd, m.is_active, m.lifecycle, m.created_at, m.updated_at,
                 SUM(mti.weight) AS raw_score
          FROM memories m
          JOIN memory_topic_index mti ON mti.memory_id = m.id
-         WHERE m.type = ? AND m.is_active = 1
+         WHERE m.type = ? AND m.is_active = 1 AND m.lifecycle = 'active'
            AND mti.term IN ({term_ph}){scope_sql}
          GROUP BY m.id
          ORDER BY raw_score DESC
@@ -466,7 +622,7 @@ fn score_context_memories(
 
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(params_from_iter(dyn_params.iter()), |r| {
-        Ok((row_to_memory(r)?, r.get::<_, f64>(11)?))
+        Ok((row_to_memory(r)?, r.get::<_, f64>(12)?))
     })?;
 
     let mut scored: Vec<(Memory, f64)> = rows
@@ -558,43 +714,92 @@ fn add(conn: &Connection, args: AddArgs) -> Result<()> {
     rebuild_index_for(conn, &id)?;
     let text = embed::memory_embed_text(&args.name, &args.description, &content);
     embed::try_embed_one(conn, &id, &text);
+    let after = memory_row_json(conn, &id)?;
+    conn.execute(
+        "INSERT INTO memory_events (ts, actor, action, memory_id, before_json, after_json)
+         VALUES (?1, 'agent', 'add', ?2, NULL, ?3)",
+        params![ts, id, after],
+    )?;
     println!("{id}");
     Ok(())
 }
 
+fn print_memory(memory: &Memory) {
+    println!(
+        "[{}] ({}) {} — {}  [{}]",
+        memory.id,
+        memory.type_,
+        memory.name,
+        memory.description,
+        fmt_ts(memory.updated_at)
+    );
+    println!("  source: {}", memory.source);
+    if !memory.tags.is_empty() {
+        println!("  tags: {}", memory.tags);
+    }
+    if !memory.cwd.is_empty() {
+        println!("  cwd: {}", memory.cwd);
+    }
+    println!("  active: {}", memory.is_active);
+    println!("  lifecycle: {}", memory.lifecycle);
+    println!("  created: {}", fmt_ts(memory.created_at));
+    println!("  updated: {}", fmt_ts(memory.updated_at));
+    println!();
+    println!("{}", memory.content);
+}
+
+fn memory_to_json(memory: &Memory) -> serde_json::Value {
+    serde_json::json!({
+        "id": memory.id,
+        "type": memory.type_,
+        "name": memory.name,
+        "description": memory.description,
+        "content": memory.content,
+        "source": memory.source,
+        "tags": memory.tags,
+        "cwd": memory.cwd,
+        "is_active": memory.is_active,
+        "lifecycle": memory.lifecycle,
+        "created_at": memory.created_at,
+        "updated_at": memory.updated_at,
+    })
+}
+
 fn update(conn: &Connection, args: UpdateArgs) -> Result<()> {
     let ts = now();
+    let id = args.id.clone();
+    let before = memory_row_json(conn, &id)?;
     let mut updated = 0;
     let content = resolve_content(args.content, args.content_file)?;
 
     if let Some(name) = args.name {
         updated += conn.execute(
             "UPDATE memories SET name=?1, updated_at=?2 WHERE id=?3",
-            params![name, ts, args.id],
+            params![name, ts, id],
         )?;
     }
     if let Some(desc) = args.description {
         updated += conn.execute(
             "UPDATE memories SET description=?1, updated_at=?2 WHERE id=?3",
-            params![desc, ts, args.id],
+            params![desc, ts, id],
         )?;
     }
     if let Some(content) = content {
         updated += conn.execute(
             "UPDATE memories SET content=?1, updated_at=?2 WHERE id=?3",
-            params![content, ts, args.id],
+            params![content, ts, id],
         )?;
     }
     if let Some(tags) = args.tags {
         updated += conn.execute(
             "UPDATE memories SET tags=?1, updated_at=?2 WHERE id=?3",
-            params![tags, ts, args.id],
+            params![tags, ts, id],
         )?;
     }
     if let Some(active) = args.active {
         updated += conn.execute(
             "UPDATE memories SET is_active=?1, updated_at=?2 WHERE id=?3",
-            params![active as i64, ts, args.id],
+            params![active as i64, ts, id],
         )?;
     }
     if let Some(scope) = args.scope {
@@ -605,22 +810,504 @@ fn update(conn: &Connection, args: UpdateArgs) -> Result<()> {
     }
 
     if updated == 0 {
-        bail!("no memory found with id={}", args.id);
+        bail!("no memory found with id={}", id);
     }
 
-    rebuild_index_for(conn, &args.id)?;
+    rebuild_index_for(conn, &id)?;
+    let after = memory_row_json(conn, &id)?;
+    conn.execute(
+        "INSERT INTO memory_events (ts, actor, action, memory_id, before_json, after_json)
+         VALUES (?1, 'agent', 'update', ?2, ?3, ?4)",
+        params![ts, id, before, after],
+    )?;
 
     // Re-embed from the post-update state
     let row: Option<(String, String, String)> = conn
         .query_row(
             "SELECT name, description, content FROM memories WHERE id = ?1 AND is_active = 1",
-            params![args.id],
+            params![id],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
         .ok();
     if let Some((name, desc, content)) = row {
         let text = embed::memory_embed_text(&name, &desc, &content);
         embed::try_embed_one(conn, &args.id, &text);
+    }
+
+    Ok(())
+}
+
+fn show(conn: &Connection, args: ShowArgs) -> Result<()> {
+    let active_clause = if args.inactive { "" } else { " AND is_active = 1" };
+    let sql = format!(
+        "SELECT id, type, name, description, content, source, tags, cwd, is_active, lifecycle, created_at, updated_at
+         FROM memories
+         WHERE (id = ?1 OR name = ?1){active_clause}
+         ORDER BY CASE WHEN id = ?1 THEN 0 ELSE 1 END, updated_at DESC"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let memories = collect_memories(stmt.query_map(params![args.key], row_to_memory)?)?;
+
+    match memories.len() {
+        0 => bail!("no memory found for id/name={}", args.key),
+        1 => {
+            let memory = &memories[0];
+            if args.json {
+                println!("{}", memory_to_json(memory));
+            } else {
+                print_memory(memory);
+            }
+        }
+        _ => {
+            if args.json {
+                let values: Vec<serde_json::Value> = memories.iter().map(memory_to_json).collect();
+                println!("{}", serde_json::json!({ "matches": values }));
+            } else {
+                println!("multiple memories matched id/name={}; use exact id", args.key);
+                for memory in &memories {
+                    println!(
+                        "[{}] ({}) {} — {}  [{}]",
+                        memory.id,
+                        memory.type_,
+                        memory.name,
+                        memory.description,
+                        fmt_ts(memory.updated_at)
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn memory_row_json(conn: &Connection, id: &str) -> Result<Option<String>> {
+    let sql = "SELECT json_object(
+            'id', id,
+            'type', type,
+            'name', name,
+            'description', description,
+            'content', content,
+            'source', source,
+            'tags', tags,
+            'cwd', cwd,
+            'is_active', is_active,
+            'lifecycle', lifecycle,
+            'created_at', created_at,
+            'updated_at', updated_at,
+            'archived_at', archived_at,
+            'trashed_at', trashed_at,
+            'purge_after', purge_after,
+            'superseded_by', superseded_by
+        ) FROM memories WHERE id = ?1";
+    match conn.query_row(sql, params![id], |r| r.get::<_, String>(0)) {
+        Ok(json) => Ok(Some(json)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+fn set_lifecycle(conn: &Connection, args: LifecycleArgs, lifecycle: &str) -> Result<()> {
+    let before = memory_row_json(conn, &args.id)?
+        .ok_or_else(|| anyhow::anyhow!("no memory found with id={}", args.id))?;
+    let ts = now();
+
+    let (action, changed) = match lifecycle {
+        "active" => (
+            "restore",
+            conn.execute(
+                "UPDATE memories
+                 SET lifecycle='active', is_active=1, archived_at=NULL, trashed_at=NULL,
+                     purge_after=NULL, updated_at=?1
+                 WHERE id=?2",
+                params![ts, args.id],
+            )?,
+        ),
+        "archived" => (
+            "archive",
+            conn.execute(
+                "UPDATE memories
+                 SET lifecycle='archived', is_active=0, archived_at=?1, trashed_at=NULL,
+                     updated_at=?1
+                 WHERE id=?2",
+                params![ts, args.id],
+            )?,
+        ),
+        "trashed" => (
+            "trash",
+            conn.execute(
+                "UPDATE memories
+                 SET lifecycle='trashed', is_active=0, trashed_at=?1, updated_at=?1
+                 WHERE id=?2",
+                params![ts, args.id],
+            )?,
+        ),
+        other => bail!("invalid lifecycle: {other}"),
+    };
+
+    if changed == 0 {
+        bail!("no memory found with id={}", args.id);
+    }
+
+    rebuild_index_for(conn, &args.id)?;
+    let after = memory_row_json(conn, &args.id)?;
+    conn.execute(
+        "INSERT INTO memory_events (ts, actor, action, memory_id, before_json, after_json, reason, source_report)
+         VALUES (?1, 'agent', ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            ts,
+            action,
+            args.id,
+            before,
+            after,
+            args.reason,
+            args.source_report
+        ],
+    )?;
+    println!("{action}: {}", args.id);
+    Ok(())
+}
+
+fn events(conn: &Connection, args: EventsArgs) -> Result<()> {
+    let mut stmt = conn.prepare(
+        "SELECT id, ts, actor, action, before_json, after_json, reason, source_report
+         FROM memory_events
+         WHERE memory_id = ?1
+         ORDER BY ts DESC, id DESC
+         LIMIT ?2",
+    )?;
+    let rows = stmt.query_map(params![args.id, args.limit as i64], |r| {
+        Ok((
+            r.get::<_, i64>(0)?,
+            r.get::<_, i64>(1)?,
+            r.get::<_, String>(2)?,
+            r.get::<_, String>(3)?,
+            r.get::<_, Option<String>>(4)?,
+            r.get::<_, Option<String>>(5)?,
+            r.get::<_, String>(6)?,
+            r.get::<_, String>(7)?,
+        ))
+    })?;
+
+    let mut values = Vec::new();
+    for row in rows {
+        let (id, ts, actor, action, before_json, after_json, reason, source_report) = row?;
+        if args.json {
+            values.push(serde_json::json!({
+                "id": id,
+                "ts": ts,
+                "actor": actor,
+                "action": action,
+                "before_json": before_json,
+                "after_json": after_json,
+                "reason": reason,
+                "source_report": source_report,
+            }));
+        } else {
+            println!("[{id}] {} {action} by {actor}", fmt_ts(ts));
+            if !reason.is_empty() {
+                println!("  reason: {reason}");
+            }
+            if !source_report.is_empty() {
+                println!("  source: {source_report}");
+            }
+        }
+    }
+
+    if args.json {
+        println!("{}", serde_json::json!({ "events": values }));
+    }
+    Ok(())
+}
+
+fn patch_log(conn: &Connection, args: EventsArgs) -> Result<()> {
+    let mut stmt = conn.prepare(
+        "SELECT id, ts, actor, action, reason, source_report
+         FROM memory_events
+         WHERE memory_id = ?1
+         ORDER BY ts DESC, id DESC
+         LIMIT ?2",
+    )?;
+    let rows = stmt.query_map(params![args.id, args.limit as i64], |r| {
+        Ok((
+            r.get::<_, i64>(0)?,
+            r.get::<_, i64>(1)?,
+            r.get::<_, String>(2)?,
+            r.get::<_, String>(3)?,
+            r.get::<_, String>(4)?,
+            r.get::<_, String>(5)?,
+        ))
+    })?;
+
+    let mut values = Vec::new();
+    for row in rows {
+        let (event_id, ts, actor, action, reason, source_report) = row?;
+        let diff_cmd = format!("agent memory diff {} --event {}", args.id, event_id);
+        if args.json {
+            values.push(serde_json::json!({
+                "event_id": event_id,
+                "ts": ts,
+                "actor": actor,
+                "action": action,
+                "reason": reason,
+                "source_report": source_report,
+                "diff_command": diff_cmd,
+            }));
+        } else {
+            println!("[{event_id}] {} {action} by {actor}", fmt_ts(ts));
+            if !reason.is_empty() {
+                println!("  reason: {reason}");
+            }
+            if !source_report.is_empty() {
+                println!("  source: {source_report}");
+            }
+            println!("  diff: {diff_cmd}");
+        }
+    }
+
+    if args.json {
+        println!("{}", serde_json::json!({ "memory_id": args.id, "patches": values }));
+    }
+    Ok(())
+}
+
+fn apply_plan(conn: &Connection, args: ApplyPlanArgs) -> Result<()> {
+    let raw = std::fs::read_to_string(&args.file)?;
+    let plan: ApplyPlan = serde_json::from_str(&raw)?;
+    let selected: BTreeSet<String> = args.select.iter().cloned().collect();
+
+    if !args.dry_run && selected.is_empty() {
+        bail!("apply-plan requires at least one --select unless --dry-run is set");
+    }
+
+    let plan_ids: BTreeSet<String> = plan.candidates.iter().map(|c| c.id.clone()).collect();
+    for id in &selected {
+        if !plan_ids.contains(id) {
+            bail!("selected candidate not found in plan: {id}");
+        }
+    }
+
+    for candidate in &plan.candidates {
+        if selected.is_empty() || selected.contains(&candidate.id) {
+            if args.dry_run {
+                print_apply_candidate(candidate);
+            } else {
+                apply_candidate(conn, candidate)?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn print_apply_candidate(candidate: &ApplyCandidate) {
+    println!("{}: {}", candidate.id, candidate.action);
+    if let Some(memory_id) = &candidate.memory_id {
+        println!("  memory_id: {memory_id}");
+    }
+    if let Some(name) = &candidate.name {
+        println!("  name: {name}");
+    }
+    if let Some(description) = &candidate.description {
+        println!("  description: {description}");
+    }
+    if let Some(reason) = &candidate.reason {
+        if !reason.is_empty() {
+            println!("  reason: {reason}");
+        }
+    }
+    if let Some(source_report) = &candidate.source_report {
+        if !source_report.is_empty() {
+            println!("  source: {source_report}");
+        }
+    }
+}
+
+fn required<'a>(value: &'a Option<String>, candidate: &ApplyCandidate, field: &str) -> Result<&'a str> {
+    value
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("candidate {} action {} missing {field}", candidate.id, candidate.action))
+}
+
+fn apply_candidate(conn: &Connection, candidate: &ApplyCandidate) -> Result<()> {
+    match candidate.action.as_str() {
+        "add" => add(
+            conn,
+            AddArgs {
+                r#type: required(&candidate.type_, candidate, "type")?.to_string(),
+                name: required(&candidate.name, candidate, "name")?.to_string(),
+                description: required(&candidate.description, candidate, "description")?.to_string(),
+                content: Some(required(&candidate.content, candidate, "content")?.to_string()),
+                content_file: None,
+                tags: candidate.tags.clone().unwrap_or_default(),
+                cwd: candidate.cwd.clone().unwrap_or_default(),
+                source: candidate.source.clone().unwrap_or_else(|| "apply-plan".into()),
+                scope: candidate.scope.clone(),
+            },
+        ),
+        "update" => update(
+            conn,
+            UpdateArgs {
+                id: required(&candidate.memory_id, candidate, "memory_id")?.to_string(),
+                name: candidate.name.clone(),
+                description: candidate.description.clone(),
+                content: candidate.content.clone(),
+                content_file: None,
+                tags: candidate.tags.clone(),
+                active: candidate.active,
+                scope: candidate.scope.clone(),
+            },
+        ),
+        "archive" => set_lifecycle(
+            conn,
+            lifecycle_args_from_candidate(candidate)?,
+            "archived",
+        ),
+        "trash" => set_lifecycle(
+            conn,
+            lifecycle_args_from_candidate(candidate)?,
+            "trashed",
+        ),
+        "restore" => set_lifecycle(
+            conn,
+            lifecycle_args_from_candidate(candidate)?,
+            "active",
+        ),
+        other => bail!("candidate {} has unsupported action: {other}", candidate.id),
+    }
+}
+
+fn lifecycle_args_from_candidate(candidate: &ApplyCandidate) -> Result<LifecycleArgs> {
+    Ok(LifecycleArgs {
+        id: required(&candidate.memory_id, candidate, "memory_id")?.to_string(),
+        reason: candidate.reason.clone().unwrap_or_default(),
+        source_report: candidate.source_report.clone().unwrap_or_default(),
+    })
+}
+
+fn parse_event_json(raw: Option<String>) -> Result<serde_json::Value> {
+    match raw {
+        Some(s) => Ok(serde_json::from_str(&s)?),
+        None => Ok(serde_json::Value::Null),
+    }
+}
+
+fn value_for_key<'a>(value: &'a serde_json::Value, key: &str) -> &'a serde_json::Value {
+    value
+        .as_object()
+        .and_then(|obj| obj.get(key))
+        .unwrap_or(&serde_json::Value::Null)
+}
+
+fn diff(conn: &Connection, args: DiffArgs) -> Result<()> {
+    let sql = if args.event.is_some() {
+        "SELECT id, ts, actor, action, before_json, after_json, reason, source_report
+         FROM memory_events
+         WHERE memory_id = ?1 AND id = ?2"
+    } else {
+        "SELECT id, ts, actor, action, before_json, after_json, reason, source_report
+         FROM memory_events
+         WHERE memory_id = ?1
+         ORDER BY ts DESC, id DESC
+         LIMIT 1"
+    };
+
+    let event = if let Some(event_id) = args.event {
+        conn.query_row(sql, params![args.id, event_id], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, Option<String>>(4)?,
+                r.get::<_, Option<String>>(5)?,
+                r.get::<_, String>(6)?,
+                r.get::<_, String>(7)?,
+            ))
+        })
+    } else {
+        conn.query_row(sql, params![args.id], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, Option<String>>(4)?,
+                r.get::<_, Option<String>>(5)?,
+                r.get::<_, String>(6)?,
+                r.get::<_, String>(7)?,
+            ))
+        })
+    }
+    .map_err(|e| match e {
+        rusqlite::Error::QueryReturnedNoRows => anyhow::anyhow!("no memory event found"),
+        other => anyhow::Error::from(other),
+    })?;
+
+    let (event_id, ts, actor, action, before_json, after_json, reason, source_report) = event;
+    let before = parse_event_json(before_json)?;
+    let after = parse_event_json(after_json)?;
+
+    let mut keys = BTreeSet::new();
+    if let Some(obj) = before.as_object() {
+        keys.extend(obj.keys().cloned());
+    }
+    if let Some(obj) = after.as_object() {
+        keys.extend(obj.keys().cloned());
+    }
+
+    let mut changes = Vec::new();
+    for key in keys {
+        let old = value_for_key(&before, &key);
+        let new = value_for_key(&after, &key);
+        if old != new {
+            changes.push((key, old.clone(), new.clone()));
+        }
+    }
+
+    if args.json {
+        let changes_json: Vec<serde_json::Value> = changes
+            .iter()
+            .map(|(field, before, after)| {
+                serde_json::json!({
+                    "field": field,
+                    "before": before,
+                    "after": after,
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::json!({
+                "event_id": event_id,
+                "memory_id": args.id,
+                "ts": ts,
+                "actor": actor,
+                "action": action,
+                "reason": reason,
+                "source_report": source_report,
+                "changes": changes_json,
+            })
+        );
+        return Ok(());
+    }
+
+    println!("memory {} event {event_id}: {action} by {actor} ({})", args.id, fmt_ts(ts));
+    if !reason.is_empty() {
+        println!("reason: {reason}");
+    }
+    if !source_report.is_empty() {
+        println!("source: {source_report}");
+    }
+    println!();
+
+    if changes.is_empty() {
+        println!("(no field changes)");
+    } else {
+        for (field, before, after) in changes {
+            println!("{field}:");
+            println!("- {}", before);
+            println!("+ {}", after);
+        }
     }
 
     Ok(())
@@ -720,15 +1407,22 @@ fn list(conn: &Connection, args: ListArgs) -> Result<()> {
             .replace('_', "\\_");
         format!("%{e}%")
     });
-    let sql = "SELECT id, type, name, description, tags, updated_at FROM memories
-         WHERE is_active = 1
-           AND (?1 IS NULL OR type = ?1)
-           AND (?2 IS NULL OR cwd LIKE ?2 ESCAPE '\\')
-           AND (?3 IS NULL OR tags LIKE ?3 ESCAPE '\\')
-         ORDER BY updated_at DESC LIMIT ?4";
+    if let Some(lifecycle) = &args.lifecycle {
+        let valid = ["active", "archived", "trashed"];
+        if !valid.contains(&lifecycle.as_str()) {
+            bail!("lifecycle must be one of: {}", valid.join(", "));
+        }
+    }
+    let lifecycle = args.lifecycle.unwrap_or_else(|| "active".into());
+    let sql = "SELECT id, type, name, description, tags, lifecycle, updated_at FROM memories
+         WHERE lifecycle = ?1
+           AND (?2 IS NULL OR type = ?2)
+           AND (?3 IS NULL OR cwd LIKE ?3 ESCAPE '\\')
+           AND (?4 IS NULL OR tags LIKE ?4 ESCAPE '\\')
+         ORDER BY updated_at DESC LIMIT ?5";
     let mut stmt = conn.prepare(sql)?;
     let rows = stmt.query_map(
-        params![args.r#type, cwd_pat, tag_pat, args.limit as i64],
+        params![lifecycle, args.r#type, cwd_pat, tag_pat, args.limit as i64],
         |r| {
             Ok((
                 r.get::<_, String>(0)?,
@@ -736,19 +1430,20 @@ fn list(conn: &Connection, args: ListArgs) -> Result<()> {
                 r.get::<_, String>(2)?,
                 r.get::<_, String>(3)?,
                 r.get::<_, String>(4)?,
-                r.get::<_, i64>(5)?,
+                r.get::<_, String>(5)?,
+                r.get::<_, i64>(6)?,
             ))
         },
     )?;
     for row in rows {
-        let (id, type_, name, desc, tags, updated_at) = row?;
+        let (id, type_, name, desc, tags, lifecycle, updated_at) = row?;
         let tag_str = if tags.is_empty() {
             String::new()
         } else {
             format!("  [{}]", tags)
         };
         println!(
-            "[{id}] ({type_}) {name}{tag_str} — {desc}  [{}]",
+            "[{id}] ({type_}) {name}{tag_str} <{lifecycle}> — {desc}  [{}]",
             fmt_ts(updated_at)
         );
     }
@@ -997,8 +1692,8 @@ fn query_by_type(
 ) -> Result<Vec<Memory>> {
     let (scope_sql, scope_vals) = scope.sql_and("scope");
     let sql = format!(
-        "SELECT id, type, name, description, content, source, tags, cwd, is_active, created_at, updated_at
-         FROM memories WHERE type = ? AND is_active = 1{scope_sql} ORDER BY updated_at DESC LIMIT ?"
+        "SELECT id, type, name, description, content, source, tags, cwd, is_active, lifecycle, created_at, updated_at
+         FROM memories WHERE type = ? AND is_active = 1 AND lifecycle = 'active'{scope_sql} ORDER BY updated_at DESC LIMIT ?"
     );
     let mut p: Vec<Value> = vec![Value::Text(type_.to_string())];
     p.extend(scope_vals);
@@ -1019,8 +1714,9 @@ fn row_to_memory(r: &rusqlite::Row) -> rusqlite::Result<Memory> {
         tags: r.get(6)?,
         cwd: r.get(7)?,
         is_active: r.get::<_, i64>(8)? != 0,
-        created_at: r.get(9)?,
-        updated_at: r.get(10)?,
+        lifecycle: r.get(9)?,
+        created_at: r.get(10)?,
+        updated_at: r.get(11)?,
     })
 }
 
@@ -1112,8 +1808,9 @@ fn recall(conn: &Connection, args: RecallArgs) -> Result<()> {
 
     let scope = ScopeFilter::for_explicit(args.scope.as_deref());
     let (scope_sql, scope_vals) = scope.sql_and("m.scope");
+    // Pull content + tags too so --full / JSON can include them without a second query
     let sql = format!(
-        "SELECT m.id, m.type, m.name, m.description, m.updated_at, e.vector
+        "SELECT m.id, m.type, m.name, m.description, m.content, m.tags, m.updated_at, e.vector
                FROM memory_embeddings e
                JOIN memories m ON m.id = e.memory_id
                WHERE m.is_active = 1 AND e.model = ?
@@ -1132,33 +1829,114 @@ fn recall(conn: &Connection, args: RecallArgs) -> Result<()> {
             r.get::<_, String>(1)?,
             r.get::<_, String>(2)?,
             r.get::<_, String>(3)?,
-            r.get::<_, i64>(4)?,
-            r.get::<_, Vec<u8>>(5)?,
+            r.get::<_, String>(4)?,
+            r.get::<_, String>(5)?,
+            r.get::<_, i64>(6)?,
+            r.get::<_, Vec<u8>>(7)?,
         ))
     })?;
 
-    let mut scored: Vec<(String, String, String, String, i64, f32)> = Vec::new();
+    struct Scored {
+        id: String,
+        type_: String,
+        name: String,
+        description: String,
+        content: String,
+        tags: String,
+        updated_at: i64,
+        score: f32,
+    }
+
+    let mut scored: Vec<Scored> = Vec::new();
     for row in rows {
-        let (id, type_, name, desc, updated_at, blob) = row?;
+        let (id, type_, name, description, content, tags, updated_at, blob) = row?;
         let v = embed::blob_to_f32(&blob);
-        let sim = embed::cosine(&query_vec, &v);
-        scored.push((id, type_, name, desc, updated_at, sim));
+        let score = embed::cosine(&query_vec, &v);
+        scored.push(Scored {
+            id,
+            type_,
+            name,
+            description,
+            content,
+            tags,
+            updated_at,
+            score,
+        });
     }
 
     if scored.is_empty() {
-        eprintln!("no embeddings found for model '{model}'. Run `agent memory reindex` first.");
+        if args.json {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "model": model,
+                    "query": args.query,
+                    "results": [],
+                    "error": format!("no embeddings found for model '{model}'; run `agent memory reindex` first"),
+                })
+            );
+        } else {
+            eprintln!(
+                "no embeddings found for model '{model}'. Run `agent memory reindex` first."
+            );
+        }
         return Ok(());
     }
 
-    scored.sort_by(|a, b| b.5.partial_cmp(&a.5).unwrap_or(std::cmp::Ordering::Equal));
+    scored.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
     scored.truncate(args.k);
 
-    println!("## Semantic recall (model: {})\n", model);
-    for (id, type_, name, desc, updated_at, sim) in &scored {
+    // Telemetry: log this recall call before returning results.
+    let log_rows: Vec<(&str, &str, f32)> = scored
+        .iter()
+        .map(|s| (s.id.as_str(), s.name.as_str(), s.score))
+        .collect();
+    log_recall(conn, &args, &log_rows);
+
+    if args.json {
+        let results: Vec<serde_json::Value> = scored
+            .iter()
+            .map(|s| {
+                let mut obj = serde_json::json!({
+                    "id": s.id,
+                    "type": s.type_,
+                    "name": s.name,
+                    "description": s.description,
+                    "tags": s.tags,
+                    "updated_at": s.updated_at,
+                    "score": s.score,
+                });
+                if args.full {
+                    obj["content"] = serde_json::Value::String(s.content.clone());
+                }
+                obj
+            })
+            .collect();
         println!(
-            "[{sim:.3}] [{id}] ({type_}) {name} — {desc}  [{}]",
-            fmt_ts(*updated_at)
+            "{}",
+            serde_json::json!({
+                "model": model,
+                "query": args.query,
+                "results": results,
+            })
         );
+        return Ok(());
+    }
+
+    println!("## Semantic recall (model: {})\n", model);
+    for s in &scored {
+        println!(
+            "[{score:.3}] [{id}] ({type_}) {name} — {desc}  [{ts}]",
+            score = s.score,
+            id = s.id,
+            type_ = s.type_,
+            name = s.name,
+            desc = s.description,
+            ts = fmt_ts(s.updated_at)
+        );
+        if args.full {
+            println!("{}\n", indent(&s.content, "  "));
+        }
     }
 
     if args.compare {
@@ -1172,6 +1950,205 @@ fn recall(conn: &Connection, args: RecallArgs) -> Result<()> {
                 scope: args.scope.clone(),
             },
         )?;
+    }
+
+    Ok(())
+}
+
+fn log_recall(conn: &Connection, args: &RecallArgs, scored: &[(&str, &str, f32)]) {
+    let cwd = std::env::current_dir()
+        .ok()
+        .and_then(|p| p.to_str().map(String::from))
+        .unwrap_or_default();
+    let top_score = scored.first().map(|(_, _, s)| *s as f64);
+    let results_summary: Vec<serde_json::Value> = scored
+        .iter()
+        .map(|(id, name, score)| serde_json::json!({"id": id, "name": name, "score": score}))
+        .collect();
+    let results_json = serde_json::to_string(&results_summary).unwrap_or_else(|_| "[]".into());
+
+    // If --compare was set, count FTS hits with the same query+type filter.
+    let fts_hits: Option<i64> = if args.compare {
+        let sql = "SELECT COUNT(*) FROM memories_fts fts
+                   JOIN memories m ON m.rowid = fts.rowid
+                   WHERE memories_fts MATCH ?1 AND m.is_active = 1
+                     AND (?2 IS NULL OR m.type = ?2)";
+        match conn.query_row(sql, params![args.query, args.r#type], |r| r.get::<_, i64>(0)) {
+            Ok(n) => Some(n),
+            Err(_) => None, // FTS query syntax errors etc — leave null
+        }
+    } else {
+        None
+    };
+
+    let _ = conn.execute(
+        "INSERT INTO memory_recall_log
+         (ts, cwd, query, k, type_filter, top_score, results_json, compare_used, fts_hits)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![
+            now(),
+            cwd,
+            args.query,
+            args.k as i64,
+            args.r#type,
+            top_score,
+            results_json,
+            if args.compare { 1_i64 } else { 0_i64 },
+            fts_hits,
+        ],
+    );
+}
+
+fn recall_stats(conn: &Connection, args: RecallStatsArgs) -> Result<()> {
+    let since = now() - args.days * 86400;
+
+    if args.gaps {
+        println!("## Weak-recall queries (top_score < {:.2}, last {} days)\n", args.gaps_threshold, args.days);
+        let mut stmt = conn.prepare(
+            "SELECT ts, query, k, COALESCE(top_score, 0.0), type_filter
+             FROM memory_recall_log
+             WHERE ts >= ?1 AND (top_score IS NULL OR top_score < ?2)
+             ORDER BY top_score ASC NULLS FIRST, ts DESC
+             LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(
+            params![since, args.gaps_threshold, args.limit as i64],
+            |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, f64>(3)?,
+                    r.get::<_, Option<String>>(4)?,
+                ))
+            },
+        )?;
+        let mut count = 0;
+        for row in rows {
+            let (ts, query, k, score, type_filter) = row?;
+            let type_str = type_filter.map(|t| format!(" type={t}")).unwrap_or_default();
+            println!("  [{score:.3}]  k={k}{type_str}  {}  ({})", fmt_ts(ts), query);
+            count += 1;
+        }
+        if count == 0 {
+            println!("  (none — recall is hitting strong matches across the board)");
+        }
+        println!();
+    }
+
+    if args.hotspots {
+        println!("## Hotspots (queries grouped by first significant token, last {} days)\n", args.days);
+        // Pull all queries in window, group in-process by first significant token.
+        let mut stmt = conn.prepare(
+            "SELECT query, COALESCE(top_score, 0.0) FROM memory_recall_log WHERE ts >= ?1",
+        )?;
+        let rows = stmt.query_map(params![since], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, f64>(1)?))
+        })?;
+        let mut buckets: HashMap<String, (f64, usize, Vec<String>)> = HashMap::new();
+        for row in rows {
+            let (q, s) = row?;
+            let token = tokenize(&q).into_iter().next().unwrap_or_else(|| "_".into());
+            let entry = buckets.entry(token).or_insert((0.0, 0, Vec::new()));
+            entry.0 += s;
+            entry.1 += 1;
+            if entry.2.len() < 3 {
+                entry.2.push(q);
+            }
+        }
+        let mut ranked: Vec<(String, f64, usize, Vec<String>)> = buckets
+            .into_iter()
+            .map(|(k, (sum, n, samples))| (k, sum / n as f64, n, samples))
+            .collect();
+        ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        for (token, avg, n, samples) in ranked.into_iter().take(args.limit) {
+            println!("  [{avg:.3}]  n={n:>3}  {token}");
+            for q in samples {
+                println!("           e.g. {q}");
+            }
+        }
+        println!();
+    }
+
+    if args.recall_vs_search {
+        println!("## Recall-found, FTS-missed (top_score >= {:.2}, fts_hits = 0, last {} days)\n", args.rvs_threshold, args.days);
+        let mut stmt = conn.prepare(
+            "SELECT ts, query, COALESCE(top_score, 0.0), results_json
+             FROM memory_recall_log
+             WHERE ts >= ?1 AND compare_used = 1
+               AND COALESCE(top_score, 0.0) >= ?2
+               AND COALESCE(fts_hits, 0) = 0
+             ORDER BY top_score DESC
+             LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(
+            params![since, args.rvs_threshold, args.limit as i64],
+            |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, f64>(2)?,
+                    r.get::<_, String>(3)?,
+                ))
+            },
+        )?;
+        let mut count = 0;
+        for row in rows {
+            let (ts, query, score, results_json) = row?;
+            println!("  [{score:.3}]  {}  ({})", fmt_ts(ts), query);
+            if let Ok(arr) = serde_json::from_str::<Vec<serde_json::Value>>(&results_json) {
+                if let Some(top) = arr.first() {
+                    let name = top["name"].as_str().unwrap_or("?");
+                    let id = top["id"].as_str().unwrap_or("?");
+                    println!("           recall top: [{id}] {name}");
+                }
+            }
+            count += 1;
+        }
+        if count == 0 {
+            println!("  (none — either FTS is keeping up, or no recent --compare calls)");
+        }
+        println!();
+    }
+
+    // Default view: recent recall log entries, like context-stats
+    if !args.gaps && !args.hotspots && !args.recall_vs_search {
+        println!("## Recent recall calls (last {})\n", args.limit);
+        let mut stmt = conn.prepare(
+            "SELECT ts, query, k, top_score, type_filter, compare_used, fts_hits
+             FROM memory_recall_log
+             ORDER BY ts DESC
+             LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![args.limit as i64], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, Option<f64>>(3)?,
+                r.get::<_, Option<String>>(4)?,
+                r.get::<_, i64>(5)?,
+                r.get::<_, Option<i64>>(6)?,
+            ))
+        })?;
+        let mut count = 0;
+        for row in rows {
+            let (ts, query, k, top_score, type_filter, compare_used, fts_hits) = row?;
+            let score_str = top_score
+                .map(|s| format!("[{s:.3}]"))
+                .unwrap_or_else(|| "[ -- ]".into());
+            let type_str = type_filter.map(|t| format!(" type={t}")).unwrap_or_default();
+            let cmp_str = if compare_used == 1 {
+                format!(" cmp fts={}", fts_hits.map(|n| n.to_string()).unwrap_or_else(|| "?".into()))
+            } else {
+                String::new()
+            };
+            println!("  {score_str}  k={k}{type_str}{cmp_str}  {}  {query}", fmt_ts(ts));
+            count += 1;
+        }
+        if count == 0 {
+            println!("  (no recall calls logged yet — run `agent memory recall <query>` to seed)");
+        }
     }
 
     Ok(())

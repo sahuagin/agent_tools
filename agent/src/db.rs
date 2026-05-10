@@ -82,36 +82,31 @@ fn migrate(conn: &Connection) -> Result<()> {
         conn.execute_batch("COMMIT")?;
     }
 
-    // ── TOMBSTONE: schema versions 5 and 6 are RESERVED, not defined here ──────
-    //
-    // This source tree defines steps 1–4, then jumps to 7. That gap is
-    // deliberate. Deployed databases are at schema_version **6**, migrated by a
-    // now-abandoned "observability/lifecycle" lineage of this crate that is NOT
-    // in this tree's history (verified: not an ancestor of main). What it left
-    // behind, present in deployed DBs but unknown to current code:
-    //   v5: table `memory_recall_log` (+ index).
-    //   v6: `memories` columns `lifecycle` (DEFAULT 'active'), `archived_at`,
-    //       `trashed_at`, `purge_after`, `superseded_by`; index
-    //       `idx_memories_lifecycle_updated`; table `memory_events` (+ indexes).
-    //       (Deployed DBs also carry `sessions`/`observations`/`dialogue` from
-    //       the same lineage.)
-    // All of it is inert: every row is lifecycle='active', the rest NULL, and no
-    // code in this tree creates or reads any of it. The lifecycle semantics we
-    // actually use live in the `tags` text field (`status:archived`, etc.).
-    //
-    // RULES for the next person adding a migration:
-    //   1. The next migration MUST be numbered **8 or higher**. NEVER reuse 5,
-    //      6, or 7 — a migration numbered ≤6 would silently NOT run on deployed
-    //      DBs (already at 6), leaving production unmigrated and undetected.
-    //   2. Do NOT redefine v5/v6 here to "fill the gap" unless you are
-    //      deliberately reconciling fresh-DB schema with deployed DBs (the
-    //      original SQL is recoverable from git history of the lifecycle lineage,
-    //      e.g. commit 630ca8e). Resurrecting dead tables just to match a dead
-    //      feature is not worth the maintenance cost; the gap is intentional.
-    //
-    // Net effect of the jump: deployed DB 6 -> 7 (the `if version < 7` below
-    // fires). A fresh DB runs 1–4 then 7 (lifecycle-free, matching this tree).
-    // ───────────────────────────────────────────────────────────────────────────
+    // Schema ladder note: v5 (recall log) and v6 (lifecycle + event log) were
+    // built on a branch that ran in production for ~2 weeks (deployed DBs reached
+    // v6) but was never merged to main; v7 (scope) was added separately. Both are
+    // reconciled here, so source now matches deployed DBs exactly: 1–7 in order.
+    // The next migration MUST be numbered 8 or higher.
+    if version < 5 {
+        conn.execute_batch("BEGIN")?;
+        conn.execute_batch(SCHEMA_V5)?;
+        conn.execute(
+            "INSERT INTO schema_version (version, applied) VALUES (5, ?)",
+            [chrono::Utc::now().timestamp()],
+        )?;
+        conn.execute_batch("COMMIT")?;
+    }
+
+    if version < 6 {
+        conn.execute_batch("BEGIN")?;
+        conn.execute_batch(SCHEMA_V6)?;
+        conn.execute(
+            "INSERT INTO schema_version (version, applied) VALUES (6, ?)",
+            [chrono::Utc::now().timestamp()],
+        )?;
+        conn.execute_batch("COMMIT")?;
+    }
+
     if version < 7 {
         conn.execute_batch("BEGIN")?;
         conn.execute_batch(SCHEMA_V7)?;
@@ -245,14 +240,53 @@ CREATE TABLE memory_embeddings (
 );
 CREATE INDEX idx_me_model ON memory_embeddings(model);
 ";
+// v5: recall telemetry log (one row per `agent memory recall`).
+const SCHEMA_V5: &str = "
+CREATE TABLE memory_recall_log (
+    id           INTEGER PRIMARY KEY,
+    ts           INTEGER NOT NULL,
+    cwd          TEXT,
+    query        TEXT NOT NULL,
+    k            INTEGER NOT NULL,
+    type_filter  TEXT,
+    top_score    REAL,
+    results_json TEXT NOT NULL,
+    compare_used INTEGER NOT NULL DEFAULT 0,
+    fts_hits     INTEGER
+);
+CREATE INDEX idx_mrl_ts ON memory_recall_log(ts DESC);
+";
+
+// v6: memory lifecycle (active/archived/trashed + supersede/purge) and a
+// before/after audit log. Powers archive/trash/restore/events/apply-plan.
+const SCHEMA_V6: &str = "
+ALTER TABLE memories ADD COLUMN lifecycle TEXT NOT NULL DEFAULT 'active';
+ALTER TABLE memories ADD COLUMN archived_at INTEGER;
+ALTER TABLE memories ADD COLUMN trashed_at INTEGER;
+ALTER TABLE memories ADD COLUMN purge_after INTEGER;
+ALTER TABLE memories ADD COLUMN superseded_by TEXT;
+CREATE INDEX idx_memories_lifecycle_updated ON memories(lifecycle, updated_at);
+
+CREATE TABLE memory_events (
+    id            INTEGER PRIMARY KEY,
+    ts            INTEGER NOT NULL,
+    actor         TEXT NOT NULL DEFAULT 'agent',
+    action        TEXT NOT NULL,
+    memory_id     TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+    before_json   TEXT,
+    after_json    TEXT,
+    reason        TEXT NOT NULL DEFAULT '',
+    source_report TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX idx_memory_events_memory_ts ON memory_events(memory_id, ts DESC);
+CREATE INDEX idx_memory_events_ts ON memory_events(ts DESC);
+";
 
 // v7: per-profile scoping. Every existing row inherits 'shared' from the
 // DEFAULT (visible to both work and personal profiles); new memories are
 // written with the active profile's scope. The FTS triggers (v1) don't
 // reference `scope`, so this column is invisible to lexical search and fully
 // backward-compatible with older binaries (which SELECT explicit columns).
-// Numbered 7 (not 5) because deployed DBs are already at version 6 — see the
-// note in migrate().
 const SCHEMA_V7: &str = "
 ALTER TABLE memories ADD COLUMN scope TEXT NOT NULL DEFAULT 'shared';
 CREATE INDEX IF NOT EXISTS idx_memories_scope ON memories(scope);
