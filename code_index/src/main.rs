@@ -7,9 +7,11 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use code_index::edges::build_edges;
 use code_index::embed::{embed_pending_concurrent, select_embedder};
+use code_index::graph::Graph;
 use code_index::ingest::ingest_with;
 use code_index::recall::{recall_with_mode, RecallMode};
 use code_index::store::SqliteStore;
+use code_index::{ChunkId, Store};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -87,14 +89,32 @@ enum Command {
 
 #[derive(Subcommand, Debug)]
 enum GraphOp {
-    /// Populate edges from chunks using the current analyzer.
+    /// Populate edges from chunks via the chunker reference pass.
     Build,
-    /// List detected communities.
-    Communities,
+    /// Quick overview: nodes, edges, components, degree.
+    Stats,
+    /// List weakly-connected components, biggest first.
+    Communities {
+        /// Limit how many components to print.
+        #[arg(short = 'n', long, default_value_t = 10)]
+        limit: usize,
+        /// Skip components below this node count.
+        #[arg(long, default_value_t = 2)]
+        min_size: usize,
+    },
     /// Print shortest path between two chunk identifiers.
     Path { from: i64, to: i64 },
-    /// Centrality scores per chunk.
-    Centrality,
+    /// PageRank-style centrality. Prints top-N chunks by score.
+    Centrality {
+        #[arg(short = 'n', long, default_value_t = 20)]
+        limit: usize,
+        /// PageRank damping factor. 0.85 is the canonical value.
+        #[arg(long, default_value_t = 0.85)]
+        damping: f32,
+        /// Iteration count for the power-method update.
+        #[arg(long, default_value_t = 50)]
+        iterations: usize,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -110,6 +130,31 @@ fn open_store(db: Option<&std::path::Path>) -> Result<SqliteStore> {
         Some(p) => SqliteStore::open_at(p),
         None => SqliteStore::open_default(),
     }
+}
+
+fn print_component(
+    store: &dyn Store,
+    index: usize,
+    comp: &[ChunkId],
+) -> Result<()> {
+    println!("# Component {index} — {} nodes", comp.len());
+    // Sample up to 10 names so big components don't spam output.
+    let sample = comp.iter().take(10);
+    for id in sample {
+        if let Some(c) = store.get_chunk(*id)? {
+            println!(
+                "  {:?} {}  {}:{}",
+                c.kind,
+                c.name,
+                c.file.display(),
+                c.lines.start,
+            );
+        }
+    }
+    if comp.len() > 10 {
+        println!("  ... and {} more", comp.len() - 10);
+    }
+    Ok(())
 }
 
 fn main() -> Result<()> {
@@ -196,12 +241,88 @@ fn main() -> Result<()> {
                 );
                 Ok(())
             }
-            GraphOp::Communities => todo!("graph communities: analyzer.community_detection"),
-            GraphOp::Path { from, to } => {
-                let _ = (from, to);
-                todo!("graph path: analyzer.shortest_path")
+            GraphOp::Stats => {
+                let store = open_store(cli.db.as_deref())?;
+                let g = Graph::from_store(&store)?;
+                let s = g.stats();
+                println!(
+                    "graph: {} nodes, {} edges, {} components, max degree {}, avg degree {:.2}",
+                    s.nodes, s.edges, s.components, s.max_degree, s.avg_degree,
+                );
+                Ok(())
             }
-            GraphOp::Centrality => todo!("graph centrality: analyzer.centrality"),
+            GraphOp::Communities { limit, min_size } => {
+                let store = open_store(cli.db.as_deref())?;
+                let g = Graph::from_store(&store)?;
+                let comps = g.connected_components();
+                let total = comps.len();
+                let mut printed = 0;
+                for (i, comp) in comps.iter().enumerate() {
+                    if comp.len() < min_size {
+                        continue;
+                    }
+                    if printed >= limit {
+                        break;
+                    }
+                    print_component(&store, i, comp)?;
+                    printed += 1;
+                }
+                println!(
+                    "(printed {printed} of {total} components; showing components with >= {min_size} nodes)",
+                );
+                Ok(())
+            }
+            GraphOp::Path { from, to } => {
+                let store = open_store(cli.db.as_deref())?;
+                let g = Graph::from_store(&store)?;
+                match g.shortest_path(ChunkId(from), ChunkId(to)) {
+                    None => {
+                        println!("no path from ChunkId({from}) to ChunkId({to})");
+                    }
+                    Some(path) => {
+                        for id in path {
+                            if let Some(c) = store.get_chunk(id)? {
+                                println!(
+                                    "ChunkId({}) {:?} {} {}:{}-{}",
+                                    id.0,
+                                    c.kind,
+                                    c.name,
+                                    c.file.display(),
+                                    c.lines.start,
+                                    c.lines.end,
+                                );
+                            } else {
+                                println!("ChunkId({}) [chunk missing]", id.0);
+                            }
+                        }
+                    }
+                }
+                Ok(())
+            }
+            GraphOp::Centrality {
+                limit,
+                damping,
+                iterations,
+            } => {
+                let store = open_store(cli.db.as_deref())?;
+                let g = Graph::from_store(&store)?;
+                let ranks = g.pagerank(damping, iterations);
+                for (id, score) in ranks.into_iter().take(limit) {
+                    if let Some(c) = store.get_chunk(id)? {
+                        println!(
+                            "{score:.5}  {:?} {}  {}:{}-{}",
+                            c.kind,
+                            c.name,
+                            c.file.display(),
+                            c.lines.start,
+                            c.lines.end,
+                        );
+                    } else {
+                        println!("{score:.5}  ChunkId({})", id.0);
+                    }
+                }
+                Ok(())
+            }
         },
         Command::Status => todo!("status: index size, last update, file count"),
         Command::Analyzer { op } => match op {
