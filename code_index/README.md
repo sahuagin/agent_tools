@@ -106,13 +106,20 @@ sqlite3 ~/.cache/code_index/<repo>.db \
 
 ## Languages
 
-Today: Rust (`.rs`), Python (`.py`, `.pyi`).
+Today:
+- Rust (`.rs`)
+- Python (`.py`, `.pyi`)
+- TypeScript (`.ts`, `.mts`, `.cts`) and JavaScript (`.js`, `.mjs`, `.cjs`)
+  — both route to the TypeScript grammar, which parses JS as a syntactic
+  subset
+- TSX/JSX (`.tsx`, `.jsx`) — separate grammar that accepts JSX
 
 `tags.scm` queries are vendored from upstream `tree-sitter-<lang>` repos
-under MIT license — see `src/chunker/queries/ATTRIBUTIONS.md`. Adding a
-language is ~30 minutes: add the grammar crate dep, vendor its
-`queries/tags.scm`, register the file extension in
-`SupportedLanguage::from_extension`.
+where they exist (Rust, Python — under MIT). The TypeScript/TSX query is
+hand-authored because tree-sitter-typescript doesn't ship a tags.scm —
+see `src/chunker/queries/ATTRIBUTIONS.md`. Adding a language is ~30
+minutes: add the grammar crate dep, vendor or write its `tags.scm`,
+register the file extension in `SupportedLanguage::from_extension`.
 
 ## Embedder configuration
 

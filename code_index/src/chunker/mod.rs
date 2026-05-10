@@ -25,6 +25,13 @@ mod extract;
 pub enum SupportedLanguage {
     Rust,
     Python,
+    /// TypeScript and (most of) JavaScript. The TypeScript grammar parses
+    /// JS as a syntactic subset, so .js/.mjs/.cjs files route here too —
+    /// avoiding a separate tree-sitter-javascript dep. The one thing this
+    /// can't parse is JSX inside .js files; those need `Tsx`.
+    TypeScript,
+    /// TSX grammar — TypeScript + JSX. .tsx/.jsx route here.
+    Tsx,
 }
 
 impl SupportedLanguage {
@@ -33,6 +40,8 @@ impl SupportedLanguage {
         match ext {
             "rs" => Some(Self::Rust),
             "py" | "pyi" => Some(Self::Python),
+            "ts" | "mts" | "cts" | "js" | "mjs" | "cjs" => Some(Self::TypeScript),
+            "tsx" | "jsx" => Some(Self::Tsx),
             _ => None,
         }
     }
@@ -47,6 +56,8 @@ impl SupportedLanguage {
         match self {
             Self::Rust => tree_sitter_rust::LANGUAGE.into(),
             Self::Python => tree_sitter_python::LANGUAGE.into(),
+            Self::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+            Self::Tsx => tree_sitter_typescript::LANGUAGE_TSX.into(),
         }
     }
 
@@ -54,6 +65,9 @@ impl SupportedLanguage {
         match self {
             Self::Rust => include_str!("queries/rust/tags.scm"),
             Self::Python => include_str!("queries/python/tags.scm"),
+            // TS and TSX share the same tags.scm — node types are
+            // identical between the two grammars; only JSX support differs.
+            Self::TypeScript | Self::Tsx => include_str!("queries/typescript/tags.scm"),
         }
     }
 }
@@ -235,6 +249,20 @@ mod tests {
             SupportedLanguage::from_extension("pyi"),
             Some(SupportedLanguage::Python)
         );
+        for ext in ["ts", "mts", "cts", "js", "mjs", "cjs"] {
+            assert_eq!(
+                SupportedLanguage::from_extension(ext),
+                Some(SupportedLanguage::TypeScript),
+                "extension {ext} should route to TypeScript",
+            );
+        }
+        for ext in ["tsx", "jsx"] {
+            assert_eq!(
+                SupportedLanguage::from_extension(ext),
+                Some(SupportedLanguage::Tsx),
+                "extension {ext} should route to Tsx",
+            );
+        }
         assert_eq!(SupportedLanguage::from_extension("md"), None);
     }
 
@@ -465,6 +493,80 @@ class Speaker:
             "oversize function chunks are kept; only modules are dropped"
         );
         assert!(huge.unwrap().text.len() > 32 * 1024);
+    }
+
+    #[test]
+    fn typescript_extracts_function_class_interface_and_arrow() {
+        let src = r#"
+function shout(msg: string): string {
+    return msg.toUpperCase();
+}
+
+const greet = (name: string): string => `hi ${name}`;
+
+class Speaker {
+    say(msg: string): void {
+        console.log(msg);
+    }
+}
+
+interface Greetable {
+    name: string;
+}
+
+type Pair<T> = [T, T];
+
+enum Mode { On, Off }
+"#;
+        let chunker = Chunker::for_language(SupportedLanguage::TypeScript).expect("compile");
+        let chunks = chunker
+            .extract(src.as_bytes(), &PathBuf::from("speaker.ts"))
+            .expect("extract");
+        let by_name: std::collections::HashMap<_, _> =
+            chunks.iter().map(|c| (c.name.as_str(), c.kind)).collect();
+
+        assert_eq!(by_name.get("shout"), Some(&ChunkKind::Function));
+        assert_eq!(by_name.get("greet"), Some(&ChunkKind::Function));
+        assert_eq!(by_name.get("Speaker"), Some(&ChunkKind::Class));
+        // Methods are inside class bodies; precedence rule prefers method
+        // over function (mirrors the Rust impl-method case).
+        assert_eq!(by_name.get("say"), Some(&ChunkKind::Method));
+        assert_eq!(by_name.get("Greetable"), Some(&ChunkKind::Interface));
+        assert_eq!(by_name.get("Pair"), Some(&ChunkKind::Type));
+        assert_eq!(by_name.get("Mode"), Some(&ChunkKind::Enum));
+    }
+
+    #[test]
+    fn tsx_parses_jsx_in_arrow_components() {
+        // The TypeScript grammar would reject the `<div>...</div>` in the
+        // body; TSX must accept it. Verifies the Tsx variant routes to a
+        // different parser even though it shares tags.scm with TypeScript.
+        let src = r#"
+const Hello = (props: { name: string }) => <div>hi {props.name}</div>;
+"#;
+        let chunker = Chunker::for_language(SupportedLanguage::Tsx).expect("compile");
+        let chunks = chunker
+            .extract(src.as_bytes(), &PathBuf::from("Hello.tsx"))
+            .expect("extract");
+        assert!(
+            chunks.iter().any(|c| c.name == "Hello" && c.kind == ChunkKind::Function),
+            "Hello arrow component should be captured as a function chunk"
+        );
+    }
+
+    #[test]
+    fn javascript_files_route_through_typescript_grammar() {
+        // .js files map to SupportedLanguage::TypeScript — TS is a syntactic
+        // superset of JS (modulo JSX), so plain JS parses correctly.
+        let chunker = Chunker::for_path(&PathBuf::from("util.js"))
+            .expect("js is supported")
+            .expect("compile");
+        assert_eq!(chunker.language(), SupportedLanguage::TypeScript);
+        let src = "function plain() { return 1; }\n";
+        let chunks = chunker
+            .extract(src.as_bytes(), &PathBuf::from("util.js"))
+            .expect("extract");
+        assert!(chunks.iter().any(|c| c.name == "plain"));
     }
 
     #[test]
