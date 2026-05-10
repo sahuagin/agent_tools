@@ -13,7 +13,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection};
 
-use super::schema::SCHEMA_V1;
+use super::schema::{SCHEMA_V1, SCHEMA_V2};
 use crate::{Chunk, ChunkId, ChunkKind, Edge, EdgeKind, Store};
 
 pub struct SqliteStore {
@@ -68,6 +68,15 @@ impl SqliteStore {
             conn.execute_batch(SCHEMA_V1)?;
             conn.execute(
                 "INSERT INTO schema_version (version, applied) VALUES (1, ?)",
+                [now_secs()],
+            )?;
+            conn.execute_batch("COMMIT")?;
+        }
+        if version < 2 {
+            conn.execute_batch("BEGIN")?;
+            conn.execute_batch(SCHEMA_V2)?;
+            conn.execute(
+                "INSERT INTO schema_version (version, applied) VALUES (2, ?)",
                 [now_secs()],
             )?;
             conn.execute_batch("COMMIT")?;
@@ -451,6 +460,57 @@ impl Store for SqliteStore {
         let mut out = Vec::new();
         for r in rows {
             out.push(r?);
+        }
+        Ok(out)
+    }
+
+    fn recall_lexical(
+        &self,
+        query: &str,
+        k: usize,
+    ) -> Result<Vec<(ChunkId, f32)>> {
+        // Sanitize: FTS5's MATCH syntax has special characters (".", ":",
+        // "*", "(", ")", AND/OR/NOT keywords) that error or alter
+        // semantics if passed raw. We split the query into tokens at
+        // every non-alphanumeric-non-underscore character — both
+        // whitespace and punctuation — and wrap each token in double
+        // quotes as an FTS5 phrase literal. That sidesteps the syntax
+        // surface entirely while still letting FTS5's own tokenizer
+        // further split snake_case at the index level.
+        //
+        // Atoms are joined with OR so a multi-token query matches docs
+        // that contain ANY of the atoms; BM25 then ranks docs that
+        // contain MORE atoms higher.
+        let atoms: Vec<String> = query
+            .split(|c: char| !c.is_alphanumeric() && c != '_')
+            .filter(|s| !s.is_empty())
+            .map(|s| s.replace('"', "\"\""))
+            .map(|s| format!("\"{s}\""))
+            .collect();
+        if atoms.is_empty() {
+            return Ok(Vec::new());
+        }
+        let match_query = atoms.join(" OR ");
+
+        let mut stmt = self.conn.prepare(
+            "SELECT rowid, rank
+             FROM chunks_fts
+             WHERE chunks_fts MATCH ?
+             ORDER BY rank
+             LIMIT ?",
+        )?;
+        let rows = stmt.query_map(params![match_query, k as i64], |row| {
+            let id: i64 = row.get(0)?;
+            let rank: f64 = row.get(1)?;
+            Ok((id, rank))
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            let (id, rank) = r?;
+            // FTS5 BM25 rank is negative; lower (more negative) is better.
+            // Flip sign so callers see a positive "higher is better"
+            // score consistent with cosine.
+            out.push((ChunkId(id), -(rank as f32)));
         }
         Ok(out)
     }

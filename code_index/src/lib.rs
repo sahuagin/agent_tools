@@ -112,6 +112,18 @@ pub trait Store {
     /// embedding pass to find work after a re-chunk.
     fn chunks_missing_embedding(&self, model: &str) -> Result<Vec<Chunk>>;
 
+    /// Lexical (BM25-style) recall. Returns `(id, score)` pairs ranked
+    /// by relevance to `query`; same readv-style scatter shape as
+    /// `recall_top_k`. Score is non-negative; higher is better. Backing
+    /// implementation may use a full-text index (sqlite FTS5 in the
+    /// SqliteStore case) or a simpler substring scan — callers should
+    /// not depend on a specific scoring scale.
+    fn recall_lexical(
+        &self,
+        query: &str,
+        k: usize,
+    ) -> Result<Vec<(ChunkId, f32)>>;
+
     // manifest / staleness
     fn file_signature(&self, file: &Path) -> Result<Option<u64>>;
     fn set_file_signature(&mut self, file: &Path, hash: u64) -> Result<()>;

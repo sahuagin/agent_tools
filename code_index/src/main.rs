@@ -7,7 +7,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use code_index::embed::{embed_pending_concurrent, select_embedder};
 use code_index::ingest::ingest_with;
-use code_index::recall::recall;
+use code_index::recall::{recall_with_mode, RecallMode};
 use code_index::store::SqliteStore;
 
 #[derive(Parser, Debug)]
@@ -55,7 +55,9 @@ enum Command {
         #[arg(long)]
         no_gitignore: bool,
     },
-    /// Semantic recall over indexed chunks. Returns ranked (id, score) pairs.
+    /// Recall over indexed chunks. Returns ranked (id, score) pairs.
+    /// Combines semantic embedding similarity with lexical FTS5 BM25
+    /// by default — toggle via `--mode`.
     Recall {
         query: String,
         #[arg(short = 'n', long, default_value_t = 10)]
@@ -63,6 +65,10 @@ enum Command {
         /// Materialize and print chunk contents for results.
         #[arg(long)]
         full: bool,
+        /// Recall strategy: `hybrid` (default, semantic + lexical via RRF),
+        /// `semantic` (embedding cosine only), or `lexical` (FTS5 BM25 only).
+        #[arg(long, default_value = "hybrid")]
+        mode: String,
     },
     /// Graph operations — build edges, run analyzers, inspect communities.
     Graph {
@@ -139,10 +145,17 @@ fn main() -> Result<()> {
             );
             Ok(())
         }
-        Command::Recall { query, limit, full } => {
+        Command::Recall {
+            query,
+            limit,
+            full,
+            mode,
+        } => {
             let store = open_store(cli.db.as_deref())?;
             let embedder = select_embedder();
-            let hits = recall(&store, embedder.as_ref(), &query, limit, full)?;
+            let mode = RecallMode::from_str(&mode)
+                .ok_or_else(|| anyhow::anyhow!("invalid --mode {mode:?}; expected hybrid|semantic|lexical"))?;
+            let hits = recall_with_mode(&store, embedder.as_ref(), &query, limit, full, mode)?;
             if hits.is_empty() {
                 println!("(no hits — has the path been ingested with embeddings?)");
             }

@@ -44,3 +44,53 @@ CREATE TABLE IF NOT EXISTS file_manifest (
     seen_at    INTEGER NOT NULL
 );
 "#;
+
+/// V2 adds the FTS5 lexical index over chunks(name, text) and the
+/// triggers that keep it in sync. External-content mode (content='chunks')
+/// avoids duplicating name/text — FTS5 reads them from the underlying
+/// table during query.
+///
+/// Tokenizer choice — default `unicode61`. Splits on `_` so identifiers
+/// like `read_parquet_from_s3` become 4 tokens (`read`, `parquet`,
+/// `from`, `s3`) and a query for `parquet` matches them all. This is
+/// the right behavior for code search: users typically know one or two
+/// of the constituent words, not the full snake-cased identifier. The
+/// cost is reduced precision when the user DOES know the exact symbol;
+/// semantic recall covers that case.
+///
+/// On migration, `INSERT INTO chunks_fts(chunks_fts) VALUES('rebuild')`
+/// backfills the index from the existing chunks rows. Cheap relative to
+/// the embedding pass.
+pub(super) const SCHEMA_V2: &str = r#"
+CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
+    name,
+    text,
+    content='chunks',
+    content_rowid='id',
+    tokenize='unicode61'
+);
+
+-- Insert: mirror new chunks into the FTS index.
+CREATE TRIGGER IF NOT EXISTS chunks_fts_ai AFTER INSERT ON chunks BEGIN
+    INSERT INTO chunks_fts(rowid, name, text)
+        VALUES (new.id, new.name, new.text);
+END;
+
+-- Delete: 'delete' command shape required by external-content FTS5.
+CREATE TRIGGER IF NOT EXISTS chunks_fts_ad AFTER DELETE ON chunks BEGIN
+    INSERT INTO chunks_fts(chunks_fts, rowid, name, text)
+        VALUES ('delete', old.id, old.name, old.text);
+END;
+
+-- Update: drop old, insert new.
+CREATE TRIGGER IF NOT EXISTS chunks_fts_au AFTER UPDATE ON chunks BEGIN
+    INSERT INTO chunks_fts(chunks_fts, rowid, name, text)
+        VALUES ('delete', old.id, old.name, old.text);
+    INSERT INTO chunks_fts(rowid, name, text)
+        VALUES (new.id, new.name, new.text);
+END;
+
+-- Rebuild from any existing rows. No-op for fresh DBs; backfills
+-- existing chunks for DBs that were created before V2 landed.
+INSERT INTO chunks_fts(chunks_fts) VALUES ('rebuild');
+"#;
