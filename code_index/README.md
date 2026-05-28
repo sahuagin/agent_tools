@@ -48,6 +48,31 @@ code-index status                 # what's indexed
 style: marker dir lets commands auto-discover the right DB by walking
 up from cwd.
 
+## Self-documenting help
+
+Every command carries runnable examples in its long help (`--help`; `-h`
+stays terse):
+
+```sh
+code-index recall --help        # examples appended after the option list
+code-index graph --help         # the build → stats/centrality/communities arc
+```
+
+For machine consumers there's `--help-ai`, an agent-oriented variant that
+documents what the human help leaves implicit — output/parse schema,
+sentinel strings (e.g. the `(no hits …)` line), mode-selection rules, and
+preconditions. Terse text by default, or `--json` for a structured object:
+
+```sh
+code-index --help-ai                  # top-level overview (when-to-use, db resolution)
+code-index recall --help-ai           # per-command: output schema, sentinels
+code-index recall --help-ai --json    # same, as JSON
+code-index graph build --help-ai      # graph subops route to the consolidated graph doc
+```
+
+Available on every command (`ingest`, `recall`, `graph`, `status`, `init`)
+and the top level.
+
 ## DB resolution
 
 In order:

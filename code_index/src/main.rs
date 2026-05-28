@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 use code_index::edges::build_edges;
 use code_index::embed::{embed_pending_concurrent, select_embedder};
 use code_index::graph::Graph;
@@ -16,7 +16,8 @@ use code_index::{ChunkId, Store};
 #[command(
     name = "code-index",
     version,
-    about = "Code-aware indexing and retrieval for agentic workflows."
+    about = "Code-aware indexing and retrieval for agentic workflows.",
+    after_long_help = TOP_AFTER_LONG_HELP
 )]
 struct Cli {
     /// Path to the index database. If omitted, code-index walks up from
@@ -27,15 +28,30 @@ struct Cli {
     #[arg(long, global = true)]
     db: Option<std::path::PathBuf>,
 
+    /// Emit machine-readable, agent-oriented help for the (sub)command and
+    /// exit. Documents output schemas, sentinels, and when-to-use rules
+    /// that the human help leaves implicit. Combine with `--json` for a
+    /// structured object instead of terse text.
+    #[arg(long, global = true)]
+    help_ai: bool,
+
+    /// Emit JSON instead of text. Currently only modifies `--help-ai`
+    /// output; reserved for structured command output in future.
+    #[arg(long, global = true)]
+    json: bool,
+
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Subcommand, Debug)]
 enum Command {
     /// Walk a path, chunk via tree-sitter, embed, and persist to the store.
+    #[command(after_long_help = INGEST_AFTER_LONG_HELP)]
     Ingest {
-        path: std::path::PathBuf,
+        /// Path to walk. Optional only so `--help-ai` works without one;
+        /// required for an actual ingest (use `.` for the current dir).
+        path: Option<std::path::PathBuf>,
         /// Skip embedding pass — useful for offline indexing or when you
         /// just want chunk metadata in the DB.
         #[arg(long)]
@@ -60,8 +76,12 @@ enum Command {
     /// Recall over indexed chunks. Returns ranked (id, score) pairs.
     /// Combines semantic embedding similarity with lexical FTS5 BM25
     /// by default — toggle via `--mode`.
+    #[command(after_long_help = RECALL_AFTER_LONG_HELP)]
     Recall {
-        query: String,
+        /// Query: a prose description of behavior (semantic/hybrid) or an
+        /// exact symbol/string (lexical). Optional only so `--help-ai`
+        /// works without one; required for an actual recall.
+        query: Option<String>,
         #[arg(short = 'n', long, default_value_t = 10)]
         limit: usize,
         /// Materialize and print chunk contents for results.
@@ -87,27 +107,35 @@ enum Command {
         exclude_tests: bool,
     },
     /// Graph operations — build edges, run analyzers, inspect communities.
+    #[command(after_long_help = GRAPH_AFTER_LONG_HELP)]
     Graph {
+        /// Optional only so `code-index graph --help-ai` works without an
+        /// op; required for an actual graph operation.
         #[command(subcommand)]
-        op: GraphOp,
+        op: Option<GraphOp>,
     },
     /// What's indexed, when, how big. Prints DB path, file count, chunk
     /// distribution by kind, embeddings by model, edge distribution.
+    #[command(after_long_help = STATUS_AFTER_LONG_HELP)]
     Status,
     /// Create a `.code_index/` directory in the current working dir,
     /// scoping subsequent commands to a per-project DB. Subsequent
     /// `code-index ingest .` will write to `.code_index/index.db`
     /// instead of the global `~/.cache/code_index/<basename>.db`.
+    #[command(after_long_help = INIT_AFTER_LONG_HELP)]
     Init,
 }
 
 #[derive(Subcommand, Debug)]
 enum GraphOp {
     /// Populate edges from chunks via the chunker reference pass.
+    #[command(after_long_help = "EXAMPLE:\n  code-index graph build   # re-parses every file; run after ingest\n\nDetail: code-index graph --help-ai")]
     Build,
     /// Quick overview: nodes, edges, components, degree.
+    #[command(after_long_help = "EXAMPLE:\n  code-index graph stats\n\nDetail: code-index graph --help-ai")]
     Stats,
     /// List weakly-connected components, biggest first.
+    #[command(after_long_help = "EXAMPLE:\n  code-index graph communities -n 10 --min-size 10\n\nDetail: code-index graph --help-ai")]
     Communities {
         /// Limit how many components to print.
         #[arg(short = 'n', long, default_value_t = 10)]
@@ -117,8 +145,10 @@ enum GraphOp {
         min_size: usize,
     },
     /// Print shortest path between two chunk identifiers.
+    #[command(after_long_help = "EXAMPLE:\n  code-index graph path 1421 8842   # chunk IDs from `recall` or sqlite\n\nDetail: code-index graph --help-ai")]
     Path { from: i64, to: i64 },
     /// PageRank-style centrality. Prints top-N chunks by score.
+    #[command(after_long_help = "EXAMPLE:\n  code-index graph centrality -n 20\n\nDetail: code-index graph --help-ai")]
     Centrality {
         #[arg(short = 'n', long, default_value_t = 20)]
         limit: usize,
@@ -129,6 +159,517 @@ enum GraphOp {
         #[arg(long, default_value_t = 50)]
         iterations: usize,
     },
+}
+
+// ---------------------------------------------------------------------------
+// Help text. Examples are single-sourced here so the human `--help`
+// (`after_long_help`) and the agent-facing `--help-ai` text share one copy;
+// the `--json` form re-lists examples as an array (a deliberately separate
+// representation). When you change an example, change it here.
+// ---------------------------------------------------------------------------
+
+const TOP_AFTER_LONG_HELP: &str = "\
+TYPICAL ARC:
+  cd <repo>
+  code-index init                 # opt into a per-project .code_index/ DB (optional)
+  code-index ingest .             # walk + chunk + embed
+  code-index graph build          # extract call/reference edges
+  code-index recall \"<behavior>\" -n 10 --full
+
+EMBEDDINGS:
+  Real embeddings need OPENROUTER_API_KEY (or CODE_INDEX_EMBED_MODEL /
+  CODE_INDEX_EMBED_BASE_URL, falling back to AGENT_EMBED_MODEL / AGENT_EMBED_BASE_URL).
+    export OPENROUTER_API_KEY=\"$(tq -f ~/.config/agent/config.toml -r openrouter.api_key)\"
+  Without a key a MockEmbedder is used and recall is semantically meaningless.
+
+AGENT-ORIENTED HELP:
+  code-index --help-ai          # terse structured overview
+  code-index --help-ai --json   # JSON overview
+  code-index recall --help-ai   # per-command detail (output schema, sentinels)";
+
+const RECALL_AFTER_LONG_HELP: &str = "\
+EXAMPLES:
+  code-index recall \"promote borrowed to owned\" -n 5 --full   # hybrid (default)
+  code-index recall \"FixedBuffer\" --mode lexical               # exact symbol, no embeddings needed
+  code-index recall \"where do we read parquet from S3\" -n 10   # concept / behavior
+
+AGENT-ORIENTED HELP:
+  code-index recall --help-ai          # terse structured text (output schema, sentinels)
+  code-index recall --help-ai --json   # JSON";
+
+const INGEST_AFTER_LONG_HELP: &str = "\
+EXAMPLES:
+  code-index ingest .                          # walk + chunk + embed cwd
+  code-index ingest . --no-embed               # chunks only (offline / lexical-ready)
+  code-index ingest . --embed-concurrency 8    # default; raise carefully (rate limits)
+  code-index ingest vendored/ --no-gitignore   # index normally-ignored paths
+
+Re-ingest is cheap: only files whose content hash changed are re-chunked, and
+only chunks lacking an embedding for the target model are embedded.
+
+AGENT-ORIENTED HELP:
+  code-index ingest --help-ai [--json]";
+
+const GRAPH_AFTER_LONG_HELP: &str = "\
+TYPICAL ARC (after `code-index ingest .`):
+  code-index graph build                          # extract edges (re-parses every file)
+  code-index graph stats                          # nodes / edges / components / degree
+  code-index graph centrality -n 20               # PageRank top-N
+  code-index graph communities -n 10 --min-size 10
+  code-index graph path <from-id> <to-id>         # shortest path between two chunk IDs
+
+Find chunk IDs via `code-index recall ... --full` or sqlite on the chunks table.
+
+AGENT-ORIENTED HELP:
+  code-index graph --help-ai [--json]";
+
+const STATUS_AFTER_LONG_HELP: &str = "\
+EXAMPLE:
+  code-index status            # DB path, file/chunk counts, embedding coverage, edges
+
+AGENT-ORIENTED HELP:
+  code-index status --help-ai [--json]";
+
+const INIT_AFTER_LONG_HELP: &str = "\
+EXAMPLE:
+  cd <repo> && code-index init   # creates .code_index/; later commands auto-find it
+
+Without init, code-index falls back to ~/.cache/code_index/<basename-of-cwd>.db.
+
+AGENT-ORIENTED HELP:
+  code-index init --help-ai [--json]";
+
+const OVERVIEW_AI_TEXT: &str = "\
+# code-index — code-aware indexing + retrieval (agent-oriented help)
+
+PURPOSE
+  Index a repo (chunk at definition boundaries, embed, store in sqlite) and
+  retrieve relevant chunks by prose or symbol. Built to give an agent a
+  focused slice of an unfamiliar codebase without re-reading every file.
+
+WHEN TO USE WHICH
+  recall (semantic/hybrid) : \"where do we X\", behavior described in prose.
+  recall (lexical)         : exact symbol/keyword; works without embeddings.
+  grep                     : when you know the exact token and want every hit.
+  Ingest a repo before semantic/hybrid recall; lexical works on chunks alone.
+
+PRECONDITIONS
+  Real embeddings require OPENROUTER_API_KEY (or CODE_INDEX_EMBED_MODEL /
+  CODE_INDEX_EMBED_BASE_URL -> AGENT_EMBED_MODEL / AGENT_EMBED_BASE_URL).
+  Without a key a MockEmbedder is used: recall returns results but they are
+  semantically meaningless.
+    export OPENROUTER_API_KEY=\"$(tq -f ~/.config/agent/config.toml -r openrouter.api_key)\"
+
+DB RESOLUTION (first match wins)
+  1. --db <path>
+  2. $CODE_INDEX_DB
+  3. nearest .code_index/index.db walking up from cwd
+  4. ~/.cache/code_index/<basename-of-cwd>.db
+
+COMMANDS
+  ingest <path>    walk + chunk + embed into the DB
+  recall <query>   ranked retrieval; see: code-index recall --help-ai
+  graph <op>       build|stats|communities|path|centrality over the ref graph
+  status           files, chunks, embedding coverage by model
+  init             create .code_index/ to scope a per-project DB
+
+TYPICAL ARC
+  cd <repo> && code-index init && code-index ingest . && code-index graph build
+  code-index recall \"<behavior>\" -n 10 --full
+
+PER-COMMAND DETAIL
+  code-index recall --help-ai [--json]";
+
+const RECALL_AI_TEXT: &str = "\
+# code-index recall — ranked code retrieval (agent-oriented help)
+
+PURPOSE
+  Return indexed chunks ranked by relevance to QUERY. Hybrid fuses semantic
+  (embedding cosine) and lexical (FTS5 BM25) via Reciprocal Rank Fusion.
+
+USAGE
+  code-index recall <QUERY> [-n N] [--full] [--mode hybrid|semantic|lexical]
+                    [--no-test-penalty] [--exclude-tests] [--db PATH]
+
+ARGS
+  <QUERY>             prose description OR exact symbol/string (required)
+  -n, --limit N       max results (default 10)
+  --full              materialize and print chunk source text
+  --mode M            hybrid (default) | semantic | lexical
+  --no-test-penalty   stop the default 0.5x down-weight on test chunks
+  --exclude-tests     drop test chunks from results entirely
+  --db PATH           override DB (else $CODE_INDEX_DB, .code_index/, cache)
+
+MODE SELECTION
+  hybrid    default; safe for most queries
+  semantic  prose / behavior (\"where do we read parquet from S3\")
+  lexical   exact symbol/keyword (\"FixedBuffer\"); WORKS WITHOUT EMBEDDINGS,
+            so it is usable mid-ingest before the embed pass finishes
+
+OUTPUT (stdout; one line per hit)
+  without --full:  \"<score:.4>  ChunkId(<id>)\"
+  with --full:     \"<score:.4>  <Kind> <name>  <file>:<startLine>-<endLine>\"
+                   then on following lines:  ---\\n<chunk source text>\\n---
+  IMPORTANT: file/name/line metadata appears ONLY with --full. A bare recall
+  prints score + ChunkId only.
+
+SENTINELS / ERRORS
+  \"(no hits — has the path been ingested with embeddings?)\"
+      -> no embeddings for this model yet, or only-lexical chunks with
+         mode != lexical. Run `code-index ingest .` (with a key) first,
+         or retry with --mode lexical.
+  invalid --mode value -> message on stderr, non-zero exit.
+
+EXAMPLES
+  code-index recall \"promote borrowed to owned\" -n 5 --full
+  code-index recall \"FixedBuffer\" --mode lexical
+  code-index recall \"where do we read parquet from S3\" -n 10";
+
+const INGEST_AI_TEXT: &str = "\
+# code-index ingest — walk, chunk, embed, persist (agent-oriented help)
+
+PURPOSE
+  Walk PATH, chunk each supported source file at definition boundaries via
+  tree-sitter, embed the chunks, and upsert into the sqlite store.
+
+USAGE
+  code-index ingest <PATH> [--no-embed] [--embed-batch-size N]
+                    [--embed-concurrency N] [--no-gitignore] [--db PATH]
+
+ARGS
+  <PATH>                  dir or file to walk (use \".\" for cwd) (required)
+  --no-embed              chunk + persist only; skip the embedding pass
+  --embed-batch-size N    chunks per embed request (default 16)
+  --embed-concurrency N   in-flight embed HTTP requests (default 8)
+  --no-gitignore          index paths normally excluded by .gitignore/.ignore
+  --db PATH               override DB resolution
+
+PRECONDITIONS
+  Embedding needs OPENROUTER_API_KEY (or CODE_INDEX_EMBED_* / AGENT_EMBED_*).
+  Without a key the MockEmbedder is used (results semantically meaningless).
+  --no-embed avoids the API entirely; lexical recall still works afterward.
+
+INCREMENTALITY
+  Only files whose content hash changed are re-chunked. Only chunks lacking
+  an embedding for the target model are embedded. Safe and cheap to re-run.
+
+OUTPUT (stdout, one summary line)
+  \"<path>: <N> files walked, <N> unchanged, <N> re-chunked, <N> chunks, <N> embedded\"
+
+SUPPORTED LANGUAGES
+  Rust (.rs), Python (.py, .pyi). Other files are skipped.
+
+EXAMPLES
+  code-index ingest .
+  code-index ingest . --no-embed
+  code-index ingest vendored/ --no-gitignore";
+
+const GRAPH_AI_TEXT: &str = "\
+# code-index graph — call/reference graph ops (agent-oriented help)
+
+PURPOSE
+  Build and analyze a directed graph of call/reference edges across chunks.
+  Edges come from a re-parse pass that resolves tree-sitter reference tags by
+  name lookup against the chunks table.
+
+OPS
+  build                                 extract edges (re-parses every manifest file)
+  stats                                 nodes, edges, components, max/avg degree
+  communities [-n N] [--min-size M]     weakly-connected components, biggest first
+  path <FROM> <TO>                      shortest path between two chunk IDs
+  centrality [-n N] [--damping D] [--iterations I]   PageRank top-N
+
+PRECONDITION
+  Run `code-index graph build` after ingest before stats/communities/path/
+  centrality — they read the edges the build pass populates.
+
+EDGE CONFIDENCE (v1 name resolution)
+  same-file single match 1.0; cross-file single 0.85; ambiguous 0.85/0.6;
+  no match -> unresolved (external / std / out-of-tree).
+
+OUTPUT (stdout)
+  build       : \"graph build: <N> files processed (<N> skipped), <N> references found, <N> edges emitted, <N> unresolved\"
+  stats       : \"graph: <N> nodes, <N> edges, <N> components, max degree <N>, avg degree <f>\"
+  communities : per component \"# Component <i> — <N> nodes\" then up to 10 \"<Kind> <name>  <file>:<line>\"
+  path        : one line per hop \"ChunkId(<id>) <Kind> <name> <file>:<start>-<end>\", or \"no path ...\"
+  centrality  : one line per chunk \"<score:.5>  <Kind> <name>  <file>:<start>-<end>\"
+
+FINDING CHUNK IDS (for `path`)
+  code-index recall \"<symbol>\" --full
+  sqlite3 <db> \"SELECT id,kind,name,file FROM chunks WHERE name='X' LIMIT 5;\"
+
+EXAMPLES
+  code-index graph build
+  code-index graph centrality -n 20
+  code-index graph communities -n 10 --min-size 10
+  code-index graph path 1421 8842";
+
+const STATUS_AI_TEXT: &str = "\
+# code-index status — index health (agent-oriented help)
+
+PURPOSE
+  Report what's indexed in the resolved DB: path, size, counts, embedding
+  coverage by model, edge distribution. Read-only.
+
+USAGE
+  code-index status [--db PATH]
+
+OUTPUT (stdout, key/value lines)
+  db: <path>
+  size: <bytes> bytes
+  files: <N>
+  chunks: <N>
+  edges: <N>
+  last indexed: <N> sec ago        (only if any chunk has a timestamp)
+  chunk kinds:                     (then \"  <kind>: <N>\" lines)
+  embeddings: none | per model \"  <model>: <N> (<pct>%)\"
+  edge kinds:                      (only if edges > 0)
+
+INTERPRETING
+  embeddings \"none\" or low % -> semantic/hybrid recall will be empty/weak;
+  run `code-index ingest .` with a key. edges 0 -> run `code-index graph build`.
+
+EXAMPLE
+  code-index status";
+
+const INIT_AI_TEXT: &str = "\
+# code-index init — scope a per-project DB (agent-oriented help)
+
+PURPOSE
+  Create a `.code_index/` directory in cwd so subsequent commands in this
+  tree resolve to `.code_index/index.db` (walk-up discovery, git/jj-style)
+  instead of the global `~/.cache/code_index/<basename>.db`.
+
+USAGE
+  code-index init
+
+EFFECT
+  Creates .code_index/index.db. Optional — without init, the global cache
+  path is used. After init, ingest/recall/graph auto-find the project DB by
+  walking up from cwd.
+
+OUTPUT (stdout)
+  \"initialized <dir> — subsequent code-index commands in this tree will use <dir>/index.db\"
+
+EXAMPLE
+  cd <repo> && code-index init && code-index ingest .";
+
+/// Render agent-oriented help for the resolved (sub)command and return.
+/// `None` (no subcommand) renders the top-level overview; each subcommand
+/// renders its own doc. Graph subops all route to the consolidated graph
+/// doc, which documents every op.
+fn print_ai_help(command: Option<&Command>, json: bool) {
+    let (text, json_fn): (&str, fn() -> String) = match command {
+        Some(Command::Ingest { .. }) => (INGEST_AI_TEXT, ingest_ai_json),
+        Some(Command::Recall { .. }) => (RECALL_AI_TEXT, recall_ai_json),
+        Some(Command::Graph { .. }) => (GRAPH_AI_TEXT, graph_ai_json),
+        Some(Command::Status) => (STATUS_AI_TEXT, status_ai_json),
+        Some(Command::Init) => (INIT_AI_TEXT, init_ai_json),
+        None => (OVERVIEW_AI_TEXT, overview_ai_json),
+    };
+    if json {
+        println!("{}", json_fn());
+    } else {
+        println!("{text}");
+    }
+}
+
+fn overview_ai_json() -> String {
+    let v = serde_json::json!({
+        "tool": "code-index",
+        "purpose": "Index a repo (chunk at definition boundaries, embed, store in \
+                    sqlite) and retrieve relevant chunks by prose or symbol.",
+        "when_to_use": {
+            "recall_semantic_or_hybrid": "behavior described in prose (\"where do we X\")",
+            "recall_lexical": "exact symbol/keyword; works without embeddings",
+            "grep": "when you know the exact token and want every hit"
+        },
+        "preconditions": {
+            "embeddings_env": ["OPENROUTER_API_KEY", "CODE_INDEX_EMBED_MODEL",
+                "CODE_INDEX_EMBED_BASE_URL", "AGENT_EMBED_MODEL", "AGENT_EMBED_BASE_URL"],
+            "no_key_behavior": "MockEmbedder is used; recall results are semantically meaningless"
+        },
+        "db_resolution_order": [
+            "--db <path>", "$CODE_INDEX_DB",
+            "nearest .code_index/index.db walking up from cwd",
+            "~/.cache/code_index/<basename-of-cwd>.db"
+        ],
+        "commands": {
+            "ingest <path>": "walk + chunk + embed into the DB",
+            "recall <query>": "ranked retrieval; see `code-index recall --help-ai --json`",
+            "graph <op>": "build|stats|communities|path|centrality over the ref graph",
+            "status": "files, chunks, embedding coverage by model",
+            "init": "create .code_index/ to scope a per-project DB"
+        },
+        "typical_arc": [
+            "cd <repo>", "code-index init", "code-index ingest .",
+            "code-index graph build", "code-index recall \"<behavior>\" -n 10 --full"
+        ]
+    });
+    serde_json::to_string_pretty(&v).unwrap_or_else(|_| v.to_string())
+}
+
+fn recall_ai_json() -> String {
+    let v = serde_json::json!({
+        "command": "recall",
+        "purpose": "Return indexed chunks ranked by relevance to QUERY. Hybrid fuses \
+                    semantic (embedding cosine) and lexical (FTS5 BM25) via RRF.",
+        "usage": "code-index recall <QUERY> [-n N] [--full] [--mode hybrid|semantic|lexical] \
+                  [--no-test-penalty] [--exclude-tests] [--db PATH]",
+        "args": [
+            {"name": "query", "positional": true, "required": true,
+             "desc": "prose description OR exact symbol/string"},
+            {"name": "--limit/-n", "type": "usize", "default": 10, "desc": "max results"},
+            {"name": "--full", "type": "flag", "desc": "materialize and print chunk source text"},
+            {"name": "--mode", "type": "enum", "values": ["hybrid", "semantic", "lexical"],
+             "default": "hybrid"},
+            {"name": "--no-test-penalty", "type": "flag",
+             "desc": "stop the default 0.5x down-weight on test chunks"},
+            {"name": "--exclude-tests", "type": "flag", "desc": "drop test chunks entirely"},
+            {"name": "--db", "type": "path", "desc": "override DB resolution"}
+        ],
+        "mode_selection": {
+            "hybrid": "default; safe for most queries",
+            "semantic": "prose/behavior",
+            "lexical": "exact symbol/keyword; works WITHOUT embeddings (usable mid-ingest)"
+        },
+        "output_schema": {
+            "stream": "stdout, one line per hit",
+            "without_full": "<score:.4>  ChunkId(<id>)",
+            "with_full": "<score:.4>  <Kind> <name>  <file>:<startLine>-<endLine>\n---\n<text>\n---",
+            "note": "file/name/line metadata appears ONLY with --full"
+        },
+        "sentinels": [
+            {"text": "(no hits — has the path been ingested with embeddings?)",
+             "meaning": "no embeddings for this model, or only-lexical chunks with mode!=lexical",
+             "remedy": "run `code-index ingest .` with a key, or retry --mode lexical"},
+            {"text": "invalid --mode ...", "stream": "stderr", "exit": "non-zero"}
+        ],
+        "examples": [
+            "code-index recall \"promote borrowed to owned\" -n 5 --full",
+            "code-index recall \"FixedBuffer\" --mode lexical",
+            "code-index recall \"where do we read parquet from S3\" -n 10"
+        ]
+    });
+    serde_json::to_string_pretty(&v).unwrap_or_else(|_| v.to_string())
+}
+
+fn ingest_ai_json() -> String {
+    let v = serde_json::json!({
+        "command": "ingest",
+        "purpose": "Walk PATH, chunk source files at definition boundaries via \
+                    tree-sitter, embed, and upsert into the sqlite store.",
+        "usage": "code-index ingest <PATH> [--no-embed] [--embed-batch-size N] \
+                  [--embed-concurrency N] [--no-gitignore] [--db PATH]",
+        "args": [
+            {"name": "path", "positional": true, "required": true,
+             "desc": "dir or file to walk; use \".\" for cwd"},
+            {"name": "--no-embed", "type": "flag", "desc": "chunk + persist only; skip embedding"},
+            {"name": "--embed-batch-size", "type": "usize", "default": 16},
+            {"name": "--embed-concurrency", "type": "usize", "default": 8},
+            {"name": "--no-gitignore", "type": "flag", "desc": "index normally-ignored paths"},
+            {"name": "--db", "type": "path", "desc": "override DB resolution"}
+        ],
+        "preconditions": {
+            "embeddings_env": ["OPENROUTER_API_KEY", "CODE_INDEX_EMBED_MODEL",
+                "CODE_INDEX_EMBED_BASE_URL", "AGENT_EMBED_MODEL", "AGENT_EMBED_BASE_URL"],
+            "no_key_behavior": "MockEmbedder used; embeddings semantically meaningless",
+            "no_embed_flag": "--no-embed skips the API entirely; lexical recall still works"
+        },
+        "incrementality": "only content-hash-changed files re-chunked; only chunks \
+                           lacking an embedding for the model are embedded; cheap to re-run",
+        "output_schema": {
+            "stream": "stdout, one summary line",
+            "format": "<path>: <N> files walked, <N> unchanged, <N> re-chunked, <N> chunks, <N> embedded"
+        },
+        "supported_languages": ["rust (.rs)", "python (.py, .pyi)"],
+        "examples": [
+            "code-index ingest .",
+            "code-index ingest . --no-embed",
+            "code-index ingest vendored/ --no-gitignore"
+        ]
+    });
+    serde_json::to_string_pretty(&v).unwrap_or_else(|_| v.to_string())
+}
+
+fn graph_ai_json() -> String {
+    let v = serde_json::json!({
+        "command": "graph",
+        "purpose": "Build and analyze a directed call/reference graph across chunks. \
+                    Edges resolved by name lookup from tree-sitter reference tags.",
+        "precondition": "run `code-index graph build` after ingest before \
+                         stats/communities/path/centrality",
+        "ops": {
+            "build": "extract edges (re-parses every manifest file)",
+            "stats": "nodes, edges, components, max/avg degree",
+            "communities": "weakly-connected components, biggest first; [-n N] [--min-size M]",
+            "path": "shortest path between two chunk IDs; <FROM> <TO>",
+            "centrality": "PageRank top-N; [-n N] [--damping D] [--iterations I]"
+        },
+        "edge_confidence": {
+            "same_file_single": 1.0, "cross_file_single": 0.85,
+            "ambiguous": "0.85 same-file else 0.6", "no_match": "unresolved (external/std/out-of-tree)"
+        },
+        "output_schema": {
+            "build": "graph build: <N> files processed (<N> skipped), <N> references found, <N> edges emitted, <N> unresolved",
+            "stats": "graph: <N> nodes, <N> edges, <N> components, max degree <N>, avg degree <f>",
+            "communities": "per component: '# Component <i> — <N> nodes' then up to 10 '<Kind> <name>  <file>:<line>'",
+            "path": "one line per hop 'ChunkId(<id>) <Kind> <name> <file>:<start>-<end>', or 'no path ...'",
+            "centrality": "one line per chunk '<score:.5>  <Kind> <name>  <file>:<start>-<end>'"
+        },
+        "finding_chunk_ids": [
+            "code-index recall \"<symbol>\" --full",
+            "sqlite3 <db> \"SELECT id,kind,name,file FROM chunks WHERE name='X' LIMIT 5;\""
+        ],
+        "examples": [
+            "code-index graph build",
+            "code-index graph centrality -n 20",
+            "code-index graph communities -n 10 --min-size 10",
+            "code-index graph path 1421 8842"
+        ]
+    });
+    serde_json::to_string_pretty(&v).unwrap_or_else(|_| v.to_string())
+}
+
+fn status_ai_json() -> String {
+    let v = serde_json::json!({
+        "command": "status",
+        "purpose": "Report what's indexed in the resolved DB. Read-only.",
+        "usage": "code-index status [--db PATH]",
+        "output_schema": {
+            "stream": "stdout, key/value lines",
+            "lines": [
+                "db: <path>", "size: <bytes> bytes", "files: <N>", "chunks: <N>",
+                "edges: <N>", "last indexed: <N> sec ago (if any chunk timestamped)",
+                "chunk kinds: then '  <kind>: <N>' lines",
+                "embeddings: 'none' or per model '  <model>: <N> (<pct>%)'",
+                "edge kinds: (only if edges > 0)"
+            ]
+        },
+        "interpreting": {
+            "embeddings_none_or_low": "semantic/hybrid recall weak/empty; run ingest with a key",
+            "edges_zero": "run `code-index graph build`"
+        },
+        "examples": ["code-index status"]
+    });
+    serde_json::to_string_pretty(&v).unwrap_or_else(|_| v.to_string())
+}
+
+fn init_ai_json() -> String {
+    let v = serde_json::json!({
+        "command": "init",
+        "purpose": "Create .code_index/ in cwd so subsequent commands resolve to a \
+                    per-project DB (walk-up discovery) instead of the global cache.",
+        "usage": "code-index init",
+        "effect": "creates .code_index/index.db; optional; ingest/recall/graph then \
+                   auto-find the project DB by walking up from cwd",
+        "output_schema": {
+            "stream": "stdout",
+            "format": "initialized <dir> — subsequent code-index commands in this tree will use <dir>/index.db"
+        },
+        "examples": ["cd <repo> && code-index init && code-index ingest ."]
+    });
+    serde_json::to_string_pretty(&v).unwrap_or_else(|_| v.to_string())
 }
 
 /// Resolve which DB path to use, in this precedence:
@@ -225,7 +766,24 @@ fn print_component(
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    match cli.command {
+
+    // `--help-ai` short-circuits before any dispatch: it documents the
+    // (sub)command and exits, exactly like clap's own `--help`.
+    if cli.help_ai {
+        print_ai_help(cli.command.as_ref(), cli.json);
+        return Ok(());
+    }
+
+    // No subcommand and not `--help-ai`: reproduce clap's default
+    // print-help-and-exit behavior (the subcommand is Optional only so
+    // `--help-ai` can stand alone).
+    let Some(command) = cli.command else {
+        Cli::command().print_help()?;
+        println!();
+        return Ok(());
+    };
+
+    match command {
         Command::Ingest {
             path,
             no_embed,
@@ -233,6 +791,10 @@ fn main() -> Result<()> {
             embed_concurrency,
             no_gitignore,
         } => {
+            // `path` is Optional only so `ingest --help-ai` can parse.
+            let path = path.ok_or_else(|| {
+                anyhow::anyhow!("ingest requires a <PATH> (use '.' for cwd, or --help-ai for usage)")
+            })?;
             let mut store = open_store(cli.db.as_deref())?;
             let stats = ingest_with(&path, &mut store, None, !no_gitignore)?;
             let embedded = if no_embed {
@@ -265,6 +827,11 @@ fn main() -> Result<()> {
             no_test_penalty,
             exclude_tests,
         } => {
+            // `query` is Optional only so `recall --help-ai` can parse
+            // without one; an actual recall requires it.
+            let query = query.ok_or_else(|| {
+                anyhow::anyhow!("recall requires a <QUERY> (or pass --help-ai for usage)")
+            })?;
             let store = open_store(cli.db.as_deref())?;
             let embedder = select_embedder();
             let mode = RecallMode::from_str(&mode)
@@ -300,7 +867,15 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
-        Command::Graph { op } => match op {
+        Command::Graph { op } => {
+            // `op` is Optional only so `graph --help-ai` can parse.
+            let op = op.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "graph requires a subcommand: build|stats|communities|path|centrality \
+                     (or pass --help-ai for usage)"
+                )
+            })?;
+            match op {
             GraphOp::Build => {
                 let mut store = open_store(cli.db.as_deref())?;
                 let stats = build_edges(&mut store)?;
@@ -396,7 +971,8 @@ fn main() -> Result<()> {
                 }
                 Ok(())
             }
-        },
+            }
+        }
         Command::Status => {
             let path = resolve_db_path(cli.db.as_deref())?;
             let store = SqliteStore::open_at(&path)?;
