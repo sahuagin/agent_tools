@@ -1,9 +1,10 @@
 use crate::embed;
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use chrono::Utc;
 use clap::{Args, Subcommand};
 use rusqlite::{params, params_from_iter, types::Value, Connection};
 use std::collections::HashMap;
+use std::io::Read;
 use std::path::PathBuf;
 use uuid::Uuid;
 
@@ -49,8 +50,13 @@ pub struct AddArgs {
     pub name: String,
     #[arg(long)]
     pub description: String,
+    /// Memory body. Pass "-" to read from stdin. For large/free-text content
+    /// prefer --content-file to avoid shell-quoting the body on the command line.
     #[arg(long)]
-    pub content: String,
+    pub content: Option<String>,
+    /// Read the memory body from this file (takes precedence over --content).
+    #[arg(long)]
+    pub content_file: Option<PathBuf>,
     #[arg(long, default_value = "")]
     pub tags: String,
     #[arg(long, default_value = "")]
@@ -68,6 +74,10 @@ pub struct UpdateArgs {
     pub description: Option<String>,
     #[arg(long)]
     pub content: Option<String>,
+    /// Read replacement body from this file (takes precedence over --content;
+    /// "-" on --content reads stdin).
+    #[arg(long)]
+    pub content_file: Option<PathBuf>,
     #[arg(long)]
     pub tags: Option<String>,
     #[arg(long)]
@@ -400,20 +410,45 @@ fn log_context_call(
 
 // ── CRUD ──────────────────────────────────────────────────────────────────────
 
+/// Resolve a memory body from the three input modes. Precedence:
+///   --content-file <path>  >  --content -  (stdin)  >  --content <inline>.
+/// Returns None only when none was supplied.
+fn resolve_content(content: Option<String>, content_file: Option<PathBuf>) -> Result<Option<String>> {
+    if let Some(path) = content_file {
+        let body = std::fs::read_to_string(&path)
+            .with_context(|| format!("reading --content-file {}", path.display()))?;
+        return Ok(Some(body));
+    }
+    if content.as_deref() == Some("-") {
+        let mut buf = String::new();
+        std::io::stdin()
+            .read_to_string(&mut buf)
+            .context("reading content from stdin")?;
+        return Ok(Some(buf));
+    }
+    Ok(content)
+}
+
 fn add(conn: &Connection, args: AddArgs) -> Result<()> {
     let valid_types = ["user", "feedback", "project", "reference"];
     if !valid_types.contains(&args.r#type.as_str()) {
         bail!("type must be one of: {}", valid_types.join(", "));
     }
+    let content = match resolve_content(args.content, args.content_file)? {
+        Some(c) => c,
+        None => bail!(
+            "content required: pass --content <text>, --content-file <path>, or --content - to read stdin"
+        ),
+    };
     let id = short_id();
     let ts = now();
     conn.execute(
         "INSERT INTO memories (id, type, name, description, content, source, tags, cwd, is_active, created_at, updated_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1, ?9, ?9)",
-        params![id, args.r#type, args.name, args.description, args.content, args.source, args.tags, args.cwd, ts],
+        params![id, args.r#type, args.name, args.description, content, args.source, args.tags, args.cwd, ts],
     )?;
     rebuild_index_for(conn, &id)?;
-    let text = embed::memory_embed_text(&args.name, &args.description, &args.content);
+    let text = embed::memory_embed_text(&args.name, &args.description, &content);
     embed::try_embed_one(conn, &id, &text);
     println!("{id}");
     Ok(())
@@ -422,6 +457,7 @@ fn add(conn: &Connection, args: AddArgs) -> Result<()> {
 fn update(conn: &Connection, args: UpdateArgs) -> Result<()> {
     let ts = now();
     let mut updated = 0;
+    let content = resolve_content(args.content, args.content_file)?;
 
     if let Some(name) = args.name {
         updated += conn.execute(
@@ -435,7 +471,7 @@ fn update(conn: &Connection, args: UpdateArgs) -> Result<()> {
             params![desc, ts, args.id],
         )?;
     }
-    if let Some(content) = args.content {
+    if let Some(content) = content {
         updated += conn.execute(
             "UPDATE memories SET content=?1, updated_at=?2 WHERE id=?3",
             params![content, ts, args.id],
