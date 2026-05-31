@@ -8,7 +8,9 @@
 //! best of both — we pull each list's top-K independently, then fuse via
 //! Reciprocal Rank Fusion (RRF), a well-studied merging algorithm:
 //!
-//!     score(d) = sum over each source m: 1 / (k_const + rank_m(d))
+//! ```text
+//! score(d) = sum over each source m: 1 / (k_const + rank_m(d))
+//! ```
 //!
 //! Where `rank_m(d)` is the document's 1-indexed rank in source `m`'s
 //! returned list, or infinity if unranked. `k_const = 60` is the
