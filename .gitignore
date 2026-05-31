@@ -1,1 +1,5 @@
 /target/
+
+# Core dumps (e.g. br.core from intermittent `br list --all` crashes, often
+# in jail/pot runs — synced into the tree via the beads .sync machinery).
+*.core
