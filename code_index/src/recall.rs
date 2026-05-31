@@ -8,7 +8,9 @@
 //! best of both — we pull each list's top-K independently, then fuse via
 //! Reciprocal Rank Fusion (RRF), a well-studied merging algorithm:
 //!
-//!     score(d) = sum over each source m: 1 / (k_const + rank_m(d))
+//! ```text
+//! score(d) = sum over each source m: 1 / (k_const + rank_m(d))
+//! ```
 //!
 //! Where `rank_m(d)` is the document's 1-indexed rank in source `m`'s
 //! returned list, or infinity if unranked. `k_const = 60` is the
@@ -311,10 +313,7 @@ fn fuse_rrf(
         *combined.entry(*id).or_insert(0.0) += 1.0 / (RRF_K + r);
     }
     let mut sorted: Vec<(ChunkId, f32)> = combined.into_iter().collect();
-    sorted.sort_by(|a, b| {
-        b.1.partial_cmp(&a.1)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     sorted.truncate(k);
     sorted
 }
@@ -354,9 +353,12 @@ mod tests {
     fn semantic_mode_returns_top_by_cosine() {
         let s = seeded_store_with_embeddings();
         let m = MockEmbedder::default();
-        let hits = recall_with_mode(&s, &m, "alpha", 4, false, RecallMode::Semantic)
-            .unwrap();
-        assert_eq!(hits.len(), 4, "semantic returns up to k regardless of overlap");
+        let hits = recall_with_mode(&s, &m, "alpha", 4, false, RecallMode::Semantic).unwrap();
+        assert_eq!(
+            hits.len(),
+            4,
+            "semantic returns up to k regardless of overlap"
+        );
         assert!(
             hits[0].score >= hits[1].score,
             "scores must descend for semantic mode"
@@ -370,8 +372,7 @@ mod tests {
         // The chunk "read_parquet_from_s3" should rank first for the
         // query "parquet" because BM25 will score it highest among
         // chunks where the term appears.
-        let hits = recall_with_mode(&s, &m, "parquet", 5, true, RecallMode::Lexical)
-            .unwrap();
+        let hits = recall_with_mode(&s, &m, "parquet", 5, true, RecallMode::Lexical).unwrap();
         assert!(!hits.is_empty(), "lexical should match the parquet chunk");
         let top_name = hits[0].chunk.as_ref().unwrap().name.as_str();
         assert_eq!(top_name, "read_parquet_from_s3");
@@ -381,9 +382,15 @@ mod tests {
     fn lexical_mode_returns_empty_for_no_matches() {
         let s = seeded_store_with_embeddings();
         let m = MockEmbedder::default();
-        let hits =
-            recall_with_mode(&s, &m, "completely_unrelated", 5, false, RecallMode::Lexical)
-                .unwrap();
+        let hits = recall_with_mode(
+            &s,
+            &m,
+            "completely_unrelated",
+            5,
+            false,
+            RecallMode::Lexical,
+        )
+        .unwrap();
         assert!(hits.is_empty());
     }
 
@@ -419,8 +426,7 @@ mod tests {
     fn hybrid_mode_combines_both_sources() {
         let s = seeded_store_with_embeddings();
         let m = MockEmbedder::default();
-        let hits = recall_with_mode(&s, &m, "parquet", 4, false, RecallMode::Hybrid)
-            .unwrap();
+        let hits = recall_with_mode(&s, &m, "parquet", 4, false, RecallMode::Hybrid).unwrap();
         // We have 4 chunks total; hybrid pool is 2k=8; should return all 4.
         assert!(!hits.is_empty());
         // All scores must be in the RRF range — small positive numbers.
@@ -440,13 +446,14 @@ mod tests {
         let mut s = SqliteStore::open_in_memory().unwrap();
         s.upsert_chunk(&dummy("parquet_loader", "loads parquet files from disk"))
             .unwrap();
-        s.upsert_chunk(&dummy("file_writer", "writes csv files")).unwrap();
-        s.upsert_chunk(&dummy("misc_helper", "general utility")).unwrap();
+        s.upsert_chunk(&dummy("file_writer", "writes csv files"))
+            .unwrap();
+        s.upsert_chunk(&dummy("misc_helper", "general utility"))
+            .unwrap();
         let m = MockEmbedder::default();
         embed_pending(&mut s, &m, 8).unwrap();
 
-        let hits = recall_with_mode(&s, &m, "parquet", 3, true, RecallMode::Hybrid)
-            .unwrap();
+        let hits = recall_with_mode(&s, &m, "parquet", 3, true, RecallMode::Hybrid).unwrap();
         let top = hits[0].chunk.as_ref().unwrap();
         assert_eq!(top.name, "parquet_loader", "double-source hit ranks first");
     }

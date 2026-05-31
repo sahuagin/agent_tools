@@ -28,9 +28,9 @@ use crate::chunker::SupportedLanguage;
 /// Conservative: these are dirs whose contents are ~never source we want
 /// indexed regardless of VCS-ignore configuration.
 const EXTRA_SKIP_DIRS: &[&str] = &[
-    "target",         // cargo
-    "node_modules",   // npm
-    "__pycache__",    // python bytecode
+    "target",       // cargo
+    "node_modules", // npm
+    "__pycache__",  // python bytecode
     ".tox",
     ".pytest_cache",
     ".mypy_cache",
@@ -65,8 +65,7 @@ pub fn walk_sources_with(root: &Path, respect_gitignore: bool) -> Result<Vec<Pat
             // Cheap extra cull for well-known build/cache dirs that some
             // codebases don't list in .gitignore.
             if let Some(name) = entry.file_name().to_str() {
-                if entry.file_type().is_some_and(|t| t.is_dir())
-                    && EXTRA_SKIP_DIRS.contains(&name)
+                if entry.file_type().is_some_and(|t| t.is_dir()) && EXTRA_SKIP_DIRS.contains(&name)
                 {
                     return false;
                 }
@@ -187,12 +186,12 @@ mod tests {
         let with_ignore = walk_sources_with(&tmp, true).unwrap();
         let without_ignore = walk_sources_with(&tmp, false).unwrap();
 
-        assert!(!with_ignore.iter().any(|p| p
-            .to_string_lossy()
-            .contains("should_be_ignored")));
-        assert!(without_ignore.iter().any(|p| p
-            .to_string_lossy()
-            .contains("should_be_ignored")));
+        assert!(!with_ignore
+            .iter()
+            .any(|p| p.to_string_lossy().contains("should_be_ignored")));
+        assert!(without_ignore
+            .iter()
+            .any(|p| p.to_string_lossy().contains("should_be_ignored")));
     }
 
     #[test]
@@ -209,7 +208,9 @@ mod tests {
         assert!(found
             .iter()
             .any(|p| p.to_string_lossy().ends_with("src/lib.rs")));
-        assert!(!found.iter().any(|p| p.to_string_lossy().contains("skip_me")));
+        assert!(!found
+            .iter()
+            .any(|p| p.to_string_lossy().contains("skip_me")));
     }
 
     #[test]

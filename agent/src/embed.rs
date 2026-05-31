@@ -153,7 +153,12 @@ impl OpenRouterEmbedder {
             .unwrap_or(1024);
         let base_url = std::env::var("AGENT_EMBED_BASE_URL")
             .unwrap_or_else(|_| "https://openrouter.ai/api/v1".to_string());
-        Some(Self { api_key, model, base_url, dims })
+        Some(Self {
+            api_key,
+            model,
+            base_url,
+            dims,
+        })
     }
 }
 
@@ -279,11 +284,10 @@ impl OpenRouterEmbedder {
             return Err(anyhow!("embedding API error: {err}"));
         }
 
-        let parsed: EmbeddingResponse =
-            serde_json::from_value(raw.clone()).with_context(|| {
-                let preview: String = raw.to_string().chars().take(500).collect();
-                format!("parse embedding response (got: {preview})")
-            })?;
+        let parsed: EmbeddingResponse = serde_json::from_value(raw.clone()).with_context(|| {
+            let preview: String = raw.to_string().chars().take(500).collect();
+            format!("parse embedding response (got: {preview})")
+        })?;
 
         if parsed.data.len() != texts.len() {
             return Err(anyhow!(
@@ -318,12 +322,7 @@ pub fn select_embedder() -> Box<dyn Embedder> {
 
 // ── Storage helpers ──────────────────────────────────────────────────────────
 
-pub fn embed_one(
-    conn: &Connection,
-    embedder: &dyn Embedder,
-    id: &str,
-    text: &str,
-) -> Result<bool> {
+pub fn embed_one(conn: &Connection, embedder: &dyn Embedder, id: &str, text: &str) -> Result<bool> {
     let hash = content_hash(text);
 
     let existing: Option<String> = conn

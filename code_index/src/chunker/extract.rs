@@ -16,8 +16,7 @@ use tree_sitter::{Node, Query, QueryCursor, StreamingIterator};
 use crate::{Chunk, ChunkKind};
 
 use super::{
-    build_chunk, chunk_kind_from_tag, edge_kind_from_reference_tag, ExtractResult,
-    RawReference,
+    build_chunk, chunk_kind_from_tag, edge_kind_from_reference_tag, ExtractResult, RawReference,
 };
 
 /// Module-level chunks larger than this are dropped at chunker time.
@@ -82,11 +81,15 @@ pub(super) fn collect_chunks_and_references(
 
         let Some(name) = name_node else { continue };
         let Some(span) = span_node else { continue };
-        let Ok(name_text) = name.utf8_text(source) else { continue };
+        let Ok(name_text) = name.utf8_text(source) else {
+            continue;
+        };
 
         if let Some(tag) = def_tag {
             // Definition: build a Chunk, dedup by span, prefer specific kinds.
-            let Ok(span_text) = span.utf8_text(source) else { continue };
+            let Ok(span_text) = span.utf8_text(source) else {
+                continue;
+            };
             let kind = chunk_kind_from_tag(tag);
 
             // Skip oversize module chunks — see MODULE_CHUNK_LIMIT_BYTES

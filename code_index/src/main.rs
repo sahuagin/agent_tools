@@ -129,13 +129,19 @@ enum Command {
 #[derive(Subcommand, Debug)]
 enum GraphOp {
     /// Populate edges from chunks via the chunker reference pass.
-    #[command(after_long_help = "EXAMPLE:\n  code-index graph build   # re-parses every file; run after ingest\n\nDetail: code-index graph --help-ai")]
+    #[command(
+        after_long_help = "EXAMPLE:\n  code-index graph build   # re-parses every file; run after ingest\n\nDetail: code-index graph --help-ai"
+    )]
     Build,
     /// Quick overview: nodes, edges, components, degree.
-    #[command(after_long_help = "EXAMPLE:\n  code-index graph stats\n\nDetail: code-index graph --help-ai")]
+    #[command(
+        after_long_help = "EXAMPLE:\n  code-index graph stats\n\nDetail: code-index graph --help-ai"
+    )]
     Stats,
     /// List weakly-connected components, biggest first.
-    #[command(after_long_help = "EXAMPLE:\n  code-index graph communities -n 10 --min-size 10\n\nDetail: code-index graph --help-ai")]
+    #[command(
+        after_long_help = "EXAMPLE:\n  code-index graph communities -n 10 --min-size 10\n\nDetail: code-index graph --help-ai"
+    )]
     Communities {
         /// Limit how many components to print.
         #[arg(short = 'n', long, default_value_t = 10)]
@@ -145,10 +151,14 @@ enum GraphOp {
         min_size: usize,
     },
     /// Print shortest path between two chunk identifiers.
-    #[command(after_long_help = "EXAMPLE:\n  code-index graph path 1421 8842   # chunk IDs from `recall` or sqlite\n\nDetail: code-index graph --help-ai")]
+    #[command(
+        after_long_help = "EXAMPLE:\n  code-index graph path 1421 8842   # chunk IDs from `recall` or sqlite\n\nDetail: code-index graph --help-ai"
+    )]
     Path { from: i64, to: i64 },
     /// PageRank-style centrality. Prints top-N chunks by score.
-    #[command(after_long_help = "EXAMPLE:\n  code-index graph centrality -n 20\n\nDetail: code-index graph --help-ai")]
+    #[command(
+        after_long_help = "EXAMPLE:\n  code-index graph centrality -n 20\n\nDetail: code-index graph --help-ai"
+    )]
     Centrality {
         #[arg(short = 'n', long, default_value_t = 20)]
         limit: usize,
@@ -739,11 +749,7 @@ fn open_store(explicit_db: Option<&Path>) -> Result<SqliteStore> {
     SqliteStore::open_at(&path)
 }
 
-fn print_component(
-    store: &dyn Store,
-    index: usize,
-    comp: &[ChunkId],
-) -> Result<()> {
+fn print_component(store: &dyn Store, index: usize, comp: &[ChunkId]) -> Result<()> {
     println!("# Component {index} — {} nodes", comp.len());
     // Sample up to 10 names so big components don't spam output.
     let sample = comp.iter().take(10);
@@ -793,7 +799,9 @@ fn main() -> Result<()> {
         } => {
             // `path` is Optional only so `ingest --help-ai` can parse.
             let path = path.ok_or_else(|| {
-                anyhow::anyhow!("ingest requires a <PATH> (use '.' for cwd, or --help-ai for usage)")
+                anyhow::anyhow!(
+                    "ingest requires a <PATH> (use '.' for cwd, or --help-ai for usage)"
+                )
             })?;
             let mut store = open_store(cli.db.as_deref())?;
             let stats = ingest_with(&path, &mut store, None, !no_gitignore)?;
@@ -834,14 +842,18 @@ fn main() -> Result<()> {
             })?;
             let store = open_store(cli.db.as_deref())?;
             let embedder = select_embedder();
-            let mode = RecallMode::from_str(&mode)
-                .ok_or_else(|| anyhow::anyhow!("invalid --mode {mode:?}; expected hybrid|semantic|lexical"))?;
+            let mode = RecallMode::from_str(&mode).ok_or_else(|| {
+                anyhow::anyhow!("invalid --mode {mode:?}; expected hybrid|semantic|lexical")
+            })?;
             let tuning = RecallTuning {
-                test_penalty: if no_test_penalty { 1.0 } else { DEFAULT_TEST_PENALTY },
+                test_penalty: if no_test_penalty {
+                    1.0
+                } else {
+                    DEFAULT_TEST_PENALTY
+                },
                 exclude_tests,
             };
-            let hits =
-                recall_tuned(&store, embedder.as_ref(), &query, limit, full, mode, tuning)?;
+            let hits = recall_tuned(&store, embedder.as_ref(), &query, limit, full, mode, tuning)?;
             if hits.is_empty() {
                 println!("(no hits — has the path been ingested with embeddings?)");
             }
@@ -876,10 +888,10 @@ fn main() -> Result<()> {
                 )
             })?;
             match op {
-            GraphOp::Build => {
-                let mut store = open_store(cli.db.as_deref())?;
-                let stats = build_edges(&mut store)?;
-                println!(
+                GraphOp::Build => {
+                    let mut store = open_store(cli.db.as_deref())?;
+                    let stats = build_edges(&mut store)?;
+                    println!(
                     "graph build: {} files processed ({} skipped), {} references found, {} edges emitted, {} unresolved",
                     stats.files_processed,
                     stats.files_skipped,
@@ -887,90 +899,90 @@ fn main() -> Result<()> {
                     stats.edges_emitted,
                     stats.references_unresolved,
                 );
-                Ok(())
-            }
-            GraphOp::Stats => {
-                let store = open_store(cli.db.as_deref())?;
-                let g = Graph::from_store(&store)?;
-                let s = g.stats();
-                println!(
-                    "graph: {} nodes, {} edges, {} components, max degree {}, avg degree {:.2}",
-                    s.nodes, s.edges, s.components, s.max_degree, s.avg_degree,
-                );
-                Ok(())
-            }
-            GraphOp::Communities { limit, min_size } => {
-                let store = open_store(cli.db.as_deref())?;
-                let g = Graph::from_store(&store)?;
-                let comps = g.connected_components();
-                let total = comps.len();
-                let mut printed = 0;
-                for (i, comp) in comps.iter().enumerate() {
-                    if comp.len() < min_size {
-                        continue;
-                    }
-                    if printed >= limit {
-                        break;
-                    }
-                    print_component(&store, i, comp)?;
-                    printed += 1;
+                    Ok(())
                 }
-                println!(
+                GraphOp::Stats => {
+                    let store = open_store(cli.db.as_deref())?;
+                    let g = Graph::from_store(&store)?;
+                    let s = g.stats();
+                    println!(
+                        "graph: {} nodes, {} edges, {} components, max degree {}, avg degree {:.2}",
+                        s.nodes, s.edges, s.components, s.max_degree, s.avg_degree,
+                    );
+                    Ok(())
+                }
+                GraphOp::Communities { limit, min_size } => {
+                    let store = open_store(cli.db.as_deref())?;
+                    let g = Graph::from_store(&store)?;
+                    let comps = g.connected_components();
+                    let total = comps.len();
+                    let mut printed = 0;
+                    for (i, comp) in comps.iter().enumerate() {
+                        if comp.len() < min_size {
+                            continue;
+                        }
+                        if printed >= limit {
+                            break;
+                        }
+                        print_component(&store, i, comp)?;
+                        printed += 1;
+                    }
+                    println!(
                     "(printed {printed} of {total} components; showing components with >= {min_size} nodes)",
                 );
-                Ok(())
-            }
-            GraphOp::Path { from, to } => {
-                let store = open_store(cli.db.as_deref())?;
-                let g = Graph::from_store(&store)?;
-                match g.shortest_path(ChunkId(from), ChunkId(to)) {
-                    None => {
-                        println!("no path from ChunkId({from}) to ChunkId({to})");
-                    }
-                    Some(path) => {
-                        for id in path {
-                            if let Some(c) = store.get_chunk(id)? {
-                                println!(
-                                    "ChunkId({}) {:?} {} {}:{}-{}",
-                                    id.0,
-                                    c.kind,
-                                    c.name,
-                                    c.file.display(),
-                                    c.lines.start,
-                                    c.lines.end,
-                                );
-                            } else {
-                                println!("ChunkId({}) [chunk missing]", id.0);
+                    Ok(())
+                }
+                GraphOp::Path { from, to } => {
+                    let store = open_store(cli.db.as_deref())?;
+                    let g = Graph::from_store(&store)?;
+                    match g.shortest_path(ChunkId(from), ChunkId(to)) {
+                        None => {
+                            println!("no path from ChunkId({from}) to ChunkId({to})");
+                        }
+                        Some(path) => {
+                            for id in path {
+                                if let Some(c) = store.get_chunk(id)? {
+                                    println!(
+                                        "ChunkId({}) {:?} {} {}:{}-{}",
+                                        id.0,
+                                        c.kind,
+                                        c.name,
+                                        c.file.display(),
+                                        c.lines.start,
+                                        c.lines.end,
+                                    );
+                                } else {
+                                    println!("ChunkId({}) [chunk missing]", id.0);
+                                }
                             }
                         }
                     }
+                    Ok(())
                 }
-                Ok(())
-            }
-            GraphOp::Centrality {
-                limit,
-                damping,
-                iterations,
-            } => {
-                let store = open_store(cli.db.as_deref())?;
-                let g = Graph::from_store(&store)?;
-                let ranks = g.pagerank(damping, iterations);
-                for (id, score) in ranks.into_iter().take(limit) {
-                    if let Some(c) = store.get_chunk(id)? {
-                        println!(
-                            "{score:.5}  {:?} {}  {}:{}-{}",
-                            c.kind,
-                            c.name,
-                            c.file.display(),
-                            c.lines.start,
-                            c.lines.end,
-                        );
-                    } else {
-                        println!("{score:.5}  ChunkId({})", id.0);
+                GraphOp::Centrality {
+                    limit,
+                    damping,
+                    iterations,
+                } => {
+                    let store = open_store(cli.db.as_deref())?;
+                    let g = Graph::from_store(&store)?;
+                    let ranks = g.pagerank(damping, iterations);
+                    for (id, score) in ranks.into_iter().take(limit) {
+                        if let Some(c) = store.get_chunk(id)? {
+                            println!(
+                                "{score:.5}  {:?} {}  {}:{}-{}",
+                                c.kind,
+                                c.name,
+                                c.file.display(),
+                                c.lines.start,
+                                c.lines.end,
+                            );
+                        } else {
+                            println!("{score:.5}  ChunkId({})", id.0);
+                        }
                     }
+                    Ok(())
                 }
-                Ok(())
-            }
             }
         }
         Command::Status => {
@@ -1033,8 +1045,8 @@ fn print_status(path: &Path, store: &dyn Store) -> Result<()> {
     }
 
     // Chunk distribution by kind.
-    let mut stmt = conn
-        .prepare("SELECT kind, COUNT(*) FROM chunks GROUP BY kind ORDER BY 2 DESC")?;
+    let mut stmt =
+        conn.prepare("SELECT kind, COUNT(*) FROM chunks GROUP BY kind ORDER BY 2 DESC")?;
     let rows = stmt.query_map([], |r| {
         let k: String = r.get(0)?;
         let c: i64 = r.get(1)?;
@@ -1049,8 +1061,7 @@ fn print_status(path: &Path, store: &dyn Store) -> Result<()> {
     }
 
     // Embedding coverage by model.
-    let mut stmt = conn
-        .prepare("SELECT model, COUNT(*) FROM chunk_embeddings GROUP BY model")?;
+    let mut stmt = conn.prepare("SELECT model, COUNT(*) FROM chunk_embeddings GROUP BY model")?;
     let rows = stmt.query_map([], |r| {
         let m: String = r.get(0)?;
         let c: i64 = r.get(1)?;
@@ -1073,9 +1084,8 @@ fn print_status(path: &Path, store: &dyn Store) -> Result<()> {
 
     // Edge distribution by kind.
     if edge_count > 0 {
-        let mut stmt = conn.prepare(
-            "SELECT kind, COUNT(*) FROM edges GROUP BY kind ORDER BY 2 DESC",
-        )?;
+        let mut stmt =
+            conn.prepare("SELECT kind, COUNT(*) FROM edges GROUP BY kind ORDER BY 2 DESC")?;
         let rows = stmt.query_map([], |r| {
             let k: String = r.get(0)?;
             let c: i64 = r.get(1)?;

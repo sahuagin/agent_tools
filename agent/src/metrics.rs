@@ -108,10 +108,19 @@ fn record_completion(conn: &Connection, args: RecordCompletionArgs) -> Result<()
           status, confidence, tool_calls, wall_ms, created_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
         params![
-            id, args.task_id, args.session_id,
-            args.model, args.provider, args.task_type,
-            args.objective, args.cwd, args.status,
-            args.confidence, args.tool_calls, args.wall_ms, ts
+            id,
+            args.task_id,
+            args.session_id,
+            args.model,
+            args.provider,
+            args.task_type,
+            args.objective,
+            args.cwd,
+            args.status,
+            args.confidence,
+            args.tool_calls,
+            args.wall_ms,
+            ts
         ],
     )?;
     println!("{id}");
@@ -125,8 +134,13 @@ fn record_usage(conn: &Connection, args: RecordUsageArgs) -> Result<()> {
          (completion_id, input_tokens, output_tokens, cache_read, cache_write, cost_usd, created_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         params![
-            args.completion_id, args.input_tokens, args.output_tokens,
-            args.cache_read, args.cache_write, args.cost_usd, ts
+            args.completion_id,
+            args.input_tokens,
+            args.output_tokens,
+            args.cache_read,
+            args.cache_write,
+            args.cost_usd,
+            ts
         ],
     )?;
     Ok(())
@@ -192,16 +206,41 @@ fn report(conn: &Connection, args: ReportArgs) -> Result<()> {
         ))
     })?;
 
-    println!("{:<35} {:<10} {:>5} {:>5} {:>8} {:>7} {:>10} {:>8} {:>7}",
-        "model/task_type", "provider", "runs", "ok%", "avg_ms", "tools", "cost_usd", "tokens", "cache%");
+    println!(
+        "{:<35} {:<10} {:>5} {:>5} {:>8} {:>7} {:>10} {:>8} {:>7}",
+        "model/task_type",
+        "provider",
+        "runs",
+        "ok%",
+        "avg_ms",
+        "tools",
+        "cost_usd",
+        "tokens",
+        "cache%"
+    );
     println!("{}", "-".repeat(100));
 
     for row in rows {
-        let (model, provider, task_type, runs, successes, avg_ms, avg_tools, total_cost, avg_tokens, cache_ratio) = row?;
+        let (
+            model,
+            provider,
+            task_type,
+            runs,
+            successes,
+            avg_ms,
+            avg_tools,
+            total_cost,
+            avg_tokens,
+            cache_ratio,
+        ) = row?;
         let ok_pct = if runs > 0 { successes * 100 / runs } else { 0 };
         let label = format!("{model} / {task_type}");
-        println!("{:<35} {:<10} {:>5} {:>4}% {:>8} {:>7.1} {:>10.6} {:>8.0} {:>6.0}%",
-            label, provider, runs, ok_pct,
+        println!(
+            "{:<35} {:<10} {:>5} {:>4}% {:>8} {:>7.1} {:>10.6} {:>8.0} {:>6.0}%",
+            label,
+            provider,
+            runs,
+            ok_pct,
             avg_ms.map(|v| format!("{:.0}", v)).unwrap_or_default(),
             avg_tools.unwrap_or(0.0),
             total_cost.unwrap_or(0.0),

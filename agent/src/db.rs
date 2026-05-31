@@ -20,8 +20,7 @@ pub fn open() -> Result<Connection> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let conn = Connection::open(&path)
-        .with_context(|| format!("opening {}", path.display()))?;
+    let conn = Connection::open(&path).with_context(|| format!("opening {}", path.display()))?;
     conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
     migrate(&conn)?;
     Ok(conn)

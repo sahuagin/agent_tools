@@ -212,14 +212,12 @@ pub fn run(conn: Connection, cmd: MemoryCmd) -> Result<()> {
 // ── Tokenizer ────────────────────────────────────────────────────────────────
 
 const STOPWORDS: &[&str] = &[
-    "the", "and", "for", "with", "from", "that", "this", "have", "been",
-    "were", "they", "their", "what", "when", "where", "which", "will",
-    "your", "about", "into", "through", "before", "after", "above", "below",
-    "between", "each", "more", "also", "than", "then", "some", "other",
-    "such", "only", "same", "both", "over", "here", "there", "just", "used",
-    "using", "use", "via", "per", "can", "has", "not", "all", "but", "are",
-    "was", "its", "our", "you", "her", "him", "his", "she", "they", "who",
-    "src", "home", "tcovert",
+    "the", "and", "for", "with", "from", "that", "this", "have", "been", "were", "they", "their",
+    "what", "when", "where", "which", "will", "your", "about", "into", "through", "before",
+    "after", "above", "below", "between", "each", "more", "also", "than", "then", "some", "other",
+    "such", "only", "same", "both", "over", "here", "there", "just", "used", "using", "use", "via",
+    "per", "can", "has", "not", "all", "but", "are", "was", "its", "our", "you", "her", "him",
+    "his", "she", "they", "who", "src", "home", "tcovert",
 ];
 
 fn tokenize(text: &str) -> Vec<String> {
@@ -234,7 +232,13 @@ fn signals_from_cwd(cwd: &str) -> Vec<String> {
     // Extract terms from the last two path components so
     // e.g. /home/tcovert/src/pi-claude-poc → ["pi", "claude", "poc", "src"]
     let parts: Vec<&str> = cwd.trim_end_matches('/').split('/').collect();
-    let tail = parts.iter().rev().take(2).copied().collect::<Vec<_>>().join("-");
+    let tail = parts
+        .iter()
+        .rev()
+        .take(2)
+        .copied()
+        .collect::<Vec<_>>()
+        .join("-");
     tokenize(&tail)
 }
 
@@ -389,9 +393,7 @@ fn log_context_call(
     let returned_json = serde_json::to_string(
         &returned
             .iter()
-            .map(|(id, name, score)| {
-                serde_json::json!({"id": id, "name": name, "score": score})
-            })
+            .map(|(id, name, score)| serde_json::json!({"id": id, "name": name, "score": score}))
             .collect::<Vec<_>>(),
     )?;
     conn.execute(
@@ -413,7 +415,10 @@ fn log_context_call(
 /// Resolve a memory body from the three input modes. Precedence:
 ///   --content-file <path>  >  --content -  (stdin)  >  --content <inline>.
 /// Returns None only when none was supplied.
-fn resolve_content(content: Option<String>, content_file: Option<PathBuf>) -> Result<Option<String>> {
+fn resolve_content(
+    content: Option<String>,
+    content_file: Option<PathBuf>,
+) -> Result<Option<String>> {
     if let Some(path) = content_file {
         let body = std::fs::read_to_string(&path)
             .with_context(|| format!("reading --content-file {}", path.display()))?;
@@ -515,6 +520,15 @@ fn update(conn: &Connection, args: UpdateArgs) -> Result<()> {
 // ── Queries ───────────────────────────────────────────────────────────────────
 
 fn search(conn: &Connection, args: SearchArgs) -> Result<()> {
+    // The raw query is free text. FTS5 treats `-`, `:`, `*`, `^`, `(`, `)` and
+    // the bareword operators AND/OR/NOT as query syntax, so an unescaped query
+    // like `mu-slat` errored (`no such column: slat`) and silently returned
+    // nothing. fts5_match_query() neutralizes that — see its doc comment.
+    let match_query = fts5_match_query(&args.query);
+    if match_query.is_empty() {
+        return Ok(());
+    }
+
     let sql = "SELECT m.id, m.type, m.name, m.description, m.content, m.tags, m.updated_at
          FROM memories_fts fts
          JOIN memories m ON m.rowid = fts.rowid
@@ -524,20 +538,17 @@ fn search(conn: &Connection, args: SearchArgs) -> Result<()> {
          LIMIT ?3";
 
     let mut stmt = conn.prepare(sql)?;
-    let rows = stmt.query_map(
-        params![args.query, args.r#type, args.limit as i64],
-        |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
-                r.get::<_, String>(3)?,
-                r.get::<_, String>(4)?,
-                r.get::<_, String>(5)?,
-                r.get::<_, i64>(6)?,
-            ))
-        },
-    )?;
+    let rows = stmt.query_map(params![match_query, args.r#type, args.limit as i64], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+            r.get::<_, String>(3)?,
+            r.get::<_, String>(4)?,
+            r.get::<_, String>(5)?,
+            r.get::<_, i64>(6)?,
+        ))
+    })?;
 
     for row in rows {
         let (id, type_, name, desc, content, tags, updated_at) = row?;
@@ -575,11 +586,17 @@ fn recent(conn: &Connection, args: RecentArgs) -> Result<()> {
 
 fn list(conn: &Connection, args: ListArgs) -> Result<()> {
     let cwd_pat = args.cwd.as_ref().map(|c| {
-        let e = c.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
+        let e = c
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
         format!("%{e}%")
     });
     let tag_pat = args.tag.as_ref().map(|t| {
-        let e = t.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
+        let e = t
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
         format!("%{e}%")
     });
     let sql = "SELECT id, type, name, description, tags, updated_at FROM memories
@@ -589,8 +606,9 @@ fn list(conn: &Connection, args: ListArgs) -> Result<()> {
            AND (?3 IS NULL OR tags LIKE ?3 ESCAPE '\\')
          ORDER BY updated_at DESC LIMIT ?4";
     let mut stmt = conn.prepare(sql)?;
-    let rows =
-        stmt.query_map(params![args.r#type, cwd_pat, tag_pat, args.limit as i64], |r| {
+    let rows = stmt.query_map(
+        params![args.r#type, cwd_pat, tag_pat, args.limit as i64],
+        |r| {
             Ok((
                 r.get::<_, String>(0)?,
                 r.get::<_, String>(1)?,
@@ -599,7 +617,8 @@ fn list(conn: &Connection, args: ListArgs) -> Result<()> {
                 r.get::<_, String>(4)?,
                 r.get::<_, i64>(5)?,
             ))
-        })?;
+        },
+    )?;
     for row in rows {
         let (id, type_, name, desc, tags, updated_at) = row?;
         let tag_str = if tags.is_empty() {
@@ -607,7 +626,10 @@ fn list(conn: &Connection, args: ListArgs) -> Result<()> {
         } else {
             format!("  [{}]", tags)
         };
-        println!("[{id}] ({type_}) {name}{tag_str} — {desc}  [{}]", fmt_ts(updated_at));
+        println!(
+            "[{id}] ({type_}) {name}{tag_str} — {desc}  [{}]",
+            fmt_ts(updated_at)
+        );
     }
     Ok(())
 }
@@ -785,8 +807,7 @@ fn migrate(conn: &Connection, args: MigrateArgs) -> Result<()> {
     let entries: Vec<_> = std::fs::read_dir(&dir)?
         .filter_map(|e| e.ok())
         .filter(|e| {
-            e.path().extension().map(|x| x == "md").unwrap_or(false)
-                && e.file_name() != "MEMORY.md"
+            e.path().extension().map(|x| x == "md").unwrap_or(false) && e.file_name() != "MEMORY.md"
         })
         .collect();
 
@@ -870,13 +891,38 @@ fn collect_memories<I>(iter: I) -> Result<Vec<Memory>>
 where
     I: Iterator<Item = rusqlite::Result<Memory>>,
 {
-    iter.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+    iter.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(Into::into)
 }
 
 fn fmt_ts(ts: i64) -> String {
     chrono::DateTime::from_timestamp(ts, 0)
         .map(|d| d.format("%Y-%m-%d").to_string())
         .unwrap_or_default()
+}
+
+/// Turn a free-text recall query into a safe FTS5 MATCH expression.
+///
+/// FTS5's query grammar reserves `-`, `:`, `*`, `^`, `(`, `)` and the bareword
+/// operators `AND`/`OR`/`NOT`. Passing user text straight into MATCH meant a
+/// hyphenated term like `mu-slat orchestration` was parsed as syntax and
+/// errored with `no such column: slat`, silently breaking all hyphenated recall.
+///
+/// We split on whitespace and wrap each token as a double-quoted FTS5 *phrase*
+/// (doubling any embedded `"`). Inside a phrase FTS5 still tokenizes, so
+/// `"mu-slat"` matches the adjacent tokens `mu slat` — i.e. the literal term —
+/// while every metacharacter is treated as inert. Tokens with no alphanumeric
+/// content are dropped (a bare `-` would otherwise produce an empty phrase).
+/// Multiple phrases keep FTS5's default implicit-AND, so recall means "all of
+/// these words appear". This intentionally trades away power-user prefix (`*`)
+/// and boolean syntax for queries that just work; an empty result means "search
+/// for nothing", and the caller short-circuits.
+fn fts5_match_query(raw: &str) -> String {
+    raw.split_whitespace()
+        .filter(|tok| tok.chars().any(|c| c.is_alphanumeric()))
+        .map(|tok| format!("\"{}\"", tok.replace('"', "\"\"")))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn parse_frontmatter(raw: &str) -> Option<(String, String, String, String)> {
@@ -953,9 +999,7 @@ fn recall(conn: &Connection, args: RecallArgs) -> Result<()> {
     }
 
     if scored.is_empty() {
-        eprintln!(
-            "no embeddings found for model '{model}'. Run `agent memory reindex` first."
-        );
+        eprintln!("no embeddings found for model '{model}'. Run `agent memory reindex` first.");
         return Ok(());
     }
 
@@ -1006,8 +1050,7 @@ fn reindex(conn: &Connection, args: ReindexArgs) -> Result<()> {
                ON e.memory_id = m.id AND e.model = ?1
              WHERE m.is_active = 1 AND e.memory_id IS NULL",
         )?;
-        let out: rusqlite::Result<Vec<_>> =
-            stmt.query_map(params![model], row_to_tuple)?.collect();
+        let out: rusqlite::Result<Vec<_>> = stmt.query_map(params![model], row_to_tuple)?.collect();
         out?
     } else {
         let mut stmt = conn.prepare(
@@ -1024,7 +1067,10 @@ fn reindex(conn: &Connection, args: ReindexArgs) -> Result<()> {
         eprintln!("nothing to embed (model={model})");
         return Ok(());
     }
-    eprintln!("embedding {total} memories with {model} (batch={})...", args.batch);
+    eprintln!(
+        "embedding {total} memories with {model} (batch={})...",
+        args.batch
+    );
 
     let batch = args.batch.max(1);
     let mut done = 0usize;
@@ -1062,4 +1108,39 @@ fn reindex(conn: &Connection, args: ReindexArgs) -> Result<()> {
 
     eprintln!("reindex complete: {done} embedded, {failed} failed");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hyphenated_term_becomes_a_phrase() {
+        // The original bug: `mu-slat` errored `no such column: slat`.
+        assert_eq!(
+            fts5_match_query("mu-slat orchestration"),
+            r#""mu-slat" "orchestration""#
+        );
+    }
+
+    #[test]
+    fn metacharacters_are_neutralized() {
+        // Colons, stars, parens and bareword operators must not reach the grammar.
+        assert_eq!(fts5_match_query("foo:bar"), r#""foo:bar""#);
+        assert_eq!(fts5_match_query("a* (b) OR c"), r#""a*" "(b)" "OR" "c""#);
+    }
+
+    #[test]
+    fn embedded_quotes_are_doubled() {
+        // A literal `"` inside a token must be escaped, not close the phrase.
+        assert_eq!(fts5_match_query(r#"say"hi"#), r#""say""hi""#);
+    }
+
+    #[test]
+    fn punctuation_only_tokens_are_dropped() {
+        // A bare `-` would otherwise produce an empty phrase and error.
+        assert_eq!(fts5_match_query("foo - bar"), r#""foo" "bar""#);
+        assert_eq!(fts5_match_query("   "), "");
+        assert_eq!(fts5_match_query("-:*"), "");
+    }
 }

@@ -100,8 +100,7 @@ fn ingest_one(
         return Ok(FileOutcome::Unchanged);
     };
 
-    let bytes =
-        std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
     let signature = fnv1a_64(&bytes);
 
     if let Some(prior) = store.file_signature(path)? {

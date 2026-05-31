@@ -33,8 +33,7 @@ impl SqliteStore {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("creating {}", parent.display()))?;
         }
-        let conn = Connection::open(path)
-            .with_context(|| format!("opening {}", path.display()))?;
+        let conn = Connection::open(path).with_context(|| format!("opening {}", path.display()))?;
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
         Self::migrate(&conn)?;
         Ok(Self { conn })
@@ -368,12 +367,7 @@ impl Store for SqliteStore {
         Ok(out)
     }
 
-    fn upsert_embedding(
-        &mut self,
-        id: ChunkId,
-        model: &str,
-        vec: &[f32],
-    ) -> Result<()> {
+    fn upsert_embedding(&mut self, id: ChunkId, model: &str, vec: &[f32]) -> Result<()> {
         let blob = f32_to_blob(vec);
         self.conn.execute(
             "INSERT INTO chunk_embeddings (chunk_id, model, dims, vector, embedded_at)
@@ -387,12 +381,7 @@ impl Store for SqliteStore {
         Ok(())
     }
 
-    fn recall_top_k(
-        &self,
-        model: &str,
-        query: &[f32],
-        k: usize,
-    ) -> Result<Vec<(ChunkId, f32)>> {
+    fn recall_top_k(&self, model: &str, query: &[f32], k: usize) -> Result<Vec<(ChunkId, f32)>> {
         // Brute-force cosine over all embeddings for `model`.
         // Top-K via min-heap of size k (keeps the largest cosines).
         // Returns (id, score) — no chunk materialization. Caller decides
@@ -466,11 +455,7 @@ impl Store for SqliteStore {
         Ok(out)
     }
 
-    fn recall_lexical(
-        &self,
-        query: &str,
-        k: usize,
-    ) -> Result<Vec<(ChunkId, f32)>> {
+    fn recall_lexical(&self, query: &str, k: usize) -> Result<Vec<(ChunkId, f32)>> {
         // Sanitize: FTS5's MATCH syntax has special characters (".", ":",
         // "*", "(", ")", AND/OR/NOT keywords) that error or alter
         // semantics if passed raw. We split the query into tokens at
@@ -700,9 +685,7 @@ mod tests {
 
         // ON DELETE CASCADE removes the edge and the embedding.
         assert_eq!(s.iter_edges().unwrap().len(), 0);
-        let no_recall = s
-            .recall_top_k("test-model", &[0.1, 0.2, 0.3], 5)
-            .unwrap();
+        let no_recall = s.recall_top_k("test-model", &[0.1, 0.2, 0.3], 5).unwrap();
         assert!(no_recall.is_empty());
     }
 
@@ -734,11 +717,7 @@ mod tests {
         let mut s = SqliteStore::open_in_memory().expect("open");
         for i in 0..5 {
             let id = s
-                .upsert_chunk(&tmp_chunk(
-                    &format!("c{i}"),
-                    "f.rs",
-                    ChunkKind::Function,
-                ))
+                .upsert_chunk(&tmp_chunk(&format!("c{i}"), "f.rs", ChunkKind::Function))
                 .unwrap();
             // Use a vector that varies slightly per i so cosines differ.
             s.upsert_embedding(id, "m", &[1.0, i as f32 * 0.1]).unwrap();
