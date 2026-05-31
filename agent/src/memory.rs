@@ -63,6 +63,9 @@ pub struct AddArgs {
     pub cwd: String,
     #[arg(long, default_value = "curated")]
     pub source: String,
+    /// Profile scope (work/personal/shared). Defaults to $CLAUDE_PROFILE, else "shared".
+    #[arg(long)]
+    pub scope: Option<String>,
 }
 
 #[derive(Args)]
@@ -82,6 +85,9 @@ pub struct UpdateArgs {
     pub tags: Option<String>,
     #[arg(long)]
     pub active: Option<bool>,
+    /// Re-scope this memory (work/personal/shared).
+    #[arg(long)]
+    pub scope: Option<String>,
 }
 
 #[derive(Args)]
@@ -91,6 +97,9 @@ pub struct SearchArgs {
     pub r#type: Option<String>,
     #[arg(long, default_value = "10")]
     pub limit: usize,
+    /// Restrict to a scope (work/personal/shared/*). Spans all scopes if omitted.
+    #[arg(long)]
+    pub scope: Option<String>,
 }
 
 #[derive(Args)]
@@ -126,6 +135,10 @@ pub struct ContextArgs {
     /// Print scoring detail to stderr for tuning
     #[arg(long)]
     pub verbose: bool,
+    /// Active profile scope. Defaults to $CLAUDE_PROFILE; "*" spans all scopes.
+    /// A profile sees its own + shared memories; absent/unknown spans all (back-compat).
+    #[arg(long)]
+    pub scope: Option<String>,
 }
 
 #[derive(Args)]
@@ -158,6 +171,9 @@ pub struct RecallArgs {
     /// Also run the FTS5 lexical search for side-by-side comparison
     #[arg(long)]
     pub compare: bool,
+    /// Restrict to a scope (work/personal/shared/*). Spans all scopes if omitted.
+    #[arg(long)]
+    pub scope: Option<String>,
 }
 
 #[derive(Args)]
@@ -190,6 +206,90 @@ fn short_id() -> String {
 
 fn now() -> i64 {
     Utc::now().timestamp()
+}
+
+// ── Profile scoping ─────────────────────────────────────────────────────────────
+//
+// Memories carry a `scope`: a profile name (`work`, `personal`) or the reserved
+// `shared` (visible to every profile). The active profile comes from the
+// `--scope` flag, else the `CLAUDE_PROFILE` env var set by the cc-work/cc-personal
+// launchers. See ~/.claude-personal/specs/profile-scoping.md.
+
+const SHARED_SCOPE: &str = "shared";
+const ALL_SCOPES: &str = "*";
+
+/// Effective scope for a WRITE (add / re-scope): explicit `--scope`, else
+/// `$CLAUDE_PROFILE`, else `shared`.
+fn resolve_write_scope(flag: Option<&str>) -> String {
+    if let Some(s) = flag.filter(|s| !s.is_empty()) {
+        return s.to_string();
+    }
+    std::env::var("CLAUDE_PROFILE")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| SHARED_SCOPE.to_string())
+}
+
+/// Which scopes a READ should include.
+enum ScopeFilter {
+    /// No predicate — span every scope.
+    All,
+    /// `scope IN (...)` — the listed scopes only.
+    Include(Vec<String>),
+}
+
+impl ScopeFilter {
+    /// Expand a resolved scope name into the set of scopes a read should see.
+    /// A concrete profile sees itself + `shared`; `shared` sees only `shared`;
+    /// `*` (or absent) spans everything.
+    fn from_resolved(resolved: Option<&str>) -> ScopeFilter {
+        match resolved.filter(|s| !s.is_empty()) {
+            None => ScopeFilter::All,
+            Some(s) if s == ALL_SCOPES => ScopeFilter::All,
+            Some(s) if s == SHARED_SCOPE => ScopeFilter::Include(vec![SHARED_SCOPE.to_string()]),
+            Some(s) => ScopeFilter::Include(vec![s.to_string(), SHARED_SCOPE.to_string()]),
+        }
+    }
+
+    /// Filter for `context` (session start): `--scope`, else `$CLAUDE_PROFILE`,
+    /// else span all (back-compat for accounts that don't set CLAUDE_PROFILE).
+    fn for_context(flag: Option<&str>) -> ScopeFilter {
+        let resolved = flag.map(str::to_string).or_else(|| {
+            std::env::var("CLAUDE_PROFILE")
+                .ok()
+                .filter(|s| !s.is_empty())
+        });
+        ScopeFilter::from_resolved(resolved.as_deref())
+    }
+
+    /// Filter for `recall` / `search`: span all by default, narrow only when
+    /// `--scope` is explicitly passed (keep semantic recall global).
+    fn for_explicit(flag: Option<&str>) -> ScopeFilter {
+        ScopeFilter::from_resolved(flag)
+    }
+
+    /// A ` AND <col> IN (?, ?)` SQL fragment plus its bound values. Uses
+    /// anonymous placeholders, so the caller must bind these values at the
+    /// position the fragment appears in the statement. Empty when `All`.
+    fn sql_and(&self, col: &str) -> (String, Vec<Value>) {
+        match self {
+            ScopeFilter::All => (String::new(), Vec::new()),
+            ScopeFilter::Include(scopes) => {
+                let ph = scopes.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+                let frag = format!(" AND {col} IN ({ph})");
+                let vals = scopes.iter().map(|s| Value::Text(s.clone())).collect();
+                (frag, vals)
+            }
+        }
+    }
+}
+
+/// A memory `type` filter (`Option<String>`) as a bindable value.
+fn type_value(t: &Option<String>) -> Value {
+    match t {
+        Some(s) => Value::Text(s.clone()),
+        None => Value::Null,
+    }
 }
 
 pub fn run(conn: Connection, cmd: MemoryCmd) -> Result<()> {
@@ -319,12 +419,13 @@ fn score_context_memories(
     signal_terms: &[String],
     type_: &str,
     limit: usize,
+    scope: &ScopeFilter,
 ) -> Result<Vec<(Memory, f64)>> {
     let now_ts = now();
 
     if signal_terms.is_empty() {
         // No signals — fall back to pure recency
-        let memories = query_by_type(conn, type_, limit)?;
+        let memories = query_by_type(conn, type_, limit, scope)?;
         return Ok(memories
             .into_iter()
             .map(|m| {
@@ -335,11 +436,13 @@ fn score_context_memories(
             .collect());
     }
 
-    // Build: ?1=type, ?2=fetch_limit, ?3..=terms
-    let placeholders = (3..=signal_terms.len() + 2)
-        .map(|i| format!("?{i}"))
+    // Anonymous placeholders bound in statement order: type, terms…, scope…, limit.
+    let term_ph = signal_terms
+        .iter()
+        .map(|_| "?")
         .collect::<Vec<_>>()
         .join(", ");
+    let (scope_sql, scope_vals) = scope.sql_and("m.scope");
 
     let sql = format!(
         "SELECT m.id, m.type, m.name, m.description, m.content, m.source,
@@ -347,20 +450,19 @@ fn score_context_memories(
                 SUM(mti.weight) AS raw_score
          FROM memories m
          JOIN memory_topic_index mti ON mti.memory_id = m.id
-         WHERE m.type = ?1 AND m.is_active = 1
-           AND mti.term IN ({placeholders})
+         WHERE m.type = ? AND m.is_active = 1
+           AND mti.term IN ({term_ph}){scope_sql}
          GROUP BY m.id
          ORDER BY raw_score DESC
-         LIMIT ?2"
+         LIMIT ?"
     );
 
-    let mut dyn_params: Vec<Value> = vec![
-        Value::Text(type_.to_string()),
-        Value::Integer((limit * 4) as i64), // fetch extra, re-rank after decay
-    ];
+    let mut dyn_params: Vec<Value> = vec![Value::Text(type_.to_string())];
     for t in signal_terms {
         dyn_params.push(Value::Text(t.clone()));
     }
+    dyn_params.extend(scope_vals);
+    dyn_params.push(Value::Integer((limit * 4) as i64)); // fetch extra, re-rank after decay
 
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(params_from_iter(dyn_params.iter()), |r| {
@@ -447,10 +549,11 @@ fn add(conn: &Connection, args: AddArgs) -> Result<()> {
     };
     let id = short_id();
     let ts = now();
+    let scope = resolve_write_scope(args.scope.as_deref());
     conn.execute(
-        "INSERT INTO memories (id, type, name, description, content, source, tags, cwd, is_active, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1, ?9, ?9)",
-        params![id, args.r#type, args.name, args.description, content, args.source, args.tags, args.cwd, ts],
+        "INSERT INTO memories (id, type, name, description, content, source, tags, cwd, scope, is_active, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1, ?10, ?10)",
+        params![id, args.r#type, args.name, args.description, content, args.source, args.tags, args.cwd, scope, ts],
     )?;
     rebuild_index_for(conn, &id)?;
     let text = embed::memory_embed_text(&args.name, &args.description, &content);
@@ -494,6 +597,12 @@ fn update(conn: &Connection, args: UpdateArgs) -> Result<()> {
             params![active as i64, ts, args.id],
         )?;
     }
+    if let Some(scope) = args.scope {
+        updated += conn.execute(
+            "UPDATE memories SET scope=?1, updated_at=?2 WHERE id=?3",
+            params![scope, ts, args.id],
+        )?;
+    }
 
     if updated == 0 {
         bail!("no memory found with id={}", args.id);
@@ -529,16 +638,28 @@ fn search(conn: &Connection, args: SearchArgs) -> Result<()> {
         return Ok(());
     }
 
-    let sql = "SELECT m.id, m.type, m.name, m.description, m.content, m.tags, m.updated_at
+    let scope = ScopeFilter::for_explicit(args.scope.as_deref());
+    let (scope_sql, scope_vals) = scope.sql_and("m.scope");
+    let sql = format!(
+        "SELECT m.id, m.type, m.name, m.description, m.content, m.tags, m.updated_at
          FROM memories_fts fts
          JOIN memories m ON m.rowid = fts.rowid
-         WHERE memories_fts MATCH ?1 AND m.is_active = 1
-           AND (?2 IS NULL OR m.type = ?2)
+         WHERE memories_fts MATCH ? AND m.is_active = 1
+           AND (? IS NULL OR m.type = ?){scope_sql}
          ORDER BY rank
-         LIMIT ?3";
+         LIMIT ?"
+    );
 
-    let mut stmt = conn.prepare(sql)?;
-    let rows = stmt.query_map(params![match_query, args.r#type, args.limit as i64], |r| {
+    let mut p: Vec<Value> = vec![
+        Value::Text(match_query),
+        type_value(&args.r#type),
+        type_value(&args.r#type),
+    ];
+    p.extend(scope_vals);
+    p.push(Value::Integer(args.limit as i64));
+
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params_from_iter(p.iter()), |r| {
         Ok((
             r.get::<_, String>(0)?,
             r.get::<_, String>(1)?,
@@ -645,16 +766,22 @@ fn context(conn: &Connection, args: ContextArgs) -> Result<()> {
     signal_terms.sort();
     signal_terms.dedup();
 
+    // Scope the session-start context to the active profile + shared. Absent a
+    // profile (no --scope, no $CLAUDE_PROFILE) this spans all scopes.
+    let scope = ScopeFilter::for_context(args.scope.as_deref());
+
     // feedback and user: always all-active, no scoring needed
-    let feedback = query_by_type(conn, "feedback", 20)?;
-    let user = query_by_type(conn, "user", 5)?;
+    let feedback = query_by_type(conn, "feedback", 20, &scope)?;
+    let user = query_by_type(conn, "user", 5, &scope)?;
 
     // project and reference: topic-scored
     let project_limit = args.limit.max(5);
     let ref_limit = (args.limit / 2).max(3);
 
-    let scored_project = score_context_memories(conn, &signal_terms, "project", project_limit)?;
-    let scored_reference = score_context_memories(conn, &signal_terms, "reference", ref_limit)?;
+    let scored_project =
+        score_context_memories(conn, &signal_terms, "project", project_limit, &scope)?;
+    let scored_reference =
+        score_context_memories(conn, &signal_terms, "reference", ref_limit, &scope)?;
 
     if args.verbose {
         eprintln!("[context] signals: {}", signal_terms.join(", "));
@@ -862,12 +989,22 @@ fn migrate(conn: &Connection, args: MigrateArgs) -> Result<()> {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-fn query_by_type(conn: &Connection, type_: &str, limit: usize) -> Result<Vec<Memory>> {
-    let mut stmt = conn.prepare(
+fn query_by_type(
+    conn: &Connection,
+    type_: &str,
+    limit: usize,
+    scope: &ScopeFilter,
+) -> Result<Vec<Memory>> {
+    let (scope_sql, scope_vals) = scope.sql_and("scope");
+    let sql = format!(
         "SELECT id, type, name, description, content, source, tags, cwd, is_active, created_at, updated_at
-         FROM memories WHERE type = ?1 AND is_active = 1 ORDER BY updated_at DESC LIMIT ?2",
-    )?;
-    let mapped = stmt.query_map(params![type_, limit as i64], row_to_memory)?;
+         FROM memories WHERE type = ? AND is_active = 1{scope_sql} ORDER BY updated_at DESC LIMIT ?"
+    );
+    let mut p: Vec<Value> = vec![Value::Text(type_.to_string())];
+    p.extend(scope_vals);
+    p.push(Value::Integer(limit as i64));
+    let mut stmt = conn.prepare(&sql)?;
+    let mapped = stmt.query_map(params_from_iter(p.iter()), row_to_memory)?;
     collect_memories(mapped)
 }
 
@@ -973,13 +1110,23 @@ fn recall(conn: &Connection, args: RecallArgs) -> Result<()> {
         .next()
         .ok_or_else(|| anyhow::anyhow!("embedder returned no vector"))?;
 
-    let sql = "SELECT m.id, m.type, m.name, m.description, m.updated_at, e.vector
+    let scope = ScopeFilter::for_explicit(args.scope.as_deref());
+    let (scope_sql, scope_vals) = scope.sql_and("m.scope");
+    let sql = format!(
+        "SELECT m.id, m.type, m.name, m.description, m.updated_at, e.vector
                FROM memory_embeddings e
                JOIN memories m ON m.id = e.memory_id
-               WHERE m.is_active = 1 AND e.model = ?1
-                 AND (?2 IS NULL OR m.type = ?2)";
-    let mut stmt = conn.prepare(sql)?;
-    let rows = stmt.query_map(params![model, args.r#type], |r| {
+               WHERE m.is_active = 1 AND e.model = ?
+                 AND (? IS NULL OR m.type = ?){scope_sql}"
+    );
+    let mut p: Vec<Value> = vec![
+        Value::Text(model.clone()),
+        type_value(&args.r#type),
+        type_value(&args.r#type),
+    ];
+    p.extend(scope_vals);
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params_from_iter(p.iter()), |r| {
         Ok((
             r.get::<_, String>(0)?,
             r.get::<_, String>(1)?,
@@ -1022,6 +1169,7 @@ fn recall(conn: &Connection, args: RecallArgs) -> Result<()> {
                 query: args.query.clone(),
                 r#type: args.r#type.clone(),
                 limit: args.k,
+                scope: args.scope.clone(),
             },
         )?;
     }
