@@ -125,10 +125,7 @@ pub fn build_edges(store: &mut dyn Store) -> Result<EdgeBuildStats> {
 
 /// Choose the best match from a candidate list of name-matched chunks.
 /// Returns the chunk and our confidence in the resolution.
-fn pick_target<'a>(
-    in_file: &PathBuf,
-    candidates: &'a [Chunk],
-) -> (Option<&'a Chunk>, f32) {
+fn pick_target<'a>(in_file: &PathBuf, candidates: &'a [Chunk]) -> (Option<&'a Chunk>, f32) {
     if candidates.is_empty() {
         return (None, 0.0);
     }

@@ -100,41 +100,40 @@ fn update(conn: &Connection, args: UpdateArgs) -> Result<()> {
     let ts = now();
     conn.execute_batch("BEGIN")?;
     let result = (|| {
-
-    if let Some(ref status) = args.status {
-        if !VALID_STATUSES.contains(&status.as_str()) {
-            bail!("status must be one of: {}", VALID_STATUSES.join(", "));
+        if let Some(ref status) = args.status {
+            if !VALID_STATUSES.contains(&status.as_str()) {
+                bail!("status must be one of: {}", VALID_STATUSES.join(", "));
+            }
+            let n = conn.execute(
+                "UPDATE tasks SET status=?1, updated_at=?2 WHERE id=?3",
+                params![status, ts, args.id],
+            )?;
+            if n == 0 {
+                bail!("no task with id={}", args.id);
+            }
         }
-        let n = conn.execute(
-            "UPDATE tasks SET status=?1, updated_at=?2 WHERE id=?3",
-            params![status, ts, args.id],
-        )?;
-        if n == 0 {
-            bail!("no task with id={}", args.id);
-        }
-    }
 
-    if let Some(ref result) = args.result {
-        let n = conn.execute(
-            "UPDATE tasks SET result=?1, updated_at=?2 WHERE id=?3",
-            params![result, ts, args.id],
-        )?;
-        if n == 0 {
-            bail!("no task with id={}", args.id);
+        if let Some(ref result) = args.result {
+            let n = conn.execute(
+                "UPDATE tasks SET result=?1, updated_at=?2 WHERE id=?3",
+                params![result, ts, args.id],
+            )?;
+            if n == 0 {
+                bail!("no task with id={}", args.id);
+            }
         }
-    }
 
-    if let Some(ref cid) = args.completion_id {
-        let n = conn.execute(
-            "UPDATE tasks SET completion_id=?1, updated_at=?2 WHERE id=?3",
-            params![cid, ts, args.id],
-        )?;
-        if n == 0 {
-            bail!("no task with id={}", args.id);
+        if let Some(ref cid) = args.completion_id {
+            let n = conn.execute(
+                "UPDATE tasks SET completion_id=?1, updated_at=?2 WHERE id=?3",
+                params![cid, ts, args.id],
+            )?;
+            if n == 0 {
+                bail!("no task with id={}", args.id);
+            }
         }
-    }
 
-    Ok(())
+        Ok(())
     })();
     if result.is_ok() {
         conn.execute_batch("COMMIT")?;
@@ -153,7 +152,10 @@ fn list(conn: &Connection, args: ListArgs) -> Result<()> {
         param_boxes.push(Box::new(s.clone()));
     }
     if let Some(ref cwd) = args.cwd {
-        let escaped = cwd.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
+        let escaped = cwd
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
         clauses.push("cwd LIKE ? ESCAPE '\\'".to_string());
         param_boxes.push(Box::new(format!("%{escaped}%")));
     }
@@ -180,7 +182,11 @@ fn list(conn: &Connection, args: ListArgs) -> Result<()> {
         let ts = chrono::DateTime::from_timestamp(updated_at, 0)
             .map(|d| d.format("%Y-%m-%d %H:%M").to_string())
             .unwrap_or_default();
-        let cwd_str = if cwd.is_empty() { String::new() } else { format!("  cwd: {cwd}") };
+        let cwd_str = if cwd.is_empty() {
+            String::new()
+        } else {
+            format!("  cwd: {cwd}")
+        };
         println!("[{id}] {status:12} ({task_type}) {ts}");
         println!("  {objective}{cwd_str}");
     }
@@ -211,7 +217,18 @@ fn show(conn: &Connection, args: ShowArgs) -> Result<()> {
     match row {
         Err(rusqlite::Error::QueryReturnedNoRows) => bail!("no task with id={}", args.id),
         Err(e) => return Err(e.into()),
-        Ok((id, status, task_type, objective, cwd, parent_id, completion_id, result, created_at, updated_at)) => {
+        Ok((
+            id,
+            status,
+            task_type,
+            objective,
+            cwd,
+            parent_id,
+            completion_id,
+            result,
+            created_at,
+            updated_at,
+        )) => {
             let fmt = |ts: i64| {
                 chrono::DateTime::from_timestamp(ts, 0)
                     .map(|d| d.format("%Y-%m-%d %H:%M:%S").to_string())
@@ -221,9 +238,15 @@ fn show(conn: &Connection, args: ShowArgs) -> Result<()> {
             println!("status:      {status}");
             println!("type:        {task_type}");
             println!("objective:   {objective}");
-            if !cwd.is_empty() { println!("cwd:         {cwd}"); }
-            if let Some(p) = parent_id { println!("parent:      {p}"); }
-            if let Some(c) = completion_id { println!("completion:  {c}"); }
+            if !cwd.is_empty() {
+                println!("cwd:         {cwd}");
+            }
+            if let Some(p) = parent_id {
+                println!("parent:      {p}");
+            }
+            if let Some(c) = completion_id {
+                println!("completion:  {c}");
+            }
             println!("created:     {}", fmt(created_at));
             println!("updated:     {}", fmt(updated_at));
             if let Some(r) = result {
@@ -258,7 +281,9 @@ fn resume(conn: &Connection) -> Result<()> {
             .unwrap_or_default();
         println!("[{id}] {status:12} ({task_type}) {ts}");
         println!("  {objective}");
-        if !cwd.is_empty() { println!("  cwd: {cwd}"); }
+        if !cwd.is_empty() {
+            println!("  cwd: {cwd}");
+        }
         any = true;
     }
     if !any {

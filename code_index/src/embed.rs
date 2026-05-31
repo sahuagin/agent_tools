@@ -158,11 +158,7 @@ impl Embedder for OpenRouterEmbedder {
 }
 
 impl OpenRouterEmbedder {
-    fn embed_with_key(
-        &self,
-        texts: &[String],
-        key: &str,
-    ) -> Result<Vec<Vec<f32>>> {
+    fn embed_with_key(&self, texts: &[String], key: &str) -> Result<Vec<Vec<f32>>> {
         let url = format!("{}/embeddings", self.base_url);
         let body = EmbeddingRequest {
             model: &self.model,
@@ -183,15 +179,13 @@ impl OpenRouterEmbedder {
                 // no hint at the actual cause. Now we try the happy-path
                 // shape, fall back to error-envelope parsing, and as a last
                 // resort include a truncated body sample in the error.
-                let body_text = r.into_string().map_err(|e| {
-                    anyhow!("reading embedding response body: {e}")
-                })?;
+                let body_text = r
+                    .into_string()
+                    .map_err(|e| anyhow!("reading embedding response body: {e}"))?;
                 if let Ok(parsed) = serde_json::from_str::<EmbeddingResponse>(&body_text) {
                     return Ok(parsed.data.into_iter().map(|d| d.embedding).collect());
                 }
-                if let Ok(envelope) =
-                    serde_json::from_str::<ErrorEnvelope>(&body_text)
-                {
+                if let Ok(envelope) = serde_json::from_str::<ErrorEnvelope>(&body_text) {
                     return Err(anyhow!(
                         "OpenRouter returned error envelope: {} (code: {})",
                         envelope.error.message,
@@ -393,10 +387,7 @@ pub fn embed_pending_concurrent(
         return embed_pending(store, embedder, batch_size);
     }
 
-    let batches: Vec<Vec<Chunk>> = pending
-        .chunks(batch_size)
-        .map(|c| c.to_vec())
-        .collect();
+    let batches: Vec<Vec<Chunk>> = pending.chunks(batch_size).map(|c| c.to_vec()).collect();
     let batch_count = batches.len();
 
     type WorkerOk = (Vec<ChunkId>, Vec<Vec<f32>>);
@@ -408,8 +399,7 @@ pub fn embed_pending_concurrent(
         // Per-worker work channels — round-robin distribution avoids a
         // shared-receiver Mutex. Per-channel capacity of 2 keeps each
         // worker primed with one in-flight + one queued, no more.
-        let mut worker_txs: Vec<mpsc::SyncSender<Vec<Chunk>>> =
-            Vec::with_capacity(concurrency);
+        let mut worker_txs: Vec<mpsc::SyncSender<Vec<Chunk>>> = Vec::with_capacity(concurrency);
         for _ in 0..concurrency {
             let (tx, rx) = mpsc::sync_channel::<Vec<Chunk>>(2);
             worker_txs.push(tx);
@@ -632,9 +622,7 @@ mod tests {
     #[test]
     fn drop_flushes_pending_on_scope_exit() {
         let mut s = SqliteStore::open_in_memory().unwrap();
-        let id = s
-            .upsert_chunk(&dummy_chunk("only", "body"))
-            .unwrap();
+        let id = s.upsert_chunk(&dummy_chunk("only", "body")).unwrap();
         let m = MockEmbedder::default();
         {
             let mut sink = BatchedEmbedSink::new(&m, &mut s).with_batch_size(100);

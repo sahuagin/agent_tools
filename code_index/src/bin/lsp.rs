@@ -27,18 +27,31 @@ impl IndexHandle {
         self.db_path.lock().await.clone()
     }
 
-    fn recall_blocking(db_path: &Path, query: &str, limit: usize) -> anyhow::Result<Vec<(Chunk, f32)>> {
+    fn recall_blocking(
+        db_path: &Path,
+        query: &str,
+        limit: usize,
+    ) -> anyhow::Result<Vec<(Chunk, f32)>> {
         let store = SqliteStore::open_at(db_path)?;
         let embedder = select_embedder();
 
         // Try hybrid first; fall back to lexical if embedding fails
         // (bad key, network error, model unavailable).
         let hits = recall::recall_with_mode(
-            &store, embedder.as_ref(), query, limit, true,
+            &store,
+            embedder.as_ref(),
+            query,
+            limit,
+            true,
             RecallMode::Hybrid,
-        ).or_else(|_| {
+        )
+        .or_else(|_| {
             recall::recall_with_mode(
-                &store, embedder.as_ref(), query, limit, true,
+                &store,
+                embedder.as_ref(),
+                query,
+                limit,
+                true,
                 RecallMode::Lexical,
             )
         })?;
@@ -55,7 +68,8 @@ impl IndexHandle {
 const MIN_POPULATED_DB_SIZE: u64 = 100_000;
 
 fn db_is_populated(path: &Path) -> bool {
-    path.metadata().map_or(false, |m| m.len() >= MIN_POPULATED_DB_SIZE)
+    path.metadata()
+        .map_or(false, |m| m.len() >= MIN_POPULATED_DB_SIZE)
 }
 
 /// Resolve the db path for a given rootUri. Checks:
@@ -104,10 +118,10 @@ impl LanguageServer for Backend {
         // Safe: each connection gets its own Backend clone.
         *self.index.db_path.lock().await = db_path.clone();
         self.client
-            .log_message(MessageType::INFO, format!(
-                "code-index-lsp: using db {}",
-                db_path.display()
-            ))
+            .log_message(
+                MessageType::INFO,
+                format!("code-index-lsp: using db {}", db_path.display()),
+            )
             .await;
         Ok(InitializeResult {
             capabilities: ServerCapabilities {
@@ -128,10 +142,10 @@ impl LanguageServer for Backend {
     async fn initialized(&self, _: InitializedParams) {
         let db = self.index.db_path().await;
         self.client
-            .log_message(MessageType::INFO, format!(
-                "code-index-lsp ready (db: {})",
-                db.display()
-            ))
+            .log_message(
+                MessageType::INFO,
+                format!("code-index-lsp ready (db: {})", db.display()),
+            )
             .await;
     }
 
@@ -149,12 +163,11 @@ impl LanguageServer for Backend {
         }
 
         let db_path = self.index.db_path().await;
-        let results = tokio::task::spawn_blocking(move || {
-            IndexHandle::recall_blocking(&db_path, &query, 20)
-        })
-        .await
-        .map_err(|_| Error::internal_error())?
-        .map_err(|_| Error::internal_error())?;
+        let results =
+            tokio::task::spawn_blocking(move || IndexHandle::recall_blocking(&db_path, &query, 20))
+                .await
+                .map_err(|_| Error::internal_error())?
+                .map_err(|_| Error::internal_error())?;
 
         let cwd = std::env::current_dir().unwrap_or_default();
         let symbols: Vec<SymbolInformation> = results
@@ -185,10 +198,7 @@ impl LanguageServer for Backend {
                             },
                         },
                     },
-                    container_name: chunk
-                        .file
-                        .parent()
-                        .map(|p| p.display().to_string()),
+                    container_name: chunk.file.parent().map(|p| p.display().to_string()),
                 })
             })
             .collect();
@@ -207,9 +217,7 @@ impl LanguageServer for Backend {
                     .await;
                 Ok(Some(serde_json::json!({"status": "not_implemented"})))
             }
-            _ => {
-                Err(Error::method_not_found())
-            }
+            _ => Err(Error::method_not_found()),
         }
     }
 }
@@ -278,7 +286,9 @@ async fn main() {
             let db = db_path.clone();
             let (service, socket) = LspService::new(|client| Backend {
                 client,
-                index: Arc::new(IndexHandle { db_path: tokio::sync::Mutex::new(db) }),
+                index: Arc::new(IndexHandle {
+                    db_path: tokio::sync::Mutex::new(db),
+                }),
                 default_db: db_path,
             });
             Server::new(tokio::io::stdin(), tokio::io::stdout(), socket)
@@ -289,10 +299,12 @@ async fn main() {
 }
 
 async fn serve_tcp(addr: &str, db_path: PathBuf) {
-    let listener = tokio::net::TcpListener::bind(addr).await.unwrap_or_else(|e| {
-        eprintln!("failed to bind {addr}: {e}");
-        std::process::exit(1);
-    });
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .unwrap_or_else(|e| {
+            eprintln!("failed to bind {addr}: {e}");
+            std::process::exit(1);
+        });
     eprintln!("code-index-lsp listening on {addr}");
 
     loop {
@@ -310,7 +322,9 @@ async fn serve_tcp(addr: &str, db_path: PathBuf) {
             let db = default.clone();
             let (service, socket) = LspService::new(|client| Backend {
                 client,
-                index: Arc::new(IndexHandle { db_path: tokio::sync::Mutex::new(db) }),
+                index: Arc::new(IndexHandle {
+                    db_path: tokio::sync::Mutex::new(db),
+                }),
                 default_db: default,
             });
             Server::new(read, write, socket).serve(service).await;

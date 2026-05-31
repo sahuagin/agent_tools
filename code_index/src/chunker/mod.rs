@@ -99,11 +99,7 @@ impl Chunker {
     /// its containing definition via byte-range containment (parent
     /// walk via `Node::start_byte`/`end_byte`). Cross-file resolution
     /// is the caller's job — see `crate::edges`.
-    pub fn extract_with_references(
-        &self,
-        source: &[u8],
-        file: &Path,
-    ) -> Result<ExtractResult> {
+    pub fn extract_with_references(&self, source: &[u8], file: &Path) -> Result<ExtractResult> {
         let mut parser = Parser::new();
         parser
             .set_language(&self.ts_language)
@@ -372,7 +368,10 @@ class Speaker:
             .unwrap();
 
         assert_eq!(a[0].signature_hash, a2[0].signature_hash, "stable");
-        assert_ne!(a[0].signature_hash, b[0].signature_hash, "content-sensitive");
+        assert_ne!(
+            a[0].signature_hash, b[0].signature_hash,
+            "content-sensitive"
+        );
     }
 
     #[test]
@@ -393,7 +392,9 @@ class Speaker:
             .extract(src.as_bytes(), &PathBuf::from("a.rs"))
             .expect("extract");
         assert!(
-            chunks.iter().any(|c| c.kind == ChunkKind::Module && c.name == "fixed_buffer"),
+            chunks
+                .iter()
+                .any(|c| c.kind == ChunkKind::Module && c.name == "fixed_buffer"),
             "small module declarations are useful navigation anchors"
         );
     }
@@ -428,7 +429,10 @@ class Speaker:
         assert!(
             module_chunks.is_empty(),
             "oversize module chunks must be dropped, got: {:?}",
-            module_chunks.iter().map(|c| (&c.name, c.text.len())).collect::<Vec<_>>()
+            module_chunks
+                .iter()
+                .map(|c| (&c.name, c.text.len()))
+                .collect::<Vec<_>>()
         );
 
         // Inner functions are still captured. Note: tree-sitter-rust's

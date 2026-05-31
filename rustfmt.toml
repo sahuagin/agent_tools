@@ -1,0 +1,7 @@
+# Pinned formatter config so `cargo fmt` is deterministic across machines,
+# rustfmt versions, and agent sessions. Without this, the toolchain default
+# (max_width = 100) silently re-wraps code that earlier tooling laid out
+# differently, producing perpetual `cargo fmt --check` drift with no single
+# source of truth. Pinning the width + a CI `cargo fmt --all --check` gate is
+# what stops that.
+max_width = 100
