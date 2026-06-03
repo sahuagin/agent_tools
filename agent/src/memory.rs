@@ -170,6 +170,10 @@ pub struct ReindexArgs {
     pub batch: usize,
 }
 
+/// Row mirror of the `memories` table. Not every column is read by every
+/// command; the unused ones are kept so the struct documents the full row
+/// shape rather than a per-command projection.
+#[allow(dead_code)]
 struct Memory {
     id: String,
     type_: String,
@@ -734,7 +738,7 @@ fn context_stats(conn: &Connection, args: ContextStatsArgs) -> Result<()> {
 
     for row in rows {
         let (id, created_at, cwd, signals, n_scored, returned_json) = row?;
-        let cwd_short = cwd.split('/').last().unwrap_or(&cwd).to_string();
+        let cwd_short = cwd.split('/').next_back().unwrap_or(&cwd).to_string();
         println!(
             "#{id}  {}  cwd={}  signals=[{}]  scored={}",
             fmt_ts(created_at),
@@ -935,7 +939,7 @@ fn recall(conn: &Connection, args: RecallArgs) -> Result<()> {
     let model = embedder.model_id().to_string();
 
     let query_vec = embedder
-        .embed(&[args.query.clone()])?
+        .embed(std::slice::from_ref(&args.query))?
         .into_iter()
         .next()
         .ok_or_else(|| anyhow::anyhow!("embedder returned no vector"))?;

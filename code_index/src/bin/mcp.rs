@@ -21,7 +21,7 @@ const MIN_POPULATED_DB_SIZE: u64 = 100_000;
 
 fn db_is_populated(path: &Path) -> bool {
     path.metadata()
-        .map_or(false, |m| m.len() >= MIN_POPULATED_DB_SIZE)
+        .is_ok_and(|m| m.len() >= MIN_POPULATED_DB_SIZE)
 }
 
 fn resolve_db() -> PathBuf {

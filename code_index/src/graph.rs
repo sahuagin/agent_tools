@@ -171,7 +171,7 @@ impl Graph {
             groups.entry(rep).or_default().push(self.inner[ix]);
         }
         let mut out: Vec<Vec<ChunkId>> = groups.into_values().collect();
-        out.sort_by(|a, b| b.len().cmp(&a.len()));
+        out.sort_by_key(|v| std::cmp::Reverse(v.len()));
         out
     }
 
@@ -198,8 +198,8 @@ impl Graph {
                 break;
             }
             for nb in self.inner.neighbors(cur) {
-                if !visited.contains_key(&nb) {
-                    visited.insert(nb, cur);
+                if let std::collections::hash_map::Entry::Vacant(e) = visited.entry(nb) {
+                    e.insert(cur);
                     queue.push_back(nb);
                 }
             }
