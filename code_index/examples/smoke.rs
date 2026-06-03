@@ -43,9 +43,7 @@ fn chunk_file(path: &Path, total: &mut usize) -> anyhow::Result<()> {
     let Some(_lang) = SupportedLanguage::from_path(path) else {
         return Ok(());
     };
-    let chunker = Chunker::for_path(path)
-        .expect("supported language returns Some")
-        .map_err(anyhow::Error::from)?;
+    let chunker = Chunker::for_path(path).expect("supported language returns Some")?;
     let src = std::fs::read(path)?;
     let chunks = chunker.extract(&src, path)?;
     println!("{}: {} chunks", path.display(), chunks.len());

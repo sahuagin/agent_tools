@@ -332,6 +332,10 @@ pub struct ReindexArgs {
     pub batch: usize,
 }
 
+/// Row mirror of the `memories` table. Not every column is read by every
+/// command; the unused ones are kept so the struct documents the full row
+/// shape rather than a per-command projection.
+#[allow(dead_code)]
 struct Memory {
     id: String,
     type_: String,
@@ -838,7 +842,11 @@ fn update(conn: &Connection, args: UpdateArgs) -> Result<()> {
 }
 
 fn show(conn: &Connection, args: ShowArgs) -> Result<()> {
-    let active_clause = if args.inactive { "" } else { " AND is_active = 1" };
+    let active_clause = if args.inactive {
+        ""
+    } else {
+        " AND is_active = 1"
+    };
     let sql = format!(
         "SELECT id, type, name, description, content, source, tags, cwd, is_active, lifecycle, created_at, updated_at
          FROM memories
@@ -863,7 +871,10 @@ fn show(conn: &Connection, args: ShowArgs) -> Result<()> {
                 let values: Vec<serde_json::Value> = memories.iter().map(memory_to_json).collect();
                 println!("{}", serde_json::json!({ "matches": values }));
             } else {
-                println!("multiple memories matched id/name={}; use exact id", args.key);
+                println!(
+                    "multiple memories matched id/name={}; use exact id",
+                    args.key
+                );
                 for memory in &memories {
                     println!(
                         "[{}] ({}) {} — {}  [{}]",
@@ -1065,7 +1076,10 @@ fn patch_log(conn: &Connection, args: EventsArgs) -> Result<()> {
     }
 
     if args.json {
-        println!("{}", serde_json::json!({ "memory_id": args.id, "patches": values }));
+        println!(
+            "{}",
+            serde_json::json!({ "memory_id": args.id, "patches": values })
+        );
     }
     Ok(())
 }
@@ -1122,10 +1136,18 @@ fn print_apply_candidate(candidate: &ApplyCandidate) {
     }
 }
 
-fn required<'a>(value: &'a Option<String>, candidate: &ApplyCandidate, field: &str) -> Result<&'a str> {
-    value
-        .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("candidate {} action {} missing {field}", candidate.id, candidate.action))
+fn required<'a>(
+    value: &'a Option<String>,
+    candidate: &ApplyCandidate,
+    field: &str,
+) -> Result<&'a str> {
+    value.as_deref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "candidate {} action {} missing {field}",
+            candidate.id,
+            candidate.action
+        )
+    })
 }
 
 fn apply_candidate(conn: &Connection, candidate: &ApplyCandidate) -> Result<()> {
@@ -1135,12 +1157,16 @@ fn apply_candidate(conn: &Connection, candidate: &ApplyCandidate) -> Result<()> 
             AddArgs {
                 r#type: required(&candidate.type_, candidate, "type")?.to_string(),
                 name: required(&candidate.name, candidate, "name")?.to_string(),
-                description: required(&candidate.description, candidate, "description")?.to_string(),
+                description: required(&candidate.description, candidate, "description")?
+                    .to_string(),
                 content: Some(required(&candidate.content, candidate, "content")?.to_string()),
                 content_file: None,
                 tags: candidate.tags.clone().unwrap_or_default(),
                 cwd: candidate.cwd.clone().unwrap_or_default(),
-                source: candidate.source.clone().unwrap_or_else(|| "apply-plan".into()),
+                source: candidate
+                    .source
+                    .clone()
+                    .unwrap_or_else(|| "apply-plan".into()),
                 scope: candidate.scope.clone(),
             },
         ),
@@ -1157,21 +1183,9 @@ fn apply_candidate(conn: &Connection, candidate: &ApplyCandidate) -> Result<()> 
                 scope: candidate.scope.clone(),
             },
         ),
-        "archive" => set_lifecycle(
-            conn,
-            lifecycle_args_from_candidate(candidate)?,
-            "archived",
-        ),
-        "trash" => set_lifecycle(
-            conn,
-            lifecycle_args_from_candidate(candidate)?,
-            "trashed",
-        ),
-        "restore" => set_lifecycle(
-            conn,
-            lifecycle_args_from_candidate(candidate)?,
-            "active",
-        ),
+        "archive" => set_lifecycle(conn, lifecycle_args_from_candidate(candidate)?, "archived"),
+        "trash" => set_lifecycle(conn, lifecycle_args_from_candidate(candidate)?, "trashed"),
+        "restore" => set_lifecycle(conn, lifecycle_args_from_candidate(candidate)?, "active"),
         other => bail!("candidate {} has unsupported action: {other}", candidate.id),
     }
 }
@@ -1291,7 +1305,11 @@ fn diff(conn: &Connection, args: DiffArgs) -> Result<()> {
         return Ok(());
     }
 
-    println!("memory {} event {event_id}: {action} by {actor} ({})", args.id, fmt_ts(ts));
+    println!(
+        "memory {} event {event_id}: {action} by {actor} ({})",
+        args.id,
+        fmt_ts(ts)
+    );
     if !reason.is_empty() {
         println!("reason: {reason}");
     }
@@ -1565,7 +1583,7 @@ fn context_stats(conn: &Connection, args: ContextStatsArgs) -> Result<()> {
 
     for row in rows {
         let (id, created_at, cwd, signals, n_scored, returned_json) = row?;
-        let cwd_short = cwd.split('/').last().unwrap_or(&cwd).to_string();
+        let cwd_short = cwd.split('/').next_back().unwrap_or(&cwd).to_string();
         println!(
             "#{id}  {}  cwd={}  signals=[{}]  scored={}",
             fmt_ts(created_at),
@@ -1801,7 +1819,7 @@ fn recall(conn: &Connection, args: RecallArgs) -> Result<()> {
     let model = embedder.model_id().to_string();
 
     let query_vec = embedder
-        .embed(&[args.query.clone()])?
+        .embed(std::slice::from_ref(&args.query))?
         .into_iter()
         .next()
         .ok_or_else(|| anyhow::anyhow!("embedder returned no vector"))?;
@@ -1876,14 +1894,16 @@ fn recall(conn: &Connection, args: RecallArgs) -> Result<()> {
                 })
             );
         } else {
-            eprintln!(
-                "no embeddings found for model '{model}'. Run `agent memory reindex` first."
-            );
+            eprintln!("no embeddings found for model '{model}'. Run `agent memory reindex` first.");
         }
         return Ok(());
     }
 
-    scored.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    scored.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     scored.truncate(args.k);
 
     // Telemetry: log this recall call before returning results.
@@ -1973,10 +1993,11 @@ fn log_recall(conn: &Connection, args: &RecallArgs, scored: &[(&str, &str, f32)]
                    JOIN memories m ON m.rowid = fts.rowid
                    WHERE memories_fts MATCH ?1 AND m.is_active = 1
                      AND (?2 IS NULL OR m.type = ?2)";
-        match conn.query_row(sql, params![args.query, args.r#type], |r| r.get::<_, i64>(0)) {
-            Ok(n) => Some(n),
-            Err(_) => None, // FTS query syntax errors etc — leave null
-        }
+        // .ok(): FTS query syntax errors etc — leave null
+        conn.query_row(sql, params![args.query, args.r#type], |r| {
+            r.get::<_, i64>(0)
+        })
+        .ok()
     } else {
         None
     };
@@ -2003,7 +2024,10 @@ fn recall_stats(conn: &Connection, args: RecallStatsArgs) -> Result<()> {
     let since = now() - args.days * 86400;
 
     if args.gaps {
-        println!("## Weak-recall queries (top_score < {:.2}, last {} days)\n", args.gaps_threshold, args.days);
+        println!(
+            "## Weak-recall queries (top_score < {:.2}, last {} days)\n",
+            args.gaps_threshold, args.days
+        );
         let mut stmt = conn.prepare(
             "SELECT ts, query, k, COALESCE(top_score, 0.0), type_filter
              FROM memory_recall_log
@@ -2026,8 +2050,14 @@ fn recall_stats(conn: &Connection, args: RecallStatsArgs) -> Result<()> {
         let mut count = 0;
         for row in rows {
             let (ts, query, k, score, type_filter) = row?;
-            let type_str = type_filter.map(|t| format!(" type={t}")).unwrap_or_default();
-            println!("  [{score:.3}]  k={k}{type_str}  {}  ({})", fmt_ts(ts), query);
+            let type_str = type_filter
+                .map(|t| format!(" type={t}"))
+                .unwrap_or_default();
+            println!(
+                "  [{score:.3}]  k={k}{type_str}  {}  ({})",
+                fmt_ts(ts),
+                query
+            );
             count += 1;
         }
         if count == 0 {
@@ -2037,7 +2067,10 @@ fn recall_stats(conn: &Connection, args: RecallStatsArgs) -> Result<()> {
     }
 
     if args.hotspots {
-        println!("## Hotspots (queries grouped by first significant token, last {} days)\n", args.days);
+        println!(
+            "## Hotspots (queries grouped by first significant token, last {} days)\n",
+            args.days
+        );
         // Pull all queries in window, group in-process by first significant token.
         let mut stmt = conn.prepare(
             "SELECT query, COALESCE(top_score, 0.0) FROM memory_recall_log WHERE ts >= ?1",
@@ -2048,7 +2081,10 @@ fn recall_stats(conn: &Connection, args: RecallStatsArgs) -> Result<()> {
         let mut buckets: HashMap<String, (f64, usize, Vec<String>)> = HashMap::new();
         for row in rows {
             let (q, s) = row?;
-            let token = tokenize(&q).into_iter().next().unwrap_or_else(|| "_".into());
+            let token = tokenize(&q)
+                .into_iter()
+                .next()
+                .unwrap_or_else(|| "_".into());
             let entry = buckets.entry(token).or_insert((0.0, 0, Vec::new()));
             entry.0 += s;
             entry.1 += 1;
@@ -2071,7 +2107,10 @@ fn recall_stats(conn: &Connection, args: RecallStatsArgs) -> Result<()> {
     }
 
     if args.recall_vs_search {
-        println!("## Recall-found, FTS-missed (top_score >= {:.2}, fts_hits = 0, last {} days)\n", args.rvs_threshold, args.days);
+        println!(
+            "## Recall-found, FTS-missed (top_score >= {:.2}, fts_hits = 0, last {} days)\n",
+            args.rvs_threshold, args.days
+        );
         let mut stmt = conn.prepare(
             "SELECT ts, query, COALESCE(top_score, 0.0), results_json
              FROM memory_recall_log
@@ -2081,17 +2120,14 @@ fn recall_stats(conn: &Connection, args: RecallStatsArgs) -> Result<()> {
              ORDER BY top_score DESC
              LIMIT ?3",
         )?;
-        let rows = stmt.query_map(
-            params![since, args.rvs_threshold, args.limit as i64],
-            |r| {
-                Ok((
-                    r.get::<_, i64>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, f64>(2)?,
-                    r.get::<_, String>(3)?,
-                ))
-            },
-        )?;
+        let rows = stmt.query_map(params![since, args.rvs_threshold, args.limit as i64], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, f64>(2)?,
+                r.get::<_, String>(3)?,
+            ))
+        })?;
         let mut count = 0;
         for row in rows {
             let (ts, query, score, results_json) = row?;
@@ -2137,13 +2173,23 @@ fn recall_stats(conn: &Connection, args: RecallStatsArgs) -> Result<()> {
             let score_str = top_score
                 .map(|s| format!("[{s:.3}]"))
                 .unwrap_or_else(|| "[ -- ]".into());
-            let type_str = type_filter.map(|t| format!(" type={t}")).unwrap_or_default();
+            let type_str = type_filter
+                .map(|t| format!(" type={t}"))
+                .unwrap_or_default();
             let cmp_str = if compare_used == 1 {
-                format!(" cmp fts={}", fts_hits.map(|n| n.to_string()).unwrap_or_else(|| "?".into()))
+                format!(
+                    " cmp fts={}",
+                    fts_hits
+                        .map(|n| n.to_string())
+                        .unwrap_or_else(|| "?".into())
+                )
             } else {
                 String::new()
             };
-            println!("  {score_str}  k={k}{type_str}{cmp_str}  {}  {query}", fmt_ts(ts));
+            println!(
+                "  {score_str}  k={k}{type_str}{cmp_str}  {}  {query}",
+                fmt_ts(ts)
+            );
             count += 1;
         }
         if count == 0 {
