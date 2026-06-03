@@ -20,7 +20,8 @@ use code_index::store::SqliteStore;
 const MIN_POPULATED_DB_SIZE: u64 = 100_000;
 
 fn db_is_populated(path: &Path) -> bool {
-    path.metadata().map_or(false, |m| m.len() >= MIN_POPULATED_DB_SIZE)
+    path.metadata()
+        .map_or(false, |m| m.len() >= MIN_POPULATED_DB_SIZE)
 }
 
 fn resolve_db() -> PathBuf {
@@ -122,11 +123,9 @@ impl CodeIndexServer {
             }
             None => self.db_path.clone(),
         };
-        let result = tokio::task::spawn_blocking(move || {
-            recall_blocking(&db_path, &params)
-        })
-        .await
-        .map_err(|e| rmcp::ErrorData::internal_error(format!("task join: {e}"), None))?;
+        let result = tokio::task::spawn_blocking(move || recall_blocking(&db_path, &params))
+            .await
+            .map_err(|e| rmcp::ErrorData::internal_error(format!("task join: {e}"), None))?;
 
         match result {
             Ok(text) => Ok(CallToolResult::success(vec![Content::text(text)])),
@@ -134,7 +133,9 @@ impl CodeIndexServer {
         }
     }
 
-    #[tool(description = "Show code index status: DB path, file count, chunk count, embedding coverage.")]
+    #[tool(
+        description = "Show code index status: DB path, file count, chunk count, embedding coverage."
+    )]
     async fn code_status(&self) -> Result<CallToolResult, rmcp::ErrorData> {
         let db_path = self.db_path.clone();
         let result = tokio::task::spawn_blocking(move || status_blocking(&db_path))

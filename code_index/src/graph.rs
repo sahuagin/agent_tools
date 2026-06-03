@@ -326,10 +326,7 @@ mod tests {
 
     #[test]
     fn shortest_path_handles_disconnected() {
-        let edges = vec![
-            edge(1, 2, EdgeKind::Calls),
-            edge(10, 20, EdgeKind::Calls),
-        ];
+        let edges = vec![edge(1, 2, EdgeKind::Calls), edge(10, 20, EdgeKind::Calls)];
         let g = Graph::from_edges(edges);
         assert!(g.shortest_path(ChunkId(1), ChunkId(20)).is_none());
     }

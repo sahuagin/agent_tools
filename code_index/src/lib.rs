@@ -104,12 +104,7 @@ pub trait Store {
     // which deserve a heap walk via get_chunk. See `Store` docstring for the
     // readv-style rationale.
     fn upsert_embedding(&mut self, id: ChunkId, model: &str, vec: &[f32]) -> Result<()>;
-    fn recall_top_k(
-        &self,
-        model: &str,
-        query: &[f32],
-        k: usize,
-    ) -> Result<Vec<(ChunkId, f32)>>;
+    fn recall_top_k(&self, model: &str, query: &[f32], k: usize) -> Result<Vec<(ChunkId, f32)>>;
     /// Chunks that don't yet have an embedding for `model`. Used by the
     /// embedding pass to find work after a re-chunk.
     fn chunks_missing_embedding(&self, model: &str) -> Result<Vec<Chunk>>;
@@ -120,11 +115,7 @@ pub trait Store {
     /// implementation may use a full-text index (sqlite FTS5 in the
     /// SqliteStore case) or a simpler substring scan — callers should
     /// not depend on a specific scoring scale.
-    fn recall_lexical(
-        &self,
-        query: &str,
-        k: usize,
-    ) -> Result<Vec<(ChunkId, f32)>>;
+    fn recall_lexical(&self, query: &str, k: usize) -> Result<Vec<(ChunkId, f32)>>;
 
     /// All file paths that have been ingested (per the file_manifest).
     /// Used by the edge-build pass to know which files to re-parse for
@@ -152,10 +143,5 @@ pub use graph::{Community, Graph};
 pub trait GraphAnalyzer {
     fn community_detection(&self, g: &Graph) -> Result<Vec<Community>>;
     fn centrality(&self, g: &Graph) -> Result<std::collections::HashMap<ChunkId, f64>>;
-    fn shortest_path(
-        &self,
-        g: &Graph,
-        from: ChunkId,
-        to: ChunkId,
-    ) -> Result<Vec<ChunkId>>;
+    fn shortest_path(&self, g: &Graph, from: ChunkId, to: ChunkId) -> Result<Vec<ChunkId>>;
 }
