@@ -624,7 +624,7 @@ mod tests {
 
     #[test]
     fn open_and_migrate_empty_db_is_idempotent() {
-        let mut s = SqliteStore::open_in_memory().expect("open");
+        let s = SqliteStore::open_in_memory().expect("open");
         // Re-running migrate on an already-migrated DB should be a no-op.
         SqliteStore::migrate(&s.conn).expect("migrate twice");
         // Empty DB: no chunks, no edges.

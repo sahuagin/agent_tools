@@ -54,6 +54,10 @@ pub enum RecallMode {
 }
 
 impl RecallMode {
+    /// Parse a mode name. Inherent rather than `std::str::FromStr` because
+    /// the contract is Option-shaped (silent `None` on unknown input), not
+    /// error-shaped.
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
         match s.to_ascii_lowercase().as_str() {
             "semantic" => Some(Self::Semantic),
@@ -196,11 +200,11 @@ pub fn recall_tuned(
     } else {
         2
     };
-    let pool_k = if matches!(mode, RecallMode::Hybrid) {
-        k.saturating_mul(scale).max(k)
-    } else {
-        k.saturating_mul(scale).max(k)
-    };
+    // NOTE: a vestigial `if Hybrid` branch here computed the same value in
+    // both arms (clippy::if_same_then_else); collapsed behavior-neutrally.
+    // Whether Hybrid should over-pull a *deeper* pool for RRF overlap is
+    // tracked in at-hybrid-pool-k-noop-tz6.
+    let pool_k = k.saturating_mul(scale).max(k);
 
     let semantic = match mode {
         RecallMode::Lexical => Vec::new(),
