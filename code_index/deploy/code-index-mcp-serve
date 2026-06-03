@@ -1,0 +1,38 @@
+#!/bin/sh
+# code-index-mcp-serve — launch the code-index MCP server over HTTP.
+#
+# Thin wrapper around code-index-mcp so the OpenRouter embed key is read from
+# config here (never passed on argv / never visible in `ps`) and a sane default
+# DB is pinned. Invoked by the code_index_mcp rc.d service (as tcovert); also
+# runnable by hand:  LISTEN=127.0.0.1:7622 code-index-mcp-serve
+#
+# Env (with defaults):
+#   LISTEN         host:port to bind                       (default 0.0.0.0:7622)
+#   CODE_INDEX_DB  default DB used when a code_recall call  (default: mu's fresh
+#                  passes no `db` argument                   per-repo index)
+#
+# Multi-repo is by the per-call `db` argument; CODE_INDEX_DB is only the default.
+set -eu
+
+: "${LISTEN:=0.0.0.0:7622}"
+: "${CODE_INDEX_DB:=/home/tcovert/src/public_github/mu/.code_index/index.db}"
+export CODE_INDEX_DB
+
+: "${HOME:=/home/tcovert}"
+export HOME
+
+TQ="$HOME/.cargo/bin/tq"
+CFG="$HOME/.config/agent/config.toml"
+BIN="$HOME/src/agent_tools/target/release/code-index-mcp"
+
+# Real query embedding needs the key; without it recall falls back to a
+# MockEmbedder (semantically meaningless). Best-effort: a failed lookup still
+# lets the server start — lexical-mode recall keeps working.
+if [ -x "$TQ" ] && [ -r "$CFG" ]; then
+    OPENROUTER_API_KEY="$("$TQ" -f "$CFG" -r openrouter.api_key 2>/dev/null || true)"
+    [ -n "${OPENROUTER_API_KEY:-}" ] && export OPENROUTER_API_KEY
+fi
+
+# exec so daemon(8)'s pidfile/-r supervision tracks the binary itself, not a
+# lingering wrapper shell.
+exec "$BIN" --listen "$LISTEN"
