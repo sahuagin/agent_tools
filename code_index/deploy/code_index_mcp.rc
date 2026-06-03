@@ -1,0 +1,77 @@
+#!/bin/sh
+#
+# code_index_mcp — rc.d service for the code-index MCP server (HTTP).
+#
+# Serves `code_recall` / `code_status` over rmcp Streamable HTTP (axum, route
+# /mcp) so MCP clients (Claude Code, mu-serve) can recall over the code indexes
+# that the reindex-if-changed cron keeps fresh. Multi-repo: each code_recall
+# call selects its DB via the `db` argument; CODE_INDEX_DB is only the default.
+#
+# Install:
+#   sudo install -m 0555 code_index_mcp.rc /usr/local/etc/rc.d/code_index_mcp
+#   sudo sysrc code_index_mcp_enable="YES"
+#   sudo sysrc code_index_mcp_user="tcovert"
+#   sudo sysrc code_index_mcp_listen="10.1.1.172:7622"   # match the registered MCP URL
+#   sudo service code_index_mcp start
+#
+# rc.conf knobs (all prefixed code_index_mcp_):
+#   enable   — required: YES to start at boot / via 'service start'
+#   user     — user to run as (rc.subr su -m switch). Default tcovert.
+#   group    — primary group. Default = user.
+#   listen   — host:port to bind. Default 0.0.0.0:7622.
+#   db       — default DB path when a call passes no `db`. Default: mu's index.
+#   serve    — wrapper path. Default /home/tcovert/.local/bin/code-index-mcp-serve
+#   logfile  — Default /var/log/code_index_mcp.log
+#
+# PROVIDE: code_index_mcp
+# REQUIRE: NETWORKING
+# KEYWORD: shutdown
+
+. /etc/rc.subr
+
+name="code_index_mcp"
+rcvar="${name}_enable"
+
+load_rc_config "$name"
+
+: ${code_index_mcp_enable:="NO"}
+: ${code_index_mcp_user:="tcovert"}
+: ${code_index_mcp_listen:="0.0.0.0:7622"}
+: ${code_index_mcp_db:="/home/tcovert/src/public_github/mu/.code_index/index.db"}
+: ${code_index_mcp_serve:="/home/tcovert/.local/bin/code-index-mcp-serve"}
+: ${code_index_mcp_logfile:="/var/log/${name}.log"}
+
+# Resolve the run-user's home for HOME and chdir.
+code_index_mcp_home="$(getent passwd ${code_index_mcp_user} 2>/dev/null | cut -d: -f6)"
+: ${code_index_mcp_home:="/home/${code_index_mcp_user}"}
+: ${code_index_mcp_group:="${code_index_mcp_user}"}
+: ${code_index_mcp_chdir:="${code_index_mcp_home}"}
+
+# We set ${name}_user/_group (rc.subr does the su -m switch) and deliberately do
+# NOT pass `daemon -u`: on this box that combination + `-r` loops in
+# setusercontext() and crashes on every restart. (Same lesson as the
+# claude_proxy and c137_memory_worker services — see their comments.)
+# HOME is injected via env because the su -m switch doesn't reliably carry it,
+# and the wrapper resolves ~/.cargo/bin/tq, ~/.config, and the binary from $HOME.
+pidfile="/var/run/${name}/${name}.pid"
+command="/usr/sbin/daemon"
+command_args="-r -t ${name} -P ${pidfile} -o ${code_index_mcp_logfile} \
+    /usr/bin/env HOME=${code_index_mcp_home} \
+    LISTEN=${code_index_mcp_listen} CODE_INDEX_DB=${code_index_mcp_db} \
+    ${code_index_mcp_serve}"
+required_files="${code_index_mcp_serve}"
+
+start_precmd="code_index_mcp_prestart"
+code_index_mcp_prestart() {
+    if [ ! -x "${code_index_mcp_serve}" ]; then
+        err 1 "wrapper not found or not executable: ${code_index_mcp_serve}"
+    fi
+    # Pidfile dir must be writable by the unprivileged run-user: daemon runs as
+    # ${code_index_mcp_user} (via rc.subr's su -m) and /var/run is root:wheel 0755.
+    install -d -o "${code_index_mcp_user}" -g "${code_index_mcp_group}" -m 0755 "/var/run/${name}"
+    install -o "${code_index_mcp_user}" -g "${code_index_mcp_group}" -m 0644 \
+        /dev/null "${code_index_mcp_logfile}" 2>/dev/null || \
+        chown "${code_index_mcp_user}:${code_index_mcp_group}" "${code_index_mcp_logfile}"
+}
+
+run_rc_command "$1"
