@@ -289,6 +289,15 @@ pub struct ContextArgs {
     /// A profile sees its own + shared memories; absent/unknown spans all (back-compat).
     #[arg(long)]
     pub scope: Option<String>,
+    /// at-0q9: which injection tier to emit. "full" (default) is the
+    /// classic four-section wall; "identity" is the small kernel —
+    /// user profile first, then feedback rules tagged 'identity'
+    /// (~600-800 tokens). Tier, not topic: the kernel carries who the
+    /// operator is and how to engage, never task detail (task detail
+    /// is recall-only — see mu's memory-hierarchy-and-trust spec,
+    /// "Injection economics: small kernel, discoverable tail").
+    #[arg(long, default_value = "full")]
+    pub tier: String,
 }
 
 #[derive(Args)]
@@ -1767,6 +1776,13 @@ fn context(conn: &Connection, args: ContextArgs) -> Result<()> {
     // profile (no --scope, no $CLAUDE_PROFILE) this spans all scopes.
     let scope = ScopeFilter::for_context(args.scope.as_deref());
 
+    // at-0q9: the identity tier short-circuits the four-section wall.
+    match args.tier.as_str() {
+        "identity" => return context_identity(conn, &args, &scope),
+        "full" => {}
+        other => bail!("invalid --tier: {other} (expected 'identity' or 'full')"),
+    }
+
     // feedback and user: always all-active, no scoring needed
     let feedback = query_by_type(conn, "feedback", 20, &scope)?;
     let user = query_by_type(conn, "user", 5, &scope)?;
@@ -1849,6 +1865,101 @@ fn context(conn: &Connection, args: ContextArgs) -> Result<()> {
             println!("**{}**: {}", m.name, m.content);
             println!("*{}*\n", memory_trust_label(m));
         }
+    }
+
+    Ok(())
+}
+
+/// at-0q9: the tag that marks a feedback memory as identity-tier.
+/// Membership is a data edit (`agent memory update ID --tags ...`),
+/// not a code change — curation stays operator-blessable.
+const IDENTITY_TAG: &str = "identity";
+
+/// True iff `m` carries the [`IDENTITY_TAG`].
+fn has_identity_tag(m: &Memory) -> bool {
+    m.tags.split(',').any(|t| t.trim() == IDENTITY_TAG)
+}
+
+/// at-0q9: select the identity kernel — `user` AND `feedback`
+/// memories tagged [`IDENTITY_TAG`]. Both types are tag-gated: the
+/// live store's user rows include multi-paragraph war stories that
+/// alone would blow the 600–800 token budget; the kernel is exactly
+/// what the operator blessed, nothing by default. Tier, not topic:
+/// who the operator is and how to engage. Task detail never
+/// qualifies; it stays recall-only.
+fn identity_kernel(conn: &Connection, scope: &ScopeFilter) -> Result<(Vec<Memory>, Vec<Memory>)> {
+    let user = query_by_type(conn, "user", 50, scope)?
+        .into_iter()
+        .filter(has_identity_tag)
+        .collect();
+    let feedback = query_by_type(conn, "feedback", 50, scope)?
+        .into_iter()
+        .filter(has_identity_tag)
+        .collect();
+    Ok((user, feedback))
+}
+
+/// at-0q9: render the identity tier — the small kernel injected at
+/// session start in place of the four-section wall. User profile
+/// FIRST (mu-42x8 lever a: the stable who-is-this slice leads), then
+/// the identity-tagged behavioral rules. Everything else in the
+/// store is reachable via `agent memory recall` / `search` — the
+/// kernel says so explicitly, because a kernel that doesn't teach
+/// discovery amputates the tail it demoted.
+fn context_identity(conn: &Connection, args: &ContextArgs, scope: &ScopeFilter) -> Result<()> {
+    let (user, feedback) = identity_kernel(conn, scope)?;
+
+    if user.is_empty() && feedback.is_empty() {
+        return Ok(());
+    }
+
+    // Same tuning log as the full tier; zero scored entries marks an
+    // identity-tier call in context-stats.
+    let _ = log_context_call(conn, &args.cwd, &["tier:identity".to_string()], 0, &[]);
+
+    println!("## Identity Kernel\n");
+
+    if !user.is_empty() {
+        println!("### User Profile\n");
+        for m in &user {
+            println!("*{}*", memory_trust_label(m));
+            println!("{}\n", m.content);
+        }
+    }
+
+    if !feedback.is_empty() {
+        println!("### Standing Rules\n");
+        // Injection economics: the rule (name + description) is the
+        // kernel; the WHY (full content, incidents) stays one
+        // `agent memory show <name>` away. Full content here would
+        // blow the 600–800 token budget on the first long rule.
+        for m in &feedback {
+            println!("**{}**: {}", m.name, m.description);
+            println!("*{}*\n", memory_trust_label(m));
+        }
+    }
+
+    println!(
+        "*Everything else is recall-only: `agent memory recall \"<topic>\"` \
+         (semantic), `agent memory search \"<term>\"` (lexical), \
+         `agent memory show <name>` (full rule + why). \
+         Memories are testimony — check the labels.*"
+    );
+
+    if args.verbose {
+        // Estimate what was actually printed: user full content,
+        // feedback one-liners.
+        let chars: usize = user.iter().map(|m| m.content.len()).sum::<usize>()
+            + feedback
+                .iter()
+                .map(|m| m.name.len() + m.description.len())
+                .sum::<usize>();
+        eprintln!(
+            "[context] tier=identity: {} user + {} feedback ≈ {} tokens (chars/4)",
+            user.len(),
+            feedback.len(),
+            chars / 4
+        );
     }
 
     Ok(())
@@ -2170,8 +2281,20 @@ fn recall(conn: &Connection, args: RecallArgs) -> Result<()> {
 
     let mut scored: Vec<Scored> = Vec::new();
     for row in rows {
-        let (id, type_, name, description, content, tags, updated_at, blob, created_at, verified_at, lifecycle, author) =
-            row?;
+        let (
+            id,
+            type_,
+            name,
+            description,
+            content,
+            tags,
+            updated_at,
+            blob,
+            created_at,
+            verified_at,
+            lifecycle,
+            author,
+        ) = row?;
         let v = embed::blob_to_f32(&blob);
         let score = embed::cosine(&query_vec, &v);
         scored.push(Scored {
@@ -2806,8 +2929,18 @@ mod tests {
         // Both of its queries filter lifecycle = 'active' — stronger than
         // excluding 'superseded' alone. Pin that down.
         let conn = crate::db::open_in_memory().unwrap();
-        seed(&conn, "p1", "stale-build", "the jail builds rust toolchains");
-        seed(&conn, "p2", "fresh-build", "the host builds rust toolchains");
+        seed(
+            &conn,
+            "p1",
+            "stale-build",
+            "the jail builds rust toolchains",
+        );
+        seed(
+            &conn,
+            "p2",
+            "fresh-build",
+            "the host builds rust toolchains",
+        );
         rebuild_index_for(&conn, "p1").unwrap();
         rebuild_index_for(&conn, "p2").unwrap();
         correct(
@@ -2869,5 +3002,90 @@ mod tests {
         let label = memory_trust_label(m);
         assert!(!label.contains("never verified"), "{label}");
         assert!(label.contains("verified"), "{label}");
+    }
+
+    // ── at-0q9: identity tier ─────────────────────────────────────
+
+    fn seed_typed(conn: &Connection, id: &str, type_: &str, name: &str, tags: &str) {
+        conn.execute(
+            "INSERT INTO memories (id, type, name, description, content, tags, created_at, updated_at, author)
+             VALUES (?1, ?2, ?3, 'd', 'content', ?4, 1000, 1000, 'witness')",
+            params![id, type_, name, tags],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn identity_kernel_selects_user_plus_tagged_feedback_only() {
+        let conn = crate::db::open_in_memory().unwrap();
+        seed_typed(&conn, "u1", "user", "identity-kernel-bio", "identity");
+        seed_typed(&conn, "u2", "user", "war-story-not-kernel", "origin-story");
+        seed_typed(
+            &conn,
+            "f1",
+            "feedback",
+            "no-sycophancy",
+            "identity,calibration",
+        );
+        seed_typed(&conn, "f2", "feedback", "task-detail-rule", "jj,workflow");
+        seed_typed(&conn, "p1", "project", "some-project-fact", "identity");
+
+        let (user, feedback) = identity_kernel(&conn, &ScopeFilter::All).unwrap();
+
+        assert_eq!(
+            user.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            vec!["u1"],
+            "user rows are tag-gated too — untagged war stories stay recall-only"
+        );
+        assert_eq!(
+            feedback.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            vec!["f1"],
+            "only identity-tagged feedback qualifies; untagged feedback and \
+             identity-tagged PROJECT rows stay recall-only"
+        );
+    }
+
+    #[test]
+    fn identity_tag_match_is_exact_not_substring() {
+        let conn = crate::db::open_in_memory().unwrap();
+        seed_typed(
+            &conn,
+            "f3",
+            "feedback",
+            "near-miss",
+            "identity-adjacent,other",
+        );
+        seed_typed(&conn, "f4", "feedback", "padded", " identity ,x");
+        let (_, feedback) = identity_kernel(&conn, &ScopeFilter::All).unwrap();
+        assert_eq!(
+            feedback.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            vec!["f4"],
+            "'identity-adjacent' must not match; whitespace-padded tag must"
+        );
+    }
+
+    #[test]
+    fn identity_kernel_excludes_superseded() {
+        // Same lifecycle discipline as the full tier (at-baj audit):
+        // query_by_type filters lifecycle='active', so a corrected
+        // identity rule drops out of the kernel.
+        let conn = crate::db::open_in_memory().unwrap();
+        seed_typed(&conn, "f5", "feedback", "stale-identity-rule", "identity");
+        seed_typed(&conn, "f6", "feedback", "fresh-identity-rule", "identity");
+        correct(
+            &conn,
+            CorrectArgs {
+                old: "f5".into(),
+                with_id: "f6".into(),
+                reason: String::new(),
+            },
+        )
+        .unwrap();
+        let (_, feedback) = identity_kernel(&conn, &ScopeFilter::All).unwrap();
+        assert_eq!(
+            feedback.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            vec!["f6"],
+            "superseded identity rule must leave the kernel"
+        );
     }
 }
