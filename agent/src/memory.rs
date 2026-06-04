@@ -384,6 +384,8 @@ struct Memory {
     lifecycle: String,
     created_at: i64,
     updated_at: i64,
+    verified_at: Option<i64>,
+    author: String,
 }
 
 fn short_id() -> String {
@@ -550,7 +552,7 @@ fn rebuild_index_for(conn: &Connection, memory_id: &str) -> Result<()> {
     let m: Option<Memory> = {
         let mut stmt = conn.prepare(
             "SELECT id, type, name, description, content, source, tags, cwd,
-                    is_active, lifecycle, created_at, updated_at
+                    is_active, lifecycle, created_at, updated_at, verified_at, author
              FROM memories WHERE id = ?1 AND is_active = 1 AND lifecycle = 'active'",
         )?;
         let mut rows = stmt.query_map(params![memory_id], row_to_memory)?;
@@ -644,6 +646,7 @@ fn score_context_memories(
     let sql = format!(
         "SELECT m.id, m.type, m.name, m.description, m.content, m.source,
                 m.tags, m.cwd, m.is_active, m.lifecycle, m.created_at, m.updated_at,
+                m.verified_at, m.author,
                 SUM(mti.weight) AS raw_score
          FROM memories m
          JOIN memory_topic_index mti ON mti.memory_id = m.id
@@ -663,7 +666,7 @@ fn score_context_memories(
 
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(params_from_iter(dyn_params.iter()), |r| {
-        Ok((row_to_memory(r)?, r.get::<_, f64>(12)?))
+        Ok((row_to_memory(r)?, r.get::<_, f64>(14)?))
     })?;
 
     let mut scored: Vec<(Memory, f64)> = rows
@@ -886,7 +889,7 @@ fn show(conn: &Connection, args: ShowArgs) -> Result<()> {
         " AND is_active = 1"
     };
     let sql = format!(
-        "SELECT id, type, name, description, content, source, tags, cwd, is_active, lifecycle, created_at, updated_at
+        "SELECT id, type, name, description, content, source, tags, cwd, is_active, lifecycle, created_at, updated_at, verified_at, author
          FROM memories
          WHERE (id = ?1 OR name = ?1){active_clause}
          ORDER BY CASE WHEN id = ?1 THEN 0 ELSE 1 END, updated_at DESC"
@@ -1609,6 +1612,13 @@ fn trust_label(
     parts.join(" · ")
 }
 
+/// at-baj: trust_label for a Memory row — the context injection path uses
+/// this. superseded_by is None by construction: every query that produces a
+/// Memory filters lifecycle = 'active', so a superseded row can't get here.
+fn memory_trust_label(m: &Memory) -> String {
+    trust_label(m.created_at, m.verified_at, &m.lifecycle, None, &m.author)
+}
+
 fn default_author() -> String {
     std::env::var("AGENT_AUTHOR")
         .or_else(|_| std::env::var("CLAUDE_PROFILE"))
@@ -1804,10 +1814,14 @@ fn context(conn: &Connection, args: ContextArgs) -> Result<()> {
 
     println!("## Active Memory Context\n");
 
+    // at-baj: every injected memory carries its testimony label — this output
+    // feeds claude-code session-start hooks AND mu's recall providers, so the
+    // label here is the whole mu integration.
     if !feedback.is_empty() {
         println!("### Behavioral Rules (Feedback)\n");
         for m in &feedback {
             println!("**{}**: {}", m.name, m.description);
+            println!("*{}*", memory_trust_label(m));
             println!("{}\n", m.content);
         }
     }
@@ -1815,6 +1829,7 @@ fn context(conn: &Connection, args: ContextArgs) -> Result<()> {
     if !user.is_empty() {
         println!("### User Profile\n");
         for m in &user {
+            println!("*{}*", memory_trust_label(m));
             println!("{}\n", m.content);
         }
     }
@@ -1823,6 +1838,7 @@ fn context(conn: &Connection, args: ContextArgs) -> Result<()> {
         println!("### Project Context\n");
         for (m, _) in &scored_project {
             println!("**{}**: {}", m.name, m.description);
+            println!("*{}*", memory_trust_label(m));
             println!("{}\n", m.content);
         }
     }
@@ -1830,7 +1846,8 @@ fn context(conn: &Connection, args: ContextArgs) -> Result<()> {
     if !scored_reference.is_empty() {
         println!("### References\n");
         for (m, _) in &scored_reference {
-            println!("**{}**: {}\n", m.name, m.content);
+            println!("**{}**: {}", m.name, m.content);
+            println!("*{}*\n", memory_trust_label(m));
         }
     }
 
@@ -1984,7 +2001,7 @@ fn query_by_type(
 ) -> Result<Vec<Memory>> {
     let (scope_sql, scope_vals) = scope.sql_and("scope");
     let sql = format!(
-        "SELECT id, type, name, description, content, source, tags, cwd, is_active, lifecycle, created_at, updated_at
+        "SELECT id, type, name, description, content, source, tags, cwd, is_active, lifecycle, created_at, updated_at, verified_at, author
          FROM memories WHERE type = ? AND is_active = 1 AND lifecycle = 'active'{scope_sql} ORDER BY updated_at DESC LIMIT ?"
     );
     let mut p: Vec<Value> = vec![Value::Text(type_.to_string())];
@@ -2009,6 +2026,8 @@ fn row_to_memory(r: &rusqlite::Row) -> rusqlite::Result<Memory> {
         lifecycle: r.get(9)?,
         created_at: r.get(10)?,
         updated_at: r.get(11)?,
+        verified_at: r.get(12)?,
+        author: r.get(13)?,
     })
 }
 
@@ -2102,7 +2121,8 @@ fn recall(conn: &Connection, args: RecallArgs) -> Result<()> {
     let (scope_sql, scope_vals) = scope.sql_and("m.scope");
     // Pull content + tags too so --full / JSON can include them without a second query
     let sql = format!(
-        "SELECT m.id, m.type, m.name, m.description, m.content, m.tags, m.updated_at, e.vector
+        "SELECT m.id, m.type, m.name, m.description, m.content, m.tags, m.updated_at, e.vector,
+                m.created_at, m.verified_at, m.lifecycle, m.author
                FROM memory_embeddings e
                JOIN memories m ON m.id = e.memory_id
                WHERE m.is_active = 1 AND e.model = ?
@@ -2126,6 +2146,10 @@ fn recall(conn: &Connection, args: RecallArgs) -> Result<()> {
             r.get::<_, String>(5)?,
             r.get::<_, i64>(6)?,
             r.get::<_, Vec<u8>>(7)?,
+            r.get::<_, i64>(8)?,
+            r.get::<_, Option<i64>>(9)?,
+            r.get::<_, String>(10)?,
+            r.get::<_, Option<String>>(11)?,
         ))
     })?;
 
@@ -2137,12 +2161,17 @@ fn recall(conn: &Connection, args: RecallArgs) -> Result<()> {
         content: String,
         tags: String,
         updated_at: i64,
+        created_at: i64,
+        verified_at: Option<i64>,
+        lifecycle: String,
+        author: Option<String>,
         score: f32,
     }
 
     let mut scored: Vec<Scored> = Vec::new();
     for row in rows {
-        let (id, type_, name, description, content, tags, updated_at, blob) = row?;
+        let (id, type_, name, description, content, tags, updated_at, blob, created_at, verified_at, lifecycle, author) =
+            row?;
         let v = embed::blob_to_f32(&blob);
         let score = embed::cosine(&query_vec, &v);
         scored.push(Scored {
@@ -2153,6 +2182,10 @@ fn recall(conn: &Connection, args: RecallArgs) -> Result<()> {
             content,
             tags,
             updated_at,
+            created_at,
+            verified_at,
+            lifecycle,
+            author,
             score,
         });
     }
@@ -2200,6 +2233,19 @@ fn recall(conn: &Connection, args: RecallArgs) -> Result<()> {
                     "tags": s.tags,
                     "updated_at": s.updated_at,
                     "score": s.score,
+                    // at-baj: testimony fields for structured consumers,
+                    // plus the rendered label injection paths show verbatim.
+                    "created_at": s.created_at,
+                    "verified_at": s.verified_at,
+                    "lifecycle": s.lifecycle,
+                    "author": s.author,
+                    "trust": trust_label(
+                        s.created_at,
+                        s.verified_at,
+                        &s.lifecycle,
+                        None,
+                        s.author.as_deref().unwrap_or(""),
+                    ),
                 });
                 if args.full {
                     obj["content"] = serde_json::Value::String(s.content.clone());
@@ -2228,6 +2274,18 @@ fn recall(conn: &Connection, args: RecallArgs) -> Result<()> {
             name = s.name,
             desc = s.description,
             ts = fmt_ts(s.updated_at)
+        );
+        // at-baj: one-liners are an injection path (mu trigger recall) — they
+        // carry the testimony label like every other read path.
+        println!(
+            "  {}",
+            trust_label(
+                s.created_at,
+                s.verified_at,
+                &s.lifecycle,
+                None,
+                s.author.as_deref().unwrap_or(""),
+            )
         );
         if args.full {
             println!("{}\n", indent(&s.content, "  "));
@@ -2738,5 +2796,78 @@ mod tests {
         assert_eq!(fts5_match_query("foo - bar"), r#""foo" "bar""#);
         assert_eq!(fts5_match_query("   "), "");
         assert_eq!(fts5_match_query("-:*"), "");
+    }
+
+    // ── at-baj: injection paths ──────────────────────────────────────
+
+    #[test]
+    fn context_queries_exclude_superseded() {
+        // context() was never audited for supersession (search/recall were).
+        // Both of its queries filter lifecycle = 'active' — stronger than
+        // excluding 'superseded' alone. Pin that down.
+        let conn = crate::db::open_in_memory().unwrap();
+        seed(&conn, "p1", "stale-build", "the jail builds rust toolchains");
+        seed(&conn, "p2", "fresh-build", "the host builds rust toolchains");
+        rebuild_index_for(&conn, "p1").unwrap();
+        rebuild_index_for(&conn, "p2").unwrap();
+        correct(
+            &conn,
+            CorrectArgs {
+                old: "p1".into(),
+                with_id: "p2".into(),
+                reason: String::new(),
+            },
+        )
+        .unwrap();
+
+        // Recency tier (feedback/user use this)
+        let by_type = query_by_type(&conn, "project", 50, &ScopeFilter::All).unwrap();
+        assert!(by_type.iter().any(|m| m.id == "p2"));
+        assert!(
+            by_type.iter().all(|m| m.id != "p1"),
+            "superseded memory leaked into query_by_type"
+        );
+
+        // Topic-scored tier (project/reference use this)
+        let terms = vec!["rust".to_string(), "toolchains".to_string()];
+        let scored =
+            score_context_memories(&conn, &terms, "project", 10, &ScopeFilter::All).unwrap();
+        assert!(scored.iter().any(|(m, _)| m.id == "p2"));
+        assert!(
+            scored.iter().all(|(m, _)| m.id != "p1"),
+            "superseded memory leaked into score_context_memories"
+        );
+    }
+
+    #[test]
+    fn injected_memories_carry_testimony_fields() {
+        // The Memory rows feeding context() must carry verified_at + author
+        // so memory_trust_label() renders a real testimony line.
+        let conn = crate::db::open_in_memory().unwrap();
+        seed(&conn, "t1", "fact", "labeled claim");
+
+        let rows = query_by_type(&conn, "project", 10, &ScopeFilter::All).unwrap();
+        let m = rows.iter().find(|m| m.id == "t1").unwrap();
+        assert_eq!(m.author, "test-witness");
+        assert!(m.verified_at.is_none());
+        let label = memory_trust_label(m);
+        assert!(label.contains("recorded"), "{label}");
+        assert!(label.contains("never verified"), "{label}");
+        assert!(label.contains("by test-witness"), "{label}");
+
+        verify(
+            &conn,
+            VerifyArgs {
+                id: "t1".into(),
+                note: "terrain-checked".into(),
+            },
+        )
+        .unwrap();
+        let rows = query_by_type(&conn, "project", 10, &ScopeFilter::All).unwrap();
+        let m = rows.iter().find(|m| m.id == "t1").unwrap();
+        assert!(m.verified_at.is_some());
+        let label = memory_trust_label(m);
+        assert!(!label.contains("never verified"), "{label}");
+        assert!(label.contains("verified"), "{label}");
     }
 }
