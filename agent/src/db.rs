@@ -26,6 +26,14 @@ pub fn open() -> Result<Connection> {
     Ok(conn)
 }
 
+/// at-usl: fresh in-memory DB at current schema for tests.
+#[cfg(test)]
+pub fn open_in_memory() -> Result<Connection> {
+    let conn = Connection::open_in_memory()?;
+    migrate(&conn)?;
+    Ok(conn)
+}
+
 fn migrate(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS schema_version (
@@ -112,6 +120,16 @@ fn migrate(conn: &Connection) -> Result<()> {
         conn.execute_batch(SCHEMA_V7)?;
         conn.execute(
             "INSERT INTO schema_version (version, applied) VALUES (7, ?)",
+            [chrono::Utc::now().timestamp()],
+        )?;
+        conn.execute_batch("COMMIT")?;
+    }
+
+    if version < 8 {
+        conn.execute_batch("BEGIN")?;
+        conn.execute_batch(SCHEMA_V8)?;
+        conn.execute(
+            "INSERT INTO schema_version (version, applied) VALUES (8, ?)",
             [chrono::Utc::now().timestamp()],
         )?;
         conn.execute_batch("COMMIT")?;
@@ -290,4 +308,23 @@ CREATE INDEX idx_memory_events_ts ON memory_events(ts DESC);
 const SCHEMA_V7: &str = "
 ALTER TABLE memories ADD COLUMN scope TEXT NOT NULL DEFAULT 'shared';
 CREATE INDEX IF NOT EXISTS idx_memories_scope ON memories(scope);
+";
+
+// v8 (at-usl): the memory trust layer — recall results are testimony, and
+// testimony carries dates, evidence, and a witness. Motivated by the
+// 2026-05-31/06-01 stale-recall incidents and mu's
+// specs/architecture/memory-hierarchy-and-trust.md (slice 1).
+//   verified_at      — when a human/agent last terrain-checked this fact
+//   source_ref       — evidence pointer (transcript path, daemon:session:seq)
+//   supersede_reason — why superseded_by (v6) points where it points
+//   author           — the witness: who asserted this (c137, work-claude,
+//                      work-gpt, subagent:<parent>, ...). Hive-mind reads by
+//                      default; filterable, never relegated.
+// Lifecycle gains the value 'superseded' (no schema change; TEXT column).
+const SCHEMA_V8: &str = "
+ALTER TABLE memories ADD COLUMN verified_at INTEGER;
+ALTER TABLE memories ADD COLUMN source_ref TEXT;
+ALTER TABLE memories ADD COLUMN supersede_reason TEXT;
+ALTER TABLE memories ADD COLUMN author TEXT NOT NULL DEFAULT '';
+CREATE INDEX idx_memories_author ON memories(author);
 ";
