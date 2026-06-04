@@ -55,6 +55,11 @@ pub enum MemoryAction {
     RecallStats(RecallStatsArgs),
     /// (Re-)embed memories using the configured embedder
     Reindex(ReindexArgs),
+    /// Mark OLD as superseded by NEW (testimony correction; read paths
+    /// then show the successor and label the stale entry)
+    Correct(CorrectArgs),
+    /// Stamp a memory as terrain-checked now (sets verified_at)
+    Verify(VerifyArgs),
     /// Export all active memories as markdown
     Export,
     /// Import existing markdown memory files into the database
@@ -85,6 +90,12 @@ pub struct AddArgs {
     /// Profile scope (work/personal/shared). Defaults to $CLAUDE_PROFILE, else "shared".
     #[arg(long)]
     pub scope: Option<String>,
+    /// Evidence pointer (transcript path, daemon:session:event_seq, URL)
+    #[arg(long)]
+    pub source_ref: Option<String>,
+    /// Witness: who asserts this. Defaults $AGENT_AUTHOR, else $CLAUDE_PROFILE.
+    #[arg(long)]
+    pub author: Option<String>,
 }
 
 #[derive(Args)]
@@ -212,6 +223,30 @@ pub struct SearchArgs {
     /// Restrict to a scope (work/personal/shared/*). Spans all scopes if omitted.
     #[arg(long)]
     pub scope: Option<String>,
+    /// Restrict to a witness (author). Hive-mind (all authors) if omitted.
+    #[arg(long)]
+    pub author: Option<String>,
+}
+
+#[derive(Args)]
+pub struct CorrectArgs {
+    /// The stale memory id being corrected
+    pub old: String,
+    /// The memory id that supersedes it
+    #[arg(long = "with")]
+    pub with_id: String,
+    /// Why the old fact is superseded
+    #[arg(long, default_value = "")]
+    pub reason: String,
+}
+
+#[derive(Args)]
+pub struct VerifyArgs {
+    /// Memory id that was terrain-checked
+    pub id: String,
+    /// Optional note about how it was verified
+    #[arg(long, default_value = "")]
+    pub note: String,
 }
 
 #[derive(Args)]
@@ -464,6 +499,8 @@ pub fn run(conn: Connection, cmd: MemoryCmd) -> Result<()> {
         MemoryAction::Recall(args) => recall(&conn, args),
         MemoryAction::RecallStats(args) => recall_stats(&conn, args),
         MemoryAction::Reindex(args) => reindex(&conn, args),
+        MemoryAction::Correct(args) => correct(&conn, args),
+        MemoryAction::Verify(args) => verify(&conn, args),
         MemoryAction::Export => export(&conn),
         MemoryAction::Migrate(args) => migrate(&conn, args),
     }
@@ -710,10 +747,11 @@ fn add(conn: &Connection, args: AddArgs) -> Result<()> {
     let id = short_id();
     let ts = now();
     let scope = resolve_write_scope(args.scope.as_deref());
+    let author = args.author.clone().unwrap_or_else(default_author);
     conn.execute(
-        "INSERT INTO memories (id, type, name, description, content, source, tags, cwd, scope, is_active, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1, ?10, ?10)",
-        params![id, args.r#type, args.name, args.description, content, args.source, args.tags, args.cwd, scope, ts],
+        "INSERT INTO memories (id, type, name, description, content, source, tags, cwd, scope, is_active, created_at, updated_at, source_ref, author)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1, ?10, ?10, ?11, ?12)",
+        params![id, args.r#type, args.name, args.description, content, args.source, args.tags, args.cwd, scope, ts, args.source_ref, author],
     )?;
     rebuild_index_for(conn, &id)?;
     let text = embed::memory_embed_text(&args.name, &args.description, &content);
@@ -864,6 +902,46 @@ fn show(conn: &Connection, args: ShowArgs) -> Result<()> {
                 println!("{}", memory_to_json(memory));
             } else {
                 print_memory(memory);
+                // at-usl: trust metadata (v8 columns live outside the Memory
+                // struct to keep its many consumers untouched).
+                if let Ok((verified_at, source_ref, superseded_by, reason, author)) = conn
+                    .query_row(
+                        "SELECT verified_at, source_ref, superseded_by, supersede_reason, author
+                         FROM memories WHERE id = ?1",
+                        params![memory.id],
+                        |r| {
+                            Ok((
+                                r.get::<_, Option<i64>>(0)?,
+                                r.get::<_, Option<String>>(1)?,
+                                r.get::<_, Option<String>>(2)?,
+                                r.get::<_, Option<String>>(3)?,
+                                r.get::<_, Option<String>>(4)?,
+                            ))
+                        },
+                    )
+                {
+                    println!();
+                    println!(
+                        "trust: {}",
+                        trust_label(
+                            memory.created_at,
+                            verified_at,
+                            &memory.lifecycle,
+                            superseded_by.as_deref(),
+                            author.as_deref().unwrap_or("")
+                        )
+                    );
+                    if let Some(sr) = source_ref.filter(|v| !v.is_empty()) {
+                        println!("source_ref: {sr}");
+                    }
+                    if let Some(rs) = reason.filter(|v| !v.is_empty()) {
+                        println!("supersede_reason: {rs}");
+                    }
+                    if let Some(succ) = superseded_by {
+                        println!();
+                        print_successor(conn, &succ)?;
+                    }
+                }
             }
         }
         _ => {
@@ -908,7 +986,11 @@ fn memory_row_json(conn: &Connection, id: &str) -> Result<Option<String>> {
             'archived_at', archived_at,
             'trashed_at', trashed_at,
             'purge_after', purge_after,
-            'superseded_by', superseded_by
+            'superseded_by', superseded_by,
+            'supersede_reason', supersede_reason,
+            'verified_at', verified_at,
+            'source_ref', source_ref,
+            'author', author
         ) FROM memories WHERE id = ?1";
     match conn.query_row(sql, params![id], |r| r.get::<_, String>(0)) {
         Ok(json) => Ok(Some(json)),
@@ -1168,6 +1250,8 @@ fn apply_candidate(conn: &Connection, candidate: &ApplyCandidate) -> Result<()> 
                     .clone()
                     .unwrap_or_else(|| "apply-plan".into()),
                 scope: candidate.scope.clone(),
+                source_ref: candidate.source_report.clone(),
+                author: None,
             },
         ),
         "update" => update(
@@ -1346,11 +1430,13 @@ fn search(conn: &Connection, args: SearchArgs) -> Result<()> {
     let scope = ScopeFilter::for_explicit(args.scope.as_deref());
     let (scope_sql, scope_vals) = scope.sql_and("m.scope");
     let sql = format!(
-        "SELECT m.id, m.type, m.name, m.description, m.content, m.tags, m.updated_at
+        "SELECT m.id, m.type, m.name, m.description, m.content, m.tags, m.updated_at,
+                m.created_at, m.verified_at, m.lifecycle, m.superseded_by, m.author
          FROM memories_fts fts
          JOIN memories m ON m.rowid = fts.rowid
          WHERE memories_fts MATCH ? AND m.is_active = 1
-           AND (? IS NULL OR m.type = ?){scope_sql}
+           AND (? IS NULL OR m.type = ?)
+           AND (? IS NULL OR m.author = ?){scope_sql}
          ORDER BY rank
          LIMIT ?"
     );
@@ -1359,6 +1445,8 @@ fn search(conn: &Connection, args: SearchArgs) -> Result<()> {
         Value::Text(match_query),
         type_value(&args.r#type),
         type_value(&args.r#type),
+        type_value(&args.author),
+        type_value(&args.author),
     ];
     p.extend(scope_vals);
     p.push(Value::Integer(args.limit as i64));
@@ -1373,19 +1461,205 @@ fn search(conn: &Connection, args: SearchArgs) -> Result<()> {
             r.get::<_, String>(4)?,
             r.get::<_, String>(5)?,
             r.get::<_, i64>(6)?,
+            r.get::<_, i64>(7)?,
+            r.get::<_, Option<i64>>(8)?,
+            r.get::<_, String>(9)?,
+            r.get::<_, Option<String>>(10)?,
+            r.get::<_, Option<String>>(11)?,
         ))
     })?;
 
     for row in rows {
-        let (id, type_, name, desc, content, tags, updated_at) = row?;
+        let (
+            id,
+            type_,
+            name,
+            desc,
+            content,
+            tags,
+            updated_at,
+            created_at,
+            verified_at,
+            lifecycle,
+            superseded_by,
+            author,
+        ) = row?;
         let ts = fmt_ts(updated_at);
+        // at-usl: a superseded memory is never shown without its successor —
+        // successor first with full content, the stale entry as a labeled stub.
+        if lifecycle == "superseded" {
+            if let Some(succ_id) = superseded_by.as_deref() {
+                print_successor(conn, succ_id)?;
+            }
+            println!(
+                "[{id}] ({type_}) {name} — {desc}  [{ts}]\n  {}",
+                trust_label(
+                    created_at,
+                    verified_at,
+                    &lifecycle,
+                    superseded_by.as_deref(),
+                    author.as_deref().unwrap_or("")
+                )
+            );
+            println!();
+            continue;
+        }
         println!("[{id}] ({type_}) {name} — {desc}  [{ts}]");
+        println!(
+            "  {}",
+            trust_label(
+                created_at,
+                verified_at,
+                &lifecycle,
+                superseded_by.as_deref(),
+                author.as_deref().unwrap_or("")
+            )
+        );
         if !tags.is_empty() {
             println!("  tags: {tags}");
         }
         println!("{}", indent(&content, "  "));
         println!();
     }
+    Ok(())
+}
+
+/// at-usl: render the successor of a superseded memory, full content,
+/// clearly marked as the fact currently in force.
+fn print_successor(conn: &Connection, succ_id: &str) -> Result<()> {
+    let row = conn.query_row(
+        "SELECT id, type, name, description, content, created_at, verified_at, lifecycle, superseded_by, author
+         FROM memories WHERE id = ?1",
+        params![succ_id],
+        |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, i64>(5)?,
+                r.get::<_, Option<i64>>(6)?,
+                r.get::<_, String>(7)?,
+                r.get::<_, Option<String>>(8)?,
+                r.get::<_, Option<String>>(9)?,
+            ))
+        },
+    );
+    match row {
+        Ok((
+            id,
+            type_,
+            name,
+            desc,
+            content,
+            created_at,
+            verified_at,
+            lifecycle,
+            superseded_by,
+            author,
+        )) => {
+            println!("[{id}] ({type_}) {name} — {desc}  [CURRENT — supersedes the entry below]");
+            println!(
+                "  {}",
+                trust_label(
+                    created_at,
+                    verified_at,
+                    &lifecycle,
+                    superseded_by.as_deref(),
+                    author.as_deref().unwrap_or("")
+                )
+            );
+            println!("{}", indent(&content, "  "));
+            println!();
+        }
+        Err(rusqlite::Error::QueryReturnedNoRows) => {
+            println!("  (successor {succ_id} not found — ORPHANED supersession)");
+        }
+        Err(e) => return Err(e.into()),
+    }
+    Ok(())
+}
+
+/// at-usl: testimony label shown on every read path. Memories are
+/// testimony with dates, not ground truth — this is where the dates live.
+fn trust_label(
+    created_at: i64,
+    verified_at: Option<i64>,
+    lifecycle: &str,
+    superseded_by: Option<&str>,
+    author: &str,
+) -> String {
+    let mut parts = vec![format!("recorded {}", fmt_ts(created_at))];
+    match verified_at {
+        Some(ts) => parts.push(format!("verified {}", fmt_ts(ts))),
+        None => parts.push("never verified".to_string()),
+    }
+    if !author.is_empty() {
+        parts.push(format!("by {author}"));
+    }
+    if lifecycle == "superseded" {
+        match superseded_by {
+            Some(succ) => parts.push(format!("SUPERSEDED by {succ}")),
+            None => parts.push("SUPERSEDED".to_string()),
+        }
+    } else if lifecycle == "orphaned" {
+        parts.push("ORPHANED — source no longer resolvable".to_string());
+    }
+    parts.join(" · ")
+}
+
+fn default_author() -> String {
+    std::env::var("AGENT_AUTHOR")
+        .or_else(|_| std::env::var("CLAUDE_PROFILE"))
+        .unwrap_or_default()
+}
+
+/// at-usl: mark OLD superseded by NEW. The read paths take it from here —
+/// search shows the successor inline; recall drops the stale entry.
+fn correct(conn: &Connection, args: CorrectArgs) -> Result<()> {
+    if args.old == args.with_id {
+        bail!("a memory cannot supersede itself");
+    }
+    let before = memory_row_json(conn, &args.old)?
+        .ok_or_else(|| anyhow::anyhow!("no memory found with id={}", args.old))?;
+    memory_row_json(conn, &args.with_id)?
+        .ok_or_else(|| anyhow::anyhow!("no successor memory with id={}", args.with_id))?;
+    let ts = now();
+    conn.execute(
+        "UPDATE memories
+         SET superseded_by=?1, supersede_reason=?2, lifecycle='superseded', updated_at=?3
+         WHERE id=?4",
+        params![args.with_id, args.reason, ts, args.old],
+    )?;
+    // lifecycle != 'active' drops it from the topic index (context injection).
+    rebuild_index_for(conn, &args.old)?;
+    let after = memory_row_json(conn, &args.old)?;
+    conn.execute(
+        "INSERT INTO memory_events (ts, actor, action, memory_id, before_json, after_json, reason)
+         VALUES (?1, 'agent', 'supersede', ?2, ?3, ?4, ?5)",
+        params![ts, args.old, before, after, args.reason],
+    )?;
+    println!("{} superseded by {}", args.old, args.with_id);
+    Ok(())
+}
+
+/// at-usl: stamp a memory as terrain-checked now.
+fn verify(conn: &Connection, args: VerifyArgs) -> Result<()> {
+    let before = memory_row_json(conn, &args.id)?
+        .ok_or_else(|| anyhow::anyhow!("no memory found with id={}", args.id))?;
+    let ts = now();
+    conn.execute(
+        "UPDATE memories SET verified_at=?1, updated_at=?1 WHERE id=?2",
+        params![ts, args.id],
+    )?;
+    let after = memory_row_json(conn, &args.id)?;
+    conn.execute(
+        "INSERT INTO memory_events (ts, actor, action, memory_id, before_json, after_json, reason)
+         VALUES (?1, 'agent', 'verify', ?2, ?3, ?4, ?5)",
+        params![ts, args.id, before, after, args.note],
+    )?;
+    println!("{} verified {}", args.id, fmt_ts(ts));
     Ok(())
 }
 
@@ -1832,6 +2106,7 @@ fn recall(conn: &Connection, args: RecallArgs) -> Result<()> {
                FROM memory_embeddings e
                JOIN memories m ON m.id = e.memory_id
                WHERE m.is_active = 1 AND e.model = ?
+                 AND m.lifecycle != 'superseded'
                  AND (? IS NULL OR m.type = ?){scope_sql}"
     );
     let mut p: Vec<Value> = vec![
@@ -1968,6 +2243,7 @@ fn recall(conn: &Connection, args: RecallArgs) -> Result<()> {
                 r#type: args.r#type.clone(),
                 limit: args.k,
                 scope: args.scope.clone(),
+                author: None,
             },
         )?;
     }
@@ -2305,6 +2581,155 @@ mod tests {
     fn embedded_quotes_are_doubled() {
         // A literal `"` inside a token must be escaped, not close the phrase.
         assert_eq!(fts5_match_query(r#"say"hi"#), r#""say""hi""#);
+    }
+
+    // ── at-usl: trust layer ──────────────────────────────────────────
+
+    fn seed(conn: &Connection, id: &str, name: &str, content: &str) {
+        conn.execute(
+            "INSERT INTO memories (id, type, name, description, content, created_at, updated_at, author)
+             VALUES (?1, 'project', ?2, 'd', ?3, 1000, 1000, 'test-witness')",
+            params![id, name, content],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn correct_supersedes_and_audits() {
+        let conn = crate::db::open_in_memory().unwrap();
+        seed(&conn, "old1", "stale-fact", "we run rust inside the jail");
+        seed(&conn, "new1", "fresh-fact", "rust always ran on the host");
+        correct(
+            &conn,
+            CorrectArgs {
+                old: "old1".into(),
+                with_id: "new1".into(),
+                reason: "operator correction".into(),
+            },
+        )
+        .unwrap();
+
+        let (lifecycle, succ, reason): (String, String, String) = conn
+            .query_row(
+                "SELECT lifecycle, superseded_by, supersede_reason FROM memories WHERE id='old1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(lifecycle, "superseded");
+        assert_eq!(succ, "new1");
+        assert_eq!(reason, "operator correction");
+
+        // Audit trail: a 'supersede' event with before/after json.
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM memory_events WHERE memory_id='old1' AND action='supersede'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn correct_rejects_self_and_missing_successor() {
+        let conn = crate::db::open_in_memory().unwrap();
+        seed(&conn, "a", "a", "x");
+        assert!(correct(
+            &conn,
+            CorrectArgs {
+                old: "a".into(),
+                with_id: "a".into(),
+                reason: String::new()
+            }
+        )
+        .is_err());
+        assert!(correct(
+            &conn,
+            CorrectArgs {
+                old: "a".into(),
+                with_id: "ghost".into(),
+                reason: String::new()
+            }
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn verify_stamps_verified_at() {
+        let conn = crate::db::open_in_memory().unwrap();
+        seed(&conn, "v1x", "fact", "checkable claim");
+        verify(
+            &conn,
+            VerifyArgs {
+                id: "v1x".into(),
+                note: "terrain-checked".into(),
+            },
+        )
+        .unwrap();
+        let ts: Option<i64> = conn
+            .query_row("SELECT verified_at FROM memories WHERE id='v1x'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert!(ts.is_some());
+    }
+
+    #[test]
+    fn trust_label_reads_as_testimony() {
+        // never verified, no author
+        let l = trust_label(1_700_000_000, None, "active", None, "");
+        assert!(l.contains("recorded"), "{l}");
+        assert!(l.contains("never verified"), "{l}");
+        // verified, witnessed, superseded
+        let l = trust_label(
+            1_700_000_000,
+            Some(1_750_000_000),
+            "superseded",
+            Some("xyz"),
+            "c137",
+        );
+        assert!(l.contains("verified"), "{l}");
+        assert!(l.contains("by c137"), "{l}");
+        assert!(l.contains("SUPERSEDED by xyz"), "{l}");
+        // orphaned
+        let l = trust_label(1_700_000_000, None, "orphaned", None, "");
+        assert!(l.contains("ORPHANED"), "{l}");
+    }
+
+    #[test]
+    fn superseded_excluded_from_topic_index() {
+        // correct() must drop the stale memory from the context-injection
+        // index (rebuild_index_for filters lifecycle='active').
+        let conn = crate::db::open_in_memory().unwrap();
+        seed(&conn, "o2", "jail-belief", "rust runs in jails definitely");
+        seed(&conn, "n2", "host-truth", "rust runs on the host");
+        rebuild_index_for(&conn, "o2").unwrap();
+        let before: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM memory_topic_index WHERE memory_id='o2'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(before > 0, "seed should be indexed while active");
+        correct(
+            &conn,
+            CorrectArgs {
+                old: "o2".into(),
+                with_id: "n2".into(),
+                reason: String::new(),
+            },
+        )
+        .unwrap();
+        let after: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM memory_topic_index WHERE memory_id='o2'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(after, 0, "superseded memory must leave the context index");
     }
 
     #[test]
