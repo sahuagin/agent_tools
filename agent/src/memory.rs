@@ -339,6 +339,11 @@ pub struct RecallArgs {
     /// Include full content body in results (default: id/name/description only)
     #[arg(long)]
     pub full: bool,
+    /// Ranking function: "v1" (cosine x trust x freshness + recency
+    /// tie-break, at-supersession-activation-gf2.1) or "legacy"
+    /// (pure cosine, the pre-gf2.1 behavior)
+    #[arg(long, default_value = "v1", value_parser = ["v1", "legacy"])]
+    pub rank: String,
 }
 
 #[derive(Args)]
@@ -2218,6 +2223,119 @@ fn indent(s: &str, prefix: &str) -> String {
 
 // ── Embedding-based recall ───────────────────────────────────────────────────
 
+// ── Recall ranking v1 (at-supersession-activation-gf2.1) ─────────────────────
+//
+// score = cosine · trust · fresh, where freshness decays from t_eff =
+// max(created, updated, verified) — so VERIFYING an old-but-true memory
+// resets its decay clock without touching the text, and old facts nobody
+// re-confirms fade gently. Trust is a bounded boost for recent
+// verification, never a gate: with most of the store never verified, a
+// gate would zero it. Design: Plan A recommendation.md §2.1
+// (mu/.delegations/overnight-2026-06-12/RESULTS-fable5/).
+
+/// Freshness floor: fresh ∈ [FLOOR, 1.0]. The floor makes semantic
+/// dominance PROVABLE: the worst-case non-semantic spread is
+/// (1 + RANK_TRUST_BOOST) / RANK_FRESH_FLOOR ≈ 1.47, so a candidate
+/// with a ≥1.48× cosine advantage can never be flipped by trust +
+/// freshness — recency nudges ties and modest gaps (the stale-vs-
+/// correction regime), never decisive matches. (An unfloored decay
+/// reached 0.43 at 2 years → 2.9× spread → identity facts washed out;
+/// the cosine-dominance test caught it.)
+const RANK_FRESH_FLOOR: f64 = 0.85;
+/// In-band decay rate (log decay, same family as `context`'s
+/// score_context_memories — deliberately NOT the Generative-Agents
+/// exponential that halves in days).
+const RANK_FRESH_LAMBDA: f64 = 1.0;
+/// Max verification boost (+25% for a just-verified memory).
+const RANK_TRUST_BOOST: f64 = 0.25;
+/// Verification boost decay scale in days (~6 months).
+const RANK_TRUST_DECAY_DAYS: f64 = 180.0;
+/// Tie-break window: scores within this relative distance count as
+/// ties. Calibrated on the live store: a genuinely-stale pair arrives
+/// here gap-compressed by freshness (the FreeBSD incident shape lands
+/// ≈1-2%), while recent complementary memories keep their full cosine
+/// gap — 15% admitted a 14.5%-gap non-tie pair on the first live smoke
+/// test; 10% does not.
+const RANK_TIE_REL_WINDOW: f32 = 0.10;
+/// Tie-break topical gate: candidates this similar to EACH OTHER are
+/// "the same topic" — only then may recency reorder them. Keeps recency
+/// from ever overriding a decisively better match on a different topic.
+const RANK_TIE_PAIR_COSINE: f32 = 0.85;
+
+/// Effective timestamp for freshness: verification counts as renewal.
+fn rank_t_eff(created_at: i64, updated_at: i64, verified_at: Option<i64>) -> i64 {
+    created_at.max(updated_at).max(verified_at.unwrap_or(0))
+}
+
+/// Freshness factor in [RANK_FRESH_FLOOR, 1.0]: 1.0 at age 0, log
+/// decay toward (never below) the floor.
+fn rank_fresh(now_ts: i64, t_eff: i64) -> f32 {
+    let days = ((now_ts - t_eff) as f64 / 86400.0).max(0.0);
+    let decay = 1.0 / (1.0 + RANK_FRESH_LAMBDA * days.ln_1p());
+    (RANK_FRESH_FLOOR + (1.0 - RANK_FRESH_FLOOR) * decay) as f32
+}
+
+/// Trust factor in [1.0, 1.25]: a boost for recent verification,
+/// baseline 1.0 for never-verified (a boost, never a gate).
+fn rank_trust(now_ts: i64, verified_at: Option<i64>) -> f32 {
+    match verified_at {
+        Some(v) => {
+            let days = ((now_ts - v) as f64 / 86400.0).max(0.0);
+            (1.0 + RANK_TRUST_BOOST * (-days / RANK_TRUST_DECAY_DAYS).exp()) as f32
+        }
+        None => 1.0,
+    }
+}
+
+/// One scored recall candidate. Lifted out of `recall()` so the ranking
+/// passes are unit-testable; `vector` is retained for the tie-break's
+/// pairwise-similarity gate.
+struct Scored {
+    id: String,
+    type_: String,
+    name: String,
+    description: String,
+    content: String,
+    tags: String,
+    updated_at: i64,
+    created_at: i64,
+    verified_at: Option<i64>,
+    lifecycle: String,
+    author: Option<String>,
+    /// Raw semantic similarity to the query.
+    cosine: f32,
+    /// Ranking score (== cosine under --rank legacy).
+    score: f32,
+    t_eff: i64,
+    vector: Vec<f32>,
+}
+
+/// ε-window recency tie-break for UNLINKED near-duplicates (the
+/// supersession edge handles linked ones): where two adjacent results
+/// are score-ties (within RANK_TIE_REL_WINDOW) AND same-topic (pairwise
+/// cosine > RANK_TIE_PAIR_COSINE), the newer t_eff wins. Bubble passes:
+/// k is capped small, and the loop stops at the first stable pass.
+fn rank_tie_break(scored: &mut [Scored]) {
+    let n = scored.len();
+    for _ in 0..n {
+        let mut swapped = false;
+        for i in 0..n.saturating_sub(1) {
+            let (a, b) = (&scored[i], &scored[i + 1]);
+            let tie = a.score > 0.0 && (a.score - b.score) / a.score <= RANK_TIE_REL_WINDOW;
+            if tie
+                && embed::cosine(&a.vector, &b.vector) > RANK_TIE_PAIR_COSINE
+                && b.t_eff > a.t_eff
+            {
+                scored.swap(i, i + 1);
+                swapped = true;
+            }
+        }
+        if !swapped {
+            break;
+        }
+    }
+}
+
 fn recall(conn: &Connection, args: RecallArgs) -> Result<()> {
     let embedder = embed::select_embedder();
     let model = embedder.model_id().to_string();
@@ -2264,21 +2382,8 @@ fn recall(conn: &Connection, args: RecallArgs) -> Result<()> {
         ))
     })?;
 
-    struct Scored {
-        id: String,
-        type_: String,
-        name: String,
-        description: String,
-        content: String,
-        tags: String,
-        updated_at: i64,
-        created_at: i64,
-        verified_at: Option<i64>,
-        lifecycle: String,
-        author: Option<String>,
-        score: f32,
-    }
-
+    let rank_v1 = args.rank == "v1";
+    let now_ts = now();
     let mut scored: Vec<Scored> = Vec::new();
     for row in rows {
         let (
@@ -2296,7 +2401,13 @@ fn recall(conn: &Connection, args: RecallArgs) -> Result<()> {
             author,
         ) = row?;
         let v = embed::blob_to_f32(&blob);
-        let score = embed::cosine(&query_vec, &v);
+        let cosine = embed::cosine(&query_vec, &v);
+        let t_eff = rank_t_eff(created_at, updated_at, verified_at);
+        let score = if rank_v1 {
+            cosine * rank_trust(now_ts, verified_at) * rank_fresh(now_ts, t_eff)
+        } else {
+            cosine
+        };
         scored.push(Scored {
             id,
             type_,
@@ -2309,7 +2420,10 @@ fn recall(conn: &Connection, args: RecallArgs) -> Result<()> {
             verified_at,
             lifecycle,
             author,
+            cosine,
             score,
+            t_eff,
+            vector: v,
         });
     }
 
@@ -2336,11 +2450,14 @@ fn recall(conn: &Connection, args: RecallArgs) -> Result<()> {
             .unwrap_or(std::cmp::Ordering::Equal)
     });
     scored.truncate(args.k);
+    if rank_v1 {
+        rank_tie_break(&mut scored);
+    }
 
     // Telemetry: log this recall call before returning results.
-    let log_rows: Vec<(&str, &str, f32)> = scored
+    let log_rows: Vec<(&str, &str, f32, f32)> = scored
         .iter()
-        .map(|s| (s.id.as_str(), s.name.as_str(), s.score))
+        .map(|s| (s.id.as_str(), s.name.as_str(), s.score, s.cosine))
         .collect();
     log_recall(conn, &args, &log_rows);
 
@@ -2370,6 +2487,12 @@ fn recall(conn: &Connection, args: RecallArgs) -> Result<()> {
                         s.author.as_deref().unwrap_or(""),
                     ),
                 });
+                if rank_v1 {
+                    // gf2.1: raw similarity alongside the rank score so
+                    // consumers can see WHY something ranked. Omitted in
+                    // legacy mode to keep that output bit-identical.
+                    obj["cosine"] = serde_json::json!(s.cosine);
+                }
                 if args.full {
                     obj["content"] = serde_json::Value::String(s.content.clone());
                 }
@@ -2389,9 +2512,15 @@ fn recall(conn: &Connection, args: RecallArgs) -> Result<()> {
 
     println!("## Semantic recall (model: {})\n", model);
     for s in &scored {
+        // v1 shows score|cosine so a reader can see how much of the rank
+        // came from similarity vs trust/freshness; legacy stays untouched.
+        let badge = if rank_v1 {
+            format!("[{:.3}|c{:.3}]", s.score, s.cosine)
+        } else {
+            format!("[{:.3}]", s.score)
+        };
         println!(
-            "[{score:.3}] [{id}] ({type_}) {name} — {desc}  [{ts}]",
-            score = s.score,
+            "{badge} [{id}] ({type_}) {name} — {desc}  [{ts}]",
             id = s.id,
             type_ = s.type_,
             name = s.name,
@@ -2432,15 +2561,20 @@ fn recall(conn: &Connection, args: RecallArgs) -> Result<()> {
     Ok(())
 }
 
-fn log_recall(conn: &Connection, args: &RecallArgs, scored: &[(&str, &str, f32)]) {
+fn log_recall(conn: &Connection, args: &RecallArgs, scored: &[(&str, &str, f32, f32)]) {
     let cwd = std::env::current_dir()
         .ok()
         .and_then(|p| p.to_str().map(String::from))
         .unwrap_or_default();
-    let top_score = scored.first().map(|(_, _, s)| *s as f64);
+    let top_score = scored.first().map(|(_, _, s, _)| *s as f64);
+    // `cosine` alongside the ranking score so rank-function changes stay
+    // tunable against telemetry (gf2.1; trust/fresh are reconstructable
+    // from the memory's timestamps + ts).
     let results_summary: Vec<serde_json::Value> = scored
         .iter()
-        .map(|(id, name, score)| serde_json::json!({"id": id, "name": name, "score": score}))
+        .map(|(id, name, score, cosine)| {
+            serde_json::json!({"id": id, "name": name, "score": score, "cosine": cosine})
+        })
         .collect();
     let results_json = serde_json::to_string(&results_summary).unwrap_or_else(|_| "[]".into());
 
@@ -2741,6 +2875,124 @@ fn reindex(conn: &Connection, args: ReindexArgs) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── gf2.1: recall ranking v1 ─────────────────────────────────────
+
+    const DAY: i64 = 86_400;
+
+    fn scored_stub(id: &str, score: f32, cosine: f32, t_eff: i64, vector: Vec<f32>) -> Scored {
+        Scored {
+            id: id.into(),
+            type_: "project".into(),
+            name: id.into(),
+            description: "d".into(),
+            content: String::new(),
+            tags: String::new(),
+            updated_at: t_eff,
+            created_at: t_eff,
+            verified_at: None,
+            lifecycle: "active".into(),
+            author: None,
+            cosine,
+            score,
+            t_eff,
+            vector,
+        }
+    }
+
+    #[test]
+    fn t_eff_takes_verification_as_renewal() {
+        assert_eq!(rank_t_eff(100, 200, None), 200);
+        assert_eq!(rank_t_eff(100, 200, Some(900)), 900);
+        // verification older than the last edit doesn't move t_eff back
+        assert_eq!(rank_t_eff(100, 500, Some(300)), 500);
+    }
+
+    #[test]
+    fn fresh_decays_monotonically_and_respects_the_floor() {
+        let now = 1_000_000 * DAY;
+        let f0 = rank_fresh(now, now);
+        let f30 = rank_fresh(now, now - 30 * DAY);
+        let f730 = rank_fresh(now, now - 730 * DAY);
+        assert_eq!(f0, 1.0);
+        assert!(f0 > f30 && f30 > f730, "freshness must decay");
+        assert!(
+            f730 >= RANK_FRESH_FLOOR as f32,
+            "floor violated: {f730} < {RANK_FRESH_FLOOR}"
+        );
+    }
+
+    /// The dominance bound is a consequence of the constants — pin it so
+    /// a future retune that breaks the property fails loudly here rather
+    /// than silently reintroducing recency-washes-out-identity-facts.
+    #[test]
+    fn non_semantic_spread_is_bounded_below_1_5() {
+        let spread = (1.0 + RANK_TRUST_BOOST) / RANK_FRESH_FLOOR;
+        assert!(
+            spread < 1.5,
+            "trust×fresh spread {spread} can flip a 0.9-vs-0.6 cosine gap"
+        );
+    }
+
+    #[test]
+    fn trust_boosts_verified_and_is_never_a_gate() {
+        let now = 1_000_000 * DAY;
+        assert_eq!(rank_trust(now, None), 1.0);
+        let fresh_verify = rank_trust(now, Some(now));
+        let old_verify = rank_trust(now, Some(now - 720 * DAY));
+        assert!(fresh_verify > 1.2 && fresh_verify <= 1.25);
+        assert!(old_verify > 1.0 && old_verify < fresh_verify);
+    }
+
+    /// The bead's cosine-dominance acceptance: a decisively better
+    /// match (0.9 vs 0.6) must survive the worst-case trust/fresh
+    /// spread — a never-verified, 2-year-stale winner still out-ranks a
+    /// just-verified, just-edited loser.
+    #[test]
+    fn cosine_dominance_survives_trust_and_freshness() {
+        let now = 1_000_000 * DAY;
+        let strong_stale = 0.9 * rank_trust(now, None) * rank_fresh(now, now - 730 * DAY);
+        let weak_fresh = 0.6 * rank_trust(now, Some(now)) * rank_fresh(now, now);
+        assert!(
+            strong_stale > weak_fresh,
+            "0.9-stale ({strong_stale}) must beat 0.6-fresh ({weak_fresh})"
+        );
+    }
+
+    #[test]
+    fn tie_break_prefers_newer_among_same_topic_ties() {
+        let now = 1_000_000 * DAY;
+        // Same topic (identical vectors), scores within the tie window:
+        // the stale belief edged out its newer correction — tie-break
+        // flips them.
+        let mut s = vec![
+            scored_stub("stale", 0.80, 0.80, now - 100 * DAY, vec![1.0, 0.0]),
+            scored_stub("correction", 0.745, 0.745, now, vec![1.0, 0.0]),
+        ];
+        rank_tie_break(&mut s);
+        assert_eq!(s[0].id, "correction");
+        assert_eq!(s[1].id, "stale");
+    }
+
+    #[test]
+    fn tie_break_never_touches_distinct_topics_or_decisive_gaps() {
+        let now = 1_000_000 * DAY;
+        // Tie, but different topics (orthogonal vectors): no reorder.
+        let mut topical = vec![
+            scored_stub("a", 0.80, 0.80, now - 100 * DAY, vec![1.0, 0.0]),
+            scored_stub("b", 0.72, 0.72, now, vec![0.0, 1.0]),
+        ];
+        rank_tie_break(&mut topical);
+        assert_eq!(topical[0].id, "a");
+
+        // Same topic, but a decisive gap (>15%): no reorder.
+        let mut decisive = vec![
+            scored_stub("a", 0.90, 0.90, now - 100 * DAY, vec![1.0, 0.0]),
+            scored_stub("b", 0.60, 0.60, now, vec![1.0, 0.0]),
+        ];
+        rank_tie_break(&mut decisive);
+        assert_eq!(decisive[0].id, "a");
+    }
 
     #[test]
     fn hyphenated_term_becomes_a_phrase() {
