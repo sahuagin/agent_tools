@@ -135,6 +135,16 @@ fn migrate(conn: &Connection) -> Result<()> {
         conn.execute_batch("COMMIT")?;
     }
 
+    if version < 9 {
+        conn.execute_batch("BEGIN")?;
+        conn.execute_batch(SCHEMA_V9)?;
+        conn.execute(
+            "INSERT INTO schema_version (version, applied) VALUES (9, ?)",
+            [chrono::Utc::now().timestamp()],
+        )?;
+        conn.execute_batch("COMMIT")?;
+    }
+
     Ok(())
 }
 
@@ -327,4 +337,42 @@ ALTER TABLE memories ADD COLUMN source_ref TEXT;
 ALTER TABLE memories ADD COLUMN supersede_reason TEXT;
 ALTER TABLE memories ADD COLUMN author TEXT NOT NULL DEFAULT '';
 CREATE INDEX idx_memories_author ON memories(author);
+";
+
+// v9 (at-supersession-activation-gf2.2): first-class typed supersession
+// edges + valid-time columns. The v6/v8 single-FK model (superseded_by +
+// supersede_reason) stays as the denormalized fast path to the PRIMARY
+// successor; this table is the full relation:
+//   - N:1 consolidation (several old memories retired by one synthesis)
+//     and 1:N splits (partial supersession by splitting), which one FK
+//     column cannot express;
+//   - kind: 'corrects' (the old was never true) vs 'updates' (the world
+//     changed — old stays true history) vs 'refines'/'consolidates' vs
+//     'retracts' (no successor: AGM contraction; new_id NULL);
+//   - confidence + actor: the write-time adjudicator (gf2.7) records
+//     its certainty; manual `correct` writes 1.0.
+// valid_from/valid_to are the minimal valid-time subset (transaction
+// time already lives in memory_events): NULL valid_to = still true;
+// closure rule on 'updates' sets old.valid_to. Lifecycle gains the
+// value 'retracted' (TEXT column, no schema change).
+// Design: Plan A recommendation.md §1
+// (mu/.delegations/overnight-2026-06-12/RESULTS-fable5/).
+const SCHEMA_V9: &str = "
+CREATE TABLE supersessions (
+    id         INTEGER PRIMARY KEY,
+    old_id     TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+    new_id     TEXT REFERENCES memories(id) ON DELETE CASCADE,
+    kind       TEXT NOT NULL CHECK (kind IN
+                 ('corrects','updates','refines','consolidates','retracts')),
+    reason     TEXT NOT NULL DEFAULT '',
+    confidence REAL,
+    actor      TEXT NOT NULL DEFAULT '',
+    created_at INTEGER NOT NULL
+);
+CREATE UNIQUE INDEX idx_sup_pair ON supersessions(old_id, new_id);
+CREATE INDEX idx_sup_old ON supersessions(old_id);
+CREATE INDEX idx_sup_new ON supersessions(new_id);
+
+ALTER TABLE memories ADD COLUMN valid_from INTEGER;
+ALTER TABLE memories ADD COLUMN valid_to   INTEGER;
 ";

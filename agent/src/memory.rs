@@ -58,6 +58,9 @@ pub enum MemoryAction {
     /// Mark OLD as superseded by NEW (testimony correction; read paths
     /// then show the successor and label the stale entry)
     Correct(CorrectArgs),
+    /// Retract a memory: no longer true, nothing replaces it (AGM
+    /// contraction — hidden everywhere; restorable)
+    Retract(RetractArgs),
     /// Stamp a memory as terrain-checked now (sets verified_at)
     Verify(VerifyArgs),
     /// Export all active memories as markdown
@@ -237,6 +240,22 @@ pub struct CorrectArgs {
     pub with_id: String,
     /// Why the old fact is superseded
     #[arg(long, default_value = "")]
+    pub reason: String,
+    /// Supersession kind: "corrects" (old was never true), "updates"
+    /// (the world changed — old stays true history, its valid_to is
+    /// closed), "refines", or "consolidates"
+    #[arg(long, default_value = "corrects",
+          value_parser = ["corrects", "updates", "refines", "consolidates"])]
+    pub kind: String,
+}
+
+#[derive(Args)]
+pub struct RetractArgs {
+    /// Memory id to retract (no longer true, nothing replaces it)
+    pub id: String,
+    /// Why this is retracted — required: a retraction without a reason
+    /// is indistinguishable from vandalism in the audit log
+    #[arg(long)]
     pub reason: String,
 }
 
@@ -516,6 +535,7 @@ pub fn run(conn: Connection, cmd: MemoryCmd) -> Result<()> {
         MemoryAction::RecallStats(args) => recall_stats(&conn, args),
         MemoryAction::Reindex(args) => reindex(&conn, args),
         MemoryAction::Correct(args) => correct(&conn, args),
+        MemoryAction::Retract(args) => retract(&conn, args),
         MemoryAction::Verify(args) => verify(&conn, args),
         MemoryAction::Export => export(&conn),
         MemoryAction::Migrate(args) => migrate(&conn, args),
@@ -1656,6 +1676,26 @@ fn correct(conn: &Connection, args: CorrectArgs) -> Result<()> {
          WHERE id=?4",
         params![args.with_id, args.reason, ts, args.old],
     )?;
+    // gf2.2: the typed edge is the full relation (the FK above stays as
+    // the fast path to the primary successor). Manual corrections carry
+    // confidence 1.0 — the write-time adjudicator (gf2.7) records less.
+    // OR IGNORE: re-asserting an existing pair is idempotent (the change
+    // history lives in memory_events, not in duplicate edges).
+    conn.execute(
+        "INSERT OR IGNORE INTO supersessions (old_id, new_id, kind, reason, confidence, actor, created_at)
+         VALUES (?1, ?2, ?3, ?4, 1.0, ?5, ?6)",
+        params![args.old, args.with_id, args.kind, args.reason, default_author(), ts],
+    )?;
+    // 'updates' = the world changed: the old fact WAS true — close its
+    // validity interval instead of leaving it ambiguous. 'corrects' = it
+    // was never true; the interval stays untouched (there is no era in
+    // which it held).
+    if args.kind == "updates" {
+        conn.execute(
+            "UPDATE memories SET valid_to = COALESCE(valid_to, ?1) WHERE id = ?2",
+            params![ts, args.old],
+        )?;
+    }
     // lifecycle != 'active' drops it from the topic index (context injection).
     rebuild_index_for(conn, &args.old)?;
     let after = memory_row_json(conn, &args.old)?;
@@ -1664,7 +1704,45 @@ fn correct(conn: &Connection, args: CorrectArgs) -> Result<()> {
          VALUES (?1, 'agent', 'supersede', ?2, ?3, ?4, ?5)",
         params![ts, args.old, before, after, args.reason],
     )?;
-    println!("{} superseded by {}", args.old, args.with_id);
+    log::info!(
+        "{} superseded by {} ({})",
+        args.old,
+        args.with_id,
+        args.kind
+    );
+    Ok(())
+}
+
+/// gf2.2: AGM contraction — "that's no longer true" with no successor.
+/// The FK model can't express it (superseded_by demands a new row); the
+/// edge table can (new_id NULL, kind 'retracts'). Hidden everywhere
+/// (is_active=0 like trash) but restorable via `restore`.
+fn retract(conn: &Connection, args: RetractArgs) -> Result<()> {
+    if args.reason.trim().is_empty() {
+        bail!("retract requires a non-empty --reason");
+    }
+    let before = memory_row_json(conn, &args.id)?
+        .ok_or_else(|| anyhow::anyhow!("no memory found with id={}", args.id))?;
+    let ts = now();
+    conn.execute(
+        "UPDATE memories
+         SET lifecycle='retracted', is_active=0, updated_at=?1
+         WHERE id=?2",
+        params![ts, args.id],
+    )?;
+    conn.execute(
+        "INSERT INTO supersessions (old_id, new_id, kind, reason, confidence, actor, created_at)
+         VALUES (?1, NULL, 'retracts', ?2, 1.0, ?3, ?4)",
+        params![args.id, args.reason, default_author(), ts],
+    )?;
+    rebuild_index_for(conn, &args.id)?;
+    let after = memory_row_json(conn, &args.id)?;
+    conn.execute(
+        "INSERT INTO memory_events (ts, actor, action, memory_id, before_json, after_json, reason)
+         VALUES (?1, 'agent', 'retract', ?2, ?3, ?4, ?5)",
+        params![ts, args.id, before, after, args.reason],
+    )?;
+    log::info!("{} retracted", args.id);
     Ok(())
 }
 
@@ -1683,7 +1761,7 @@ fn verify(conn: &Connection, args: VerifyArgs) -> Result<()> {
          VALUES (?1, 'agent', 'verify', ?2, ?3, ?4, ?5)",
         params![ts, args.id, before, after, args.note],
     )?;
-    println!("{} verified {}", args.id, fmt_ts(ts));
+    log::info!("{} verified {}", args.id, fmt_ts(ts));
     Ok(())
 }
 
@@ -3038,6 +3116,7 @@ mod tests {
                 old: "old1".into(),
                 with_id: "new1".into(),
                 reason: "operator correction".into(),
+                kind: "corrects".into(),
             },
         )
         .unwrap();
@@ -3062,6 +3141,148 @@ mod tests {
             )
             .unwrap();
         assert_eq!(n, 1);
+
+        // gf2.2: the typed edge — manual correction, full confidence,
+        // and 'corrects' leaves the validity interval untouched (it was
+        // never true; there is no era to close).
+        let (kind, conf): (String, f64) = conn
+            .query_row(
+                "SELECT kind, confidence FROM supersessions WHERE old_id='old1' AND new_id='new1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(kind, "corrects");
+        assert_eq!(conf, 1.0);
+        let valid_to: Option<i64> = conn
+            .query_row("SELECT valid_to FROM memories WHERE id='old1'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(valid_to, None);
+
+        // Re-asserting the same pair is idempotent, not an error.
+        correct(
+            &conn,
+            CorrectArgs {
+                old: "old1".into(),
+                with_id: "new1".into(),
+                reason: "again".into(),
+                kind: "corrects".into(),
+            },
+        )
+        .unwrap();
+        let edges: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM supersessions WHERE old_id='old1' AND new_id='new1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(edges, 1);
+    }
+
+    /// gf2.2: 'updates' = the world changed — the old fact WAS true, so
+    /// its validity interval gets closed instead of left ambiguous.
+    #[test]
+    fn correct_kind_updates_closes_validity_interval() {
+        let conn = crate::db::open_in_memory().unwrap();
+        seed(&conn, "was-true", "old-state", "user lives in NYC");
+        seed(&conn, "now-true", "new-state", "user lives in SF");
+        correct(
+            &conn,
+            CorrectArgs {
+                old: "was-true".into(),
+                with_id: "now-true".into(),
+                reason: "moved".into(),
+                kind: "updates".into(),
+            },
+        )
+        .unwrap();
+        let valid_to: Option<i64> = conn
+            .query_row(
+                "SELECT valid_to FROM memories WHERE id='was-true'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            valid_to.is_some(),
+            "'updates' must close the old validity interval"
+        );
+    }
+
+    /// gf2.2: retraction — AGM contraction: gone from every read path,
+    /// successor-less edge in the relation, restorable, re-retractable.
+    #[test]
+    fn retract_hides_edges_and_round_trips_through_restore() {
+        let conn = crate::db::open_in_memory().unwrap();
+        seed(&conn, "r1", "doomed-fact", "this stopped being true");
+
+        assert!(retract(
+            &conn,
+            RetractArgs {
+                id: "r1".into(),
+                reason: "  ".into()
+            }
+        )
+        .is_err());
+
+        retract(
+            &conn,
+            RetractArgs {
+                id: "r1".into(),
+                reason: "no longer true, no successor".into(),
+            },
+        )
+        .unwrap();
+        let (lifecycle, is_active): (String, i64) = conn
+            .query_row(
+                "SELECT lifecycle, is_active FROM memories WHERE id='r1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(lifecycle, "retracted");
+        assert_eq!(is_active, 0);
+        let (kind, new_id): (String, Option<String>) = conn
+            .query_row(
+                "SELECT kind, new_id FROM supersessions WHERE old_id='r1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(kind, "retracts");
+        assert_eq!(new_id, None);
+
+        // restore brings it back; a later re-retract is a new history
+        // row, not a constraint violation.
+        set_lifecycle(
+            &conn,
+            LifecycleArgs {
+                id: "r1".into(),
+                reason: "restoring for re-retract test".into(),
+                source_report: String::new(),
+            },
+            "active",
+        )
+        .unwrap();
+        retract(
+            &conn,
+            RetractArgs {
+                id: "r1".into(),
+                reason: "retracted again after restore".into(),
+            },
+        )
+        .unwrap();
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM supersessions WHERE old_id='r1' AND new_id IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 2);
     }
 
     #[test]
@@ -3073,6 +3294,7 @@ mod tests {
             CorrectArgs {
                 old: "a".into(),
                 with_id: "a".into(),
+                kind: "corrects".into(),
                 reason: String::new()
             }
         )
@@ -3082,6 +3304,7 @@ mod tests {
             CorrectArgs {
                 old: "a".into(),
                 with_id: "ghost".into(),
+                kind: "corrects".into(),
                 reason: String::new()
             }
         )
@@ -3151,6 +3374,7 @@ mod tests {
             CorrectArgs {
                 old: "o2".into(),
                 with_id: "n2".into(),
+                kind: "corrects".into(),
                 reason: String::new(),
             },
         )
@@ -3200,6 +3424,7 @@ mod tests {
             CorrectArgs {
                 old: "p1".into(),
                 with_id: "p2".into(),
+                kind: "corrects".into(),
                 reason: String::new(),
             },
         )
@@ -3329,6 +3554,7 @@ mod tests {
             CorrectArgs {
                 old: "f5".into(),
                 with_id: "f6".into(),
+                kind: "corrects".into(),
                 reason: String::new(),
             },
         )

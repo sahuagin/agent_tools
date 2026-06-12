@@ -31,6 +31,12 @@ enum Command {
 }
 
 fn main() -> Result<()> {
+    // Status + diagnostics via `log`/env_logger (stderr): confirmations
+    // at info (visible by default, RUST_LOG=warn silences), debug/trace
+    // compiled out of release builds (release_max_level_info). Command
+    // RESULTS (listings, --json) stay on stdout — the tool contract.
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+
     // Agent-oriented help: `agent [<group> [<sub>]] --help-ai [--json]`.
     // Handled before clap so it works even when the target command's required
     // args are absent (mirrors code-index's --help-ai).

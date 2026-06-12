@@ -13,6 +13,13 @@ path = "src/main.rs"
 anyhow = "1"
 chrono = "0.4"
 clap = { version = "4", features = ["derive"] }
+# log + env_logger (operator preference, 2026-06-12): diagnostics and
+# status messages go through `log` macros — RUST_LOG controls them at
+# runtime, and release builds compile debug/trace out via the
+# release_max_level_info feature. Command OUTPUT (results, --json) stays
+# on stdout: that's the tool contract mu parses, not logging.
+env_logger = "0.11"
+log = { version = "0.4", features = ["release_max_level_info"] }
 rusqlite = { version = "0.31", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
