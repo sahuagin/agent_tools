@@ -2336,6 +2336,36 @@ fn rank_tie_break(scored: &mut [Scored]) {
     }
 }
 
+/// gf2.10: pairwise-similarity gate for the possible-conflict flag.
+/// Distinct knob from RANK_TIE_PAIR_COSINE even though the v1 values
+/// coincide — the tie-break asks "same topic, may recency reorder?",
+/// this asks "same topic, might these DISAGREE?"; they tune
+/// independently (AT-9's replay harness is the tuning surface).
+const CONFLICT_PAIR_COSINE: f32 = 0.85;
+
+/// gf2.10: read-time possible-conflict flag — the safety net for
+/// write-time adjudication misses and the unlinked backlog. Recall
+/// only ever returns ACTIVE rows (superseded/retracted are filtered),
+/// so any two returned results this similar are by construction
+/// unlinked: surface that the agent may be looking at a contradiction
+/// pair. Deliberately weak ("possible"): a statement and its negation
+/// embed nearly identically (negation-blindness), but so do
+/// complementary near-duplicates — a false flag costs only attention.
+/// No LLM, no NLI in v1. Returns, per result, the ids of its
+/// high-similarity partners (empty = no flag).
+fn conflict_partners(scored: &[Scored]) -> Vec<Vec<String>> {
+    let mut partners = vec![Vec::new(); scored.len()];
+    for i in 0..scored.len() {
+        for j in (i + 1)..scored.len() {
+            if embed::cosine(&scored[i].vector, &scored[j].vector) > CONFLICT_PAIR_COSINE {
+                partners[i].push(scored[j].id.clone());
+                partners[j].push(scored[i].id.clone());
+            }
+        }
+    }
+    partners
+}
+
 fn recall(conn: &Connection, args: RecallArgs) -> Result<()> {
     let embedder = embed::select_embedder();
     let model = embedder.model_id().to_string();
@@ -2453,6 +2483,13 @@ fn recall(conn: &Connection, args: RecallArgs) -> Result<()> {
     if rank_v1 {
         rank_tie_break(&mut scored);
     }
+    // gf2.10: flag possible contradiction pairs among the returned set
+    // (v1 only — legacy output stays bit-identical).
+    let conflicts = if rank_v1 {
+        conflict_partners(&scored)
+    } else {
+        vec![Vec::new(); scored.len()]
+    };
 
     // Telemetry: log this recall call before returning results.
     let log_rows: Vec<(&str, &str, f32, f32)> = scored
@@ -2464,7 +2501,8 @@ fn recall(conn: &Connection, args: RecallArgs) -> Result<()> {
     if args.json {
         let results: Vec<serde_json::Value> = scored
             .iter()
-            .map(|s| {
+            .zip(&conflicts)
+            .map(|(s, conflict)| {
                 let mut obj = serde_json::json!({
                     "id": s.id,
                     "type": s.type_,
@@ -2493,6 +2531,11 @@ fn recall(conn: &Connection, args: RecallArgs) -> Result<()> {
                     // legacy mode to keep that output bit-identical.
                     obj["cosine"] = serde_json::json!(s.cosine);
                 }
+                if !conflict.is_empty() {
+                    // gf2.10: ids of co-returned results similar enough
+                    // to be the other side of a contradiction.
+                    obj["possible_conflict_with"] = serde_json::json!(conflict);
+                }
                 if args.full {
                     obj["content"] = serde_json::Value::String(s.content.clone());
                 }
@@ -2511,7 +2554,7 @@ fn recall(conn: &Connection, args: RecallArgs) -> Result<()> {
     }
 
     println!("## Semantic recall (model: {})\n", model);
-    for s in &scored {
+    for (s, conflict) in scored.iter().zip(&conflicts) {
         // v1 shows score|cosine so a reader can see how much of the rank
         // came from similarity vs trust/freshness; legacy stays untouched.
         let badge = if rank_v1 {
@@ -2539,6 +2582,9 @@ fn recall(conn: &Connection, args: RecallArgs) -> Result<()> {
                 s.author.as_deref().unwrap_or(""),
             )
         );
+        if !conflict.is_empty() {
+            println!("  possible-conflict-with: {}", conflict.join(", "));
+        }
         if args.full {
             println!("{}\n", indent(&s.content, "  "));
         }
@@ -2992,6 +3038,36 @@ mod tests {
         ];
         rank_tie_break(&mut decisive);
         assert_eq!(decisive[0].id, "a");
+    }
+
+    // ── gf2.10: read-time possible-conflict flag ─────────────────────
+
+    #[test]
+    fn conflict_partners_flags_same_topic_pairs_symmetrically() {
+        let now = 1_000_000 * DAY;
+        // a ≈ c (near-identical vectors), b orthogonal to both.
+        let scored = vec![
+            scored_stub("a", 0.9, 0.9, now, vec![1.0, 0.0, 0.05]),
+            scored_stub("b", 0.8, 0.8, now, vec![0.0, 1.0, 0.0]),
+            scored_stub("c", 0.7, 0.7, now, vec![1.0, 0.0, 0.0]),
+        ];
+        let partners = conflict_partners(&scored);
+        assert_eq!(partners[0], vec!["c".to_string()]);
+        assert!(
+            partners[1].is_empty(),
+            "orthogonal result must not be flagged"
+        );
+        assert_eq!(partners[2], vec!["a".to_string()]);
+    }
+
+    #[test]
+    fn conflict_partners_empty_for_distinct_results() {
+        let now = 1_000_000 * DAY;
+        let scored = vec![
+            scored_stub("a", 0.9, 0.9, now, vec![1.0, 0.0]),
+            scored_stub("b", 0.8, 0.8, now, vec![0.0, 1.0]),
+        ];
+        assert!(conflict_partners(&scored).iter().all(Vec::is_empty));
     }
 
     #[test]
