@@ -17,19 +17,13 @@
 //! warning. Memory infrastructure must never gate the write path (the
 //! same discipline as mu's action_recall).
 //!
-//! Configuration lives in `~/.config/agent/config.toml`:
-//!
-//! ```toml
-//! [adjudicate]
-//! base_url = "http://debian13rtx4000:11434/v1"   # OpenAI-compatible chat endpoint
-//! model    = "qwen3-coder-next-agent262k:latest"
-//! # auto_threshold  = 0.8   # >= this: create the edge
-//! # queue_threshold = 0.5   # >= this: conflict_suspected row
-//! ```
-//!
-//! No `[adjudicate]` section (or no model) = adjudication off. Env
-//! overrides mirror the embedder convention: `AGENT_ADJUDICATE_BASE_URL`
-//! / `AGENT_ADJUDICATE_MODEL`, and `AGENT_NO_ADJUDICATE=1` disables.
+//! Configuration lives in the `[adjudicate]` section of
+//! `~/.config/agent/config.toml` — see **`config.toml.example`** at the
+//! repo root for the complete documented reference (all sections, all
+//! keys, defaults). No `[adjudicate]` section (or no model) =
+//! adjudication off. Env overrides mirror the embedder convention:
+//! `AGENT_ADJUDICATE_BASE_URL` / `AGENT_ADJUDICATE_MODEL`, and
+//! `AGENT_NO_ADJUDICATE=1` disables.
 //!
 //! Design: Plan A recommendation.md §3.1
 //! (mu/.delegations/overnight-2026-06-12/RESULTS-fable5/); the
