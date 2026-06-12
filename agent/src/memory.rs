@@ -66,6 +66,8 @@ pub enum MemoryAction {
     /// List/dismiss suspected-conflict queue rows (write-time adjudicator
     /// and sweep park uncertain relations here; resolve with correct/retract)
     Conflicts(ConflictsArgs),
+    /// Backlog sweep: run supersession adjudication over existing memories
+    Sweep(SweepArgs),
     /// Identity-kernel editor: see and curate exactly what
     /// `context --tier identity` injects (at-kernel-editor-oio)
     Kernel(KernelCmd),
@@ -283,6 +285,22 @@ pub struct ConflictsArgs {
     /// Emit JSON instead of human-readable text
     #[arg(long)]
     pub json: bool,
+}
+
+#[derive(Args)]
+pub struct SweepArgs {
+    /// Only sweep prose-marked memories (CORRECTED/SUPERSEDES/OBSOLETE/...)
+    #[arg(long)]
+    pub prose_only: bool,
+    /// Print proposals without creating edges/queue rows or recording coverage
+    #[arg(long)]
+    pub dry_run: bool,
+    /// Sweep at most N seeds this run
+    #[arg(long)]
+    pub limit: Option<usize>,
+    /// Re-sweep seeds already covered in sweep_state
+    #[arg(long)]
+    pub force: bool,
 }
 
 #[derive(Args)]
@@ -627,6 +645,15 @@ pub fn run(conn: Connection, cmd: MemoryCmd) -> Result<()> {
         MemoryAction::Retract(args) => retract(&conn, args),
         MemoryAction::Resolve(args) => resolve(&conn, args),
         MemoryAction::Conflicts(args) => conflicts(&conn, args),
+        MemoryAction::Sweep(args) => crate::adjudicate::sweep(
+            &conn,
+            &crate::adjudicate::SweepOpts {
+                prose_only: args.prose_only,
+                dry_run: args.dry_run,
+                limit: args.limit,
+                force: args.force,
+            },
+        ),
         MemoryAction::Kernel(cmd) => kernel(&conn, cmd),
         MemoryAction::Verify(args) => verify(&conn, args),
         MemoryAction::Export => export(&conn),

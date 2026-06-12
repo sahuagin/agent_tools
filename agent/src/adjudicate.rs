@@ -57,7 +57,7 @@ pub struct AdjudicateConfig {
 }
 
 /// Resolve config: env override → config.toml `[adjudicate]` → off.
-fn config() -> Option<AdjudicateConfig> {
+pub(crate) fn config() -> Option<AdjudicateConfig> {
     if std::env::var("AGENT_NO_ADJUDICATE").is_ok_and(|v| v == "1") {
         return None;
     }
@@ -115,7 +115,11 @@ pub fn maybe_adjudicate(conn: &Connection, new_id: &str) {
     }
 }
 
-fn adjudicate(conn: &Connection, new_id: &str, cfg: &AdjudicateConfig) -> Result<String> {
+pub(crate) fn adjudicate(
+    conn: &Connection,
+    new_id: &str,
+    cfg: &AdjudicateConfig,
+) -> Result<String> {
     let new_mem = load_candidate(conn, new_id)?;
     let candidates = nominate(conn, new_id)?;
     if candidates.is_empty() {
@@ -124,7 +128,7 @@ fn adjudicate(conn: &Connection, new_id: &str, cfg: &AdjudicateConfig) -> Result
     let prompt = build_prompt(&new_mem, &candidates);
     let raw = call_llm(cfg, &prompt)?;
     let verdicts = parse_verdicts(&raw)?;
-    apply_verdicts(conn, new_id, &candidates, &verdicts, cfg)
+    apply_verdicts(conn, new_id, &candidates, &verdicts, cfg, false)
 }
 
 fn load_candidate(conn: &Connection, id: &str) -> Result<Candidate> {
@@ -243,7 +247,7 @@ fn excerpt(s: &str) -> &str {
     }
 }
 
-fn build_prompt(new_mem: &Candidate, candidates: &[Candidate]) -> String {
+pub(crate) fn build_prompt(new_mem: &Candidate, candidates: &[Candidate]) -> String {
     let mut p = String::from(
         "A new memory was just written to an agent memory store. Compare it against each \
          existing candidate memory and classify their relation:\n\
@@ -253,7 +257,13 @@ fn build_prompt(new_mem: &Candidate, candidates: &[Candidate]) -> String {
          - \"refines\": same topic, the new memory adds detail without contradicting\n\
          - \"unrelated\": none of the above\n\
          Judge content, not phrasing. Temporal succession (lived in X, now lives in Y) is \
-         \"updates\", not \"corrects\". If unsure, prefer \"unrelated\" with low confidence.\n\
+         \"updates\", not \"corrects\". \"updates\" requires the candidate to assert a CURRENT \
+         state of the world that the new memory explicitly replaces — a newer memory merely \
+         post-dating, reaffirming, or reporting later progress on the same topic is NOT \
+         \"updates\" (use \"refines\" or \"unrelated\"). Dated historical records (session \
+         logs, status-as-of-a-date reports, war stories) are not superseded by later status: \
+         they remain true records of their date. If unsure, prefer \"unrelated\" with low \
+         confidence.\n\
          Respond with ONLY a JSON array, one object per candidate:\n\
          [{\"candidate\": <1-based index>, \"relation\": \"...\", \"confidence\": 0.0-1.0, \"rationale\": \"<one line>\"}]\n\n",
     );
@@ -277,7 +287,7 @@ fn build_prompt(new_mem: &Candidate, candidates: &[Candidate]) -> String {
     p
 }
 
-fn call_llm(cfg: &AdjudicateConfig, prompt: &str) -> Result<String> {
+pub(crate) fn call_llm(cfg: &AdjudicateConfig, prompt: &str) -> Result<String> {
     let url = format!("{}/chat/completions", cfg.base_url.trim_end_matches('/'));
     let body = serde_json::json!({
         "model": cfg.model,
@@ -316,6 +326,7 @@ pub fn apply_verdicts(
     candidates: &[Candidate],
     verdicts: &[Verdict],
     cfg: &AdjudicateConfig,
+    updates_queue_only: bool,
 ) -> Result<String> {
     let ts = crate::memory::now();
     let mut actions: Vec<String> = Vec::new();
@@ -338,6 +349,17 @@ pub fn apply_verdicts(
                     );
                     queue_conflict(conn, &cand.id, new_id, rel, conf, &v.rationale, ts)?;
                     actions.push(format!("zombie-flag {} ({rel})", cand.id));
+                } else if rel == "updates" && updates_queue_only {
+                    // Sweep calibration (gf2.9 dry-run finding): on the
+                    // backlog, the model conflates "newer memory, same
+                    // topic" with supersession — 'updates' over-fires on
+                    // historical records. In sweep mode 'updates' always
+                    // queues for review; only 'corrects' (precise:
+                    // falsity detection) auto-edges.
+                    if conf >= cfg.queue_threshold {
+                        queue_conflict(conn, &cand.id, new_id, rel, conf, &v.rationale, ts)?;
+                        actions.push(format!("{} queued ({rel}, conf {conf:.2})", cand.id));
+                    }
                 } else if conf >= cfg.auto_threshold {
                     crate::memory::apply_supersession(
                         conn,
@@ -380,6 +402,168 @@ fn queue_conflict(
         params![old_id, new_id, relation, confidence, rationale, ts],
     )?;
     Ok(())
+}
+
+/// Prose markers that flag a memory as carrying a correction in TEXT —
+/// the unlinked-backlog seed set (terrain: 123 such memories at the
+/// time of writing, ~10% of the store).
+const PROSE_MARKERS: &[&str] = &[
+    "CORRECTED",
+    "SUPERSEDES",
+    "superseded",
+    "OBSOLETE",
+    "DEPRECATED",
+    "no longer true",
+];
+
+pub struct SweepOpts {
+    pub prose_only: bool,
+    pub dry_run: bool,
+    pub limit: Option<usize>,
+    pub force: bool,
+}
+
+/// gf2.9: backlog sweep — run the write-time adjudication pipeline over
+/// EXISTING memories, which write-time detection can never reach (it
+/// only sees conflicts involving the newest write; survey Q4.7).
+/// Prose-marked memories order first: their corrections are written in
+/// content text where no filter can see them, and they usually NAME
+/// their target — the cheapest wins. Coverage ledger in sweep_state
+/// makes re-runs resume (skip swept seeds unless --force); effects are
+/// idempotent regardless (OR IGNORE edges and queue rows).
+pub fn sweep(conn: &Connection, opts: &SweepOpts) -> Result<()> {
+    let Some(cfg) = config() else {
+        bail!("sweep requires [adjudicate] config (see config.toml.example)");
+    };
+
+    let marker_clause = PROSE_MARKERS
+        .iter()
+        .map(|m| format!("instr(content, '{m}') > 0 OR instr(name, '{m}') > 0"))
+        .collect::<Vec<_>>()
+        .join(" OR ");
+    let prose_filter = if opts.prose_only {
+        format!(" AND ({marker_clause})")
+    } else {
+        String::new()
+    };
+    let skip_swept = if opts.force {
+        ""
+    } else {
+        " AND id NOT IN (SELECT seed_id FROM sweep_state)"
+    };
+    // Prose-marked first, then the rest, newest first within each group.
+    let sql = format!(
+        "SELECT id FROM memories
+         WHERE is_active = 1 AND lifecycle = 'active'{prose_filter}{skip_swept}
+         ORDER BY CASE WHEN ({marker_clause}) THEN 0 ELSE 1 END, updated_at DESC"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let mut seeds: Vec<String> = stmt
+        .query_map([], |r| r.get(0))?
+        .collect::<std::result::Result<_, _>>()?;
+    if let Some(n) = opts.limit {
+        seeds.truncate(n);
+    }
+    if seeds.is_empty() {
+        println!("sweep: nothing to do (all candidate seeds already swept; --force to redo)");
+        return Ok(());
+    }
+    println!(
+        "sweep: {} seed(s){}{}",
+        seeds.len(),
+        if opts.prose_only {
+            " (prose-marked only)"
+        } else {
+            ""
+        },
+        if opts.dry_run { " [DRY RUN]" } else { "" }
+    );
+
+    let mut edges = 0usize;
+    let mut queued = 0usize;
+    let mut errors = 0usize;
+    for (i, seed) in seeds.iter().enumerate() {
+        let outcome = if opts.dry_run {
+            sweep_dry_run_one(conn, seed, &cfg)
+        } else {
+            sweep_one(conn, seed, &cfg)
+        };
+        match outcome {
+            Ok(summary) => {
+                edges += summary.matches("-edge").count();
+                queued += summary.matches("queued").count();
+                if !summary.is_empty() {
+                    println!("[{}/{}] {seed}: {summary}", i + 1, seeds.len());
+                }
+                if !opts.dry_run {
+                    conn.execute(
+                        "INSERT OR REPLACE INTO sweep_state (seed_id, swept_at, outcome)
+                         VALUES (?1, ?2, ?3)",
+                        params![seed, crate::memory::now(), summary],
+                    )?;
+                }
+            }
+            Err(e) => {
+                errors += 1;
+                log::warn!("sweep: seed {seed} failed (continuing): {e:#}");
+                // Deliberately NOT recorded as swept — a transient LLM
+                // failure should retry on the next run.
+            }
+        }
+    }
+    println!(
+        "sweep done: {} seeds, {} edge(s), {} queued, {} error(s)",
+        seeds.len(),
+        edges,
+        queued,
+        errors
+    );
+    Ok(())
+}
+
+/// Live sweep for one seed: the adjudication pipeline with the
+/// updates-queue-only calibration (see apply_verdicts).
+fn sweep_one(conn: &Connection, seed: &str, cfg: &AdjudicateConfig) -> Result<String> {
+    let seed_mem = load_candidate(conn, seed)?;
+    let candidates = nominate(conn, seed)?;
+    if candidates.is_empty() {
+        return Ok(String::new());
+    }
+    let raw = call_llm(cfg, &build_prompt(&seed_mem, &candidates))?;
+    let verdicts = parse_verdicts(&raw)?;
+    apply_verdicts(conn, seed, &candidates, &verdicts, cfg, true)
+}
+
+/// Dry-run variant: same nominate → classify, but verdicts are PRINTED
+/// as proposals instead of applied, and nothing is recorded as swept.
+fn sweep_dry_run_one(conn: &Connection, seed: &str, cfg: &AdjudicateConfig) -> Result<String> {
+    let seed_mem = load_candidate(conn, seed)?;
+    let candidates = nominate(conn, seed)?;
+    if candidates.is_empty() {
+        return Ok(String::new());
+    }
+    let raw = call_llm(cfg, &build_prompt(&seed_mem, &candidates))?;
+    let verdicts = parse_verdicts(&raw)?;
+    let mut out: Vec<String> = Vec::new();
+    for v in &verdicts {
+        if v.relation == "unrelated" {
+            continue;
+        }
+        if let Some(c) = v.candidate.checked_sub(1).and_then(|i| candidates.get(i)) {
+            let action = match v.relation.as_str() {
+                "corrects" if v.confidence >= cfg.auto_threshold => "would-edge",
+                "corrects" | "updates" | "duplicate" if v.confidence >= cfg.queue_threshold => {
+                    "would-queue"
+                }
+                _ => continue,
+            };
+            out.push(format!(
+                "{action} {} ({}, conf {:.2}: {})",
+                c.id, v.relation, v.confidence, v.rationale
+            ));
+        }
+    }
+    Ok(out.join("; "))
 }
 
 #[cfg(test)]
@@ -441,8 +625,15 @@ mod tests {
             confidence: 0.95,
             rationale: "direct negation".into(),
         }];
-        let summary =
-            apply_verdicts(&conn, "fresh", &[cand(&conn, "stale")], &verdicts, &cfg()).unwrap();
+        let summary = apply_verdicts(
+            &conn,
+            "fresh",
+            &[cand(&conn, "stale")],
+            &verdicts,
+            &cfg(),
+            false,
+        )
+        .unwrap();
         assert!(summary.contains("corrects-edge"), "{summary}");
         let (lc, succ): (String, String) = conn
             .query_row(
@@ -476,7 +667,15 @@ mod tests {
             confidence: 0.6,
             rationale: "unsure".into(),
         }];
-        apply_verdicts(&conn, "new", &[cand(&conn, "old")], &verdicts, &cfg()).unwrap();
+        apply_verdicts(
+            &conn,
+            "new",
+            &[cand(&conn, "old")],
+            &verdicts,
+            &cfg(),
+            false,
+        )
+        .unwrap();
         let lc: String = conn
             .query_row("SELECT lifecycle FROM memories WHERE id='old'", [], |r| {
                 r.get(0)
@@ -511,8 +710,15 @@ mod tests {
             confidence: 0.99,
             rationale: "matches retired fact".into(),
         }];
-        let summary =
-            apply_verdicts(&conn, "zombie", &[cand(&conn, "tomb")], &verdicts, &cfg()).unwrap();
+        let summary = apply_verdicts(
+            &conn,
+            "zombie",
+            &[cand(&conn, "tomb")],
+            &verdicts,
+            &cfg(),
+            false,
+        )
+        .unwrap();
         assert!(summary.contains("zombie-flag"), "{summary}");
         // No new edge; tombstone untouched; queue row exists.
         let edges: i64 = conn
@@ -531,6 +737,45 @@ mod tests {
             )
             .unwrap();
         assert_eq!(queued, 1);
+    }
+
+    /// gf2.9 dry-run finding, pinned: in sweep mode (updates_queue_only),
+    /// even a 0.95-confidence 'updates' must queue, never auto-edge —
+    /// the model conflates topic-adjacency with supersession on the
+    /// backlog. 'corrects' still auto-edges.
+    #[test]
+    fn sweep_mode_queues_updates_and_edges_corrects() {
+        let conn = crate::db::open_in_memory().unwrap();
+        seed(&conn, "hist", "dated-status", "status as of april");
+        seed(&conn, "wrong", "false-claim", "the test passed");
+        seed(&conn, "seedm", "newer", "current state + correction");
+        let verdicts = vec![
+            Verdict {
+                candidate: 1,
+                relation: "updates".into(),
+                confidence: 0.95,
+                rationale: "newer status".into(),
+            },
+            Verdict {
+                candidate: 2,
+                relation: "corrects".into(),
+                confidence: 0.95,
+                rationale: "the test never passed".into(),
+            },
+        ];
+        let cands = [cand(&conn, "hist"), cand(&conn, "wrong")];
+        let summary = apply_verdicts(&conn, "seedm", &cands, &verdicts, &cfg(), true).unwrap();
+        assert!(summary.contains("hist queued (updates"), "{summary}");
+        assert!(summary.contains("wrong corrects-edge"), "{summary}");
+        let hist_lc: String = conn
+            .query_row("SELECT lifecycle FROM memories WHERE id='hist'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            hist_lc, "active",
+            "updates in sweep mode must not flip lifecycle"
+        );
     }
 
     #[test]

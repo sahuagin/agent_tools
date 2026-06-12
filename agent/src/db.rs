@@ -155,6 +155,16 @@ fn migrate(conn: &Connection) -> Result<()> {
         conn.execute_batch("COMMIT")?;
     }
 
+    if version < 11 {
+        conn.execute_batch("BEGIN")?;
+        conn.execute_batch(SCHEMA_V11)?;
+        conn.execute(
+            "INSERT INTO schema_version (version, applied) VALUES (11, ?)",
+            [chrono::Utc::now().timestamp()],
+        )?;
+        conn.execute_batch("COMMIT")?;
+    }
+
     Ok(())
 }
 
@@ -407,4 +417,16 @@ CREATE TABLE conflict_suspected (
     UNIQUE (old_id, new_id)
 );
 CREATE INDEX idx_cs_status ON conflict_suspected(status, created_at DESC);
+";
+
+// v11 (at-supersession-activation-gf2.9): sweep coverage ledger — one
+// row per seed memory the backlog sweep has adjudicated. Doubles as the
+// resume cursor (sweep skips seeds present here unless --force) and the
+// coverage audit ("which memories has the sweep never judged?").
+const SCHEMA_V11: &str = "
+CREATE TABLE sweep_state (
+    seed_id  TEXT PRIMARY KEY REFERENCES memories(id) ON DELETE CASCADE,
+    swept_at INTEGER NOT NULL,
+    outcome  TEXT NOT NULL DEFAULT ''
+);
 ";
