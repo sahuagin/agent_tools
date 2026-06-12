@@ -61,6 +61,9 @@ pub enum MemoryAction {
     /// Retract a memory: no longer true, nothing replaces it (AGM
     /// contraction — hidden everywhere; restorable)
     Retract(RetractArgs),
+    /// Identity-kernel editor: see and curate exactly what
+    /// `context --tier identity` injects (at-kernel-editor-oio)
+    Kernel(KernelCmd),
     /// Stamp a memory as terrain-checked now (sets verified_at)
     Verify(VerifyArgs),
     /// Export all active memories as markdown
@@ -256,6 +259,59 @@ pub struct RetractArgs {
     /// Why this is retracted — required: a retraction without a reason
     /// is indistinguishable from vandalism in the audit log
     #[arg(long)]
+    pub reason: String,
+}
+
+/// at-kernel-editor-oio ("Morty's Mind Blowers"): operator-facing
+/// editor for the injected identity kernel. Kernel membership is the
+/// `identity` tag (see [`IDENTITY_TAG`]) — these commands are a thin
+/// projection over the `context --tier identity` selection plus
+/// tag mutations, every change logged to `memory_events`.
+#[derive(Args)]
+pub struct KernelCmd {
+    #[command(subcommand)]
+    pub action: KernelAction,
+}
+
+#[derive(Subcommand)]
+pub enum KernelAction {
+    /// Render the kernel exactly as `context --tier identity` selects
+    /// it: id, type, trust, token estimate, injection count per row
+    Show(KernelShowArgs),
+    /// Remove a memory from the kernel (drops the `identity` tag; the
+    /// memory stays recall-able). Requires --reason: kernel membership
+    /// changes are ledger acts
+    Demote(KernelDemoteArgs),
+    /// Add a memory to the kernel (adds the `identity` tag).
+    /// `pin` is an alias
+    #[command(visible_alias = "pin")]
+    Promote(KernelPromoteArgs),
+    /// Supersede a kernel row — alias of `memory correct OLD --with NEW`
+    Supersede(CorrectArgs),
+}
+
+#[derive(Args)]
+pub struct KernelShowArgs {
+    /// Active profile scope (same semantics as `context --scope`)
+    #[arg(long)]
+    pub scope: Option<String>,
+}
+
+#[derive(Args)]
+pub struct KernelDemoteArgs {
+    /// Memory id to demote out of the kernel
+    pub id: String,
+    /// Why this row leaves the kernel (required — initial the strike)
+    #[arg(long)]
+    pub reason: String,
+}
+
+#[derive(Args)]
+pub struct KernelPromoteArgs {
+    /// Memory id to promote into the kernel
+    pub id: String,
+    /// Why this row joins the kernel
+    #[arg(long, default_value = "")]
     pub reason: String,
 }
 
@@ -536,6 +592,7 @@ pub fn run(conn: Connection, cmd: MemoryCmd) -> Result<()> {
         MemoryAction::Reindex(args) => reindex(&conn, args),
         MemoryAction::Correct(args) => correct(&conn, args),
         MemoryAction::Retract(args) => retract(&conn, args),
+        MemoryAction::Kernel(cmd) => kernel(&conn, cmd),
         MemoryAction::Verify(args) => verify(&conn, args),
         MemoryAction::Export => export(&conn),
         MemoryAction::Migrate(args) => migrate(&conn, args),
@@ -1996,9 +2053,23 @@ fn context_identity(conn: &Connection, args: &ContextArgs, scope: &ScopeFilter) 
         return Ok(());
     }
 
-    // Same tuning log as the full tier; zero scored entries marks an
-    // identity-tier call in context-stats.
-    let _ = log_context_call(conn, &args.cwd, &["tier:identity".to_string()], 0, &[]);
+    // Same tuning log as the full tier; n_scored=0 stays the marker for
+    // an identity-tier call in context-stats. at-kernel-editor-oio: the
+    // injected ids now ride in `returned` (score 0.0) so `kernel show`
+    // can answer "how often does this row actually get injected" —
+    // before this, identity-tier calls logged no ids at all.
+    let injected: Vec<(String, String, f64)> = user
+        .iter()
+        .chain(feedback.iter())
+        .map(|m| (m.id.clone(), m.name.clone(), 0.0))
+        .collect();
+    let _ = log_context_call(
+        conn,
+        &args.cwd,
+        &["tier:identity".to_string()],
+        0,
+        &injected,
+    );
 
     println!("## Identity Kernel\n");
 
@@ -2045,6 +2116,162 @@ fn context_identity(conn: &Connection, args: &ContextArgs, scope: &ScopeFilter) 
         );
     }
 
+    Ok(())
+}
+
+/// at-kernel-editor-oio: dispatch for the `memory kernel` group.
+fn kernel(conn: &Connection, cmd: KernelCmd) -> Result<()> {
+    match cmd.action {
+        KernelAction::Show(args) => kernel_show(conn, args),
+        KernelAction::Demote(args) => kernel_set_membership(conn, &args.id, false, &args.reason),
+        KernelAction::Promote(args) => kernel_set_membership(conn, &args.id, true, &args.reason),
+        // Thin alias: a kernel row is corrected exactly like any other
+        // memory; the alias exists so the operator editing the kernel
+        // doesn't have to context-switch command groups.
+        KernelAction::Supersede(args) => correct(conn, args),
+    }
+}
+
+/// Per-memory identity-tier injection stats from `memory_context_log`:
+/// (times injected, last-injected unix ts). Only rows logged AFTER
+/// at-kernel-editor-oio carry ids for the identity tier, so counts
+/// start at the deploy date — the column header says "logged" to keep
+/// that honest.
+fn kernel_injection_stats(
+    conn: &Connection,
+) -> Result<std::collections::HashMap<String, (u64, i64)>> {
+    let mut stmt = conn.prepare(
+        "SELECT created_at, returned FROM memory_context_log
+         WHERE signals LIKE '%tier:identity%' AND returned != '' AND returned != '[]'",
+    )?;
+    let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+    let mut stats: std::collections::HashMap<String, (u64, i64)> = std::collections::HashMap::new();
+    for row in rows {
+        let (ts, returned) = row?;
+        let Ok(entries) = serde_json::from_str::<Vec<serde_json::Value>>(&returned) else {
+            continue;
+        };
+        for e in entries {
+            if let Some(id) = e.get("id").and_then(|v| v.as_str()) {
+                let s = stats.entry(id.to_string()).or_insert((0, ts));
+                s.0 += 1;
+                s.1 = s.1.max(ts);
+            }
+        }
+    }
+    Ok(stats)
+}
+
+/// `kernel show` — the kernel as `context --tier identity` selects it,
+/// row for row (same [`identity_kernel`] call), with the per-row
+/// numbers the operator needs to curate: token estimate (chars/4 of
+/// what that row actually injects) and logged injection count.
+fn kernel_show(conn: &Connection, args: KernelShowArgs) -> Result<()> {
+    let scope = ScopeFilter::for_context(args.scope.as_deref());
+    let (user, feedback) = identity_kernel(conn, &scope)?;
+
+    if user.is_empty() && feedback.is_empty() {
+        println!(
+            "identity kernel is empty — nothing carries the '{IDENTITY_TAG}' tag in scope. \
+             Promote rows with `agent memory kernel promote <id>`."
+        );
+        return Ok(());
+    }
+
+    let stats = kernel_injection_stats(conn).unwrap_or_default();
+    let mut total_chars = 0usize;
+    let mut print_row = |m: &Memory, injected_chars: usize| {
+        total_chars += injected_chars;
+        let (count, last) = stats.get(&m.id).copied().unwrap_or((0, 0));
+        let last = if last > 0 {
+            format!(", last {}", fmt_ts(last))
+        } else {
+            String::new()
+        };
+        println!(
+            "  {}  ~{} tok  injected {}x (logged{})  [{}]",
+            m.id,
+            injected_chars / 4,
+            count,
+            last,
+            memory_trust_label(m),
+        );
+        println!("      {}", m.name);
+    };
+
+    println!(
+        "## Identity Kernel — {} user + {} rules\n",
+        user.len(),
+        feedback.len()
+    );
+    if !user.is_empty() {
+        println!("USER PROFILE (injects full content)");
+        for m in &user {
+            // Mirrors context_identity: user rows inject content.
+            print_row(m, m.content.len());
+        }
+    }
+    if !feedback.is_empty() {
+        println!("STANDING RULES (inject name + description)");
+        for m in &feedback {
+            // Mirrors context_identity: rules inject the one-liner.
+            print_row(m, m.name.len() + m.description.len());
+        }
+    }
+    println!(
+        "\n≈ {} tokens total (chars/4). Curate: `kernel demote <id> --reason ...`, \
+         `kernel promote <id>`, `kernel supersede <old> --with <new>`.",
+        total_chars / 4
+    );
+    Ok(())
+}
+
+/// Add/remove the [`IDENTITY_TAG`] on a memory — the kernel-membership
+/// mutation behind `kernel promote` / `kernel demote`. Logged to
+/// `memory_events` as action=promote/demote with before/after
+/// snapshots; a no-op (already in the requested state) logs nothing.
+fn kernel_set_membership(conn: &Connection, id: &str, member: bool, reason: &str) -> Result<()> {
+    let before = memory_row_json(conn, id)?
+        .ok_or_else(|| anyhow::anyhow!("no memory found with id={id}"))?;
+    let tags: String =
+        conn.query_row("SELECT tags FROM memories WHERE id=?1", params![id], |r| {
+            r.get(0)
+        })?;
+    let mut parts: Vec<String> = tags
+        .split(',')
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+        .collect();
+    let has = parts.iter().any(|t| t == IDENTITY_TAG);
+    if member == has {
+        println!(
+            "no change: {id} is already {} the kernel",
+            if member { "in" } else { "out of" }
+        );
+        return Ok(());
+    }
+    if member {
+        parts.push(IDENTITY_TAG.to_string());
+    } else {
+        parts.retain(|t| t != IDENTITY_TAG);
+    }
+    let new_tags = parts.join(",");
+    let ts = now();
+    conn.execute(
+        "UPDATE memories SET tags=?1, updated_at=?2 WHERE id=?3",
+        params![new_tags, ts, id],
+    )?;
+    let after = memory_row_json(conn, id)?;
+    let action = if member { "promote" } else { "demote" };
+    conn.execute(
+        "INSERT INTO memory_events (ts, actor, action, memory_id, before_json, after_json, reason)
+         VALUES (?1, 'agent', ?2, ?3, ?4, ?5, ?6)",
+        params![ts, action, id, before, after, reason],
+    )?;
+    println!(
+        "{action}d {id} {} the identity kernel (takes effect next session start)",
+        if member { "into" } else { "out of" }
+    );
     Ok(())
 }
 
@@ -3179,6 +3406,131 @@ mod tests {
             params![id, name, content],
         )
         .unwrap();
+    }
+
+    // ── at-kernel-editor-oio: identity-kernel editor ─────────────────
+    // (reuses the at-0q9 `seed_typed` helper further down this module)
+
+    fn kernel_ids(conn: &Connection) -> Vec<String> {
+        let (user, feedback) = identity_kernel(conn, &ScopeFilter::All).unwrap();
+        user.iter()
+            .chain(feedback.iter())
+            .map(|m| m.id.clone())
+            .collect()
+    }
+
+    #[test]
+    fn kernel_promote_demote_round_trip_drives_selection_and_audits() {
+        let conn = crate::db::open_in_memory().unwrap();
+        seed_typed(&conn, "fb1", "feedback", "no-trailing-summaries", "tone");
+        assert!(kernel_ids(&conn).is_empty(), "untagged row is not kernel");
+
+        // Promote: row enters the exact selection context --tier identity uses.
+        kernel_set_membership(&conn, "fb1", true, "operator blessed").unwrap();
+        assert_eq!(kernel_ids(&conn), vec!["fb1".to_string()]);
+
+        // Demote: row leaves the kernel but stays an active memory.
+        kernel_set_membership(&conn, "fb1", false, "not load-bearing").unwrap();
+        assert!(kernel_ids(&conn).is_empty());
+        let (lifecycle, tags): (String, String) = conn
+            .query_row(
+                "SELECT lifecycle, tags FROM memories WHERE id='fb1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(lifecycle, "active", "demote must not touch lifecycle");
+        assert_eq!(tags, "tone", "only the identity tag is removed");
+
+        // Both mutations are ledger acts: action + reason in memory_events.
+        let events: Vec<(String, String)> = conn
+            .prepare("SELECT action, reason FROM memory_events WHERE memory_id='fb1' ORDER BY id")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            events,
+            vec![
+                ("promote".to_string(), "operator blessed".to_string()),
+                ("demote".to_string(), "not load-bearing".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn kernel_membership_noop_logs_no_event() {
+        let conn = crate::db::open_in_memory().unwrap();
+        seed_typed(&conn, "fb1", "feedback", "rule", "");
+        // Demoting a row that isn't in the kernel: no change, no event.
+        kernel_set_membership(&conn, "fb1", false, "noop").unwrap();
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM memory_events WHERE memory_id='fb1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 0, "no-op must not write a ledger entry");
+    }
+
+    #[test]
+    fn kernel_injection_stats_count_identity_tier_rows() {
+        let conn = crate::db::open_in_memory().unwrap();
+        // Two identity-tier calls injecting fb1; one full-tier call that
+        // must be ignored even though it returned the same id.
+        for ts in [2000, 3000] {
+            conn.execute(
+                "INSERT INTO memory_context_log (created_at, cwd, signals, n_scored, returned)
+                 VALUES (?1, '', 'tier:identity', 0, '[{\"id\":\"fb1\",\"name\":\"rule\",\"score\":0.0}]')",
+                params![ts],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO memory_context_log (created_at, cwd, signals, n_scored, returned)
+             VALUES (4000, '', 'project rust', 1, '[{\"id\":\"fb1\",\"name\":\"rule\",\"score\":0.9}]')",
+            [],
+        )
+        .unwrap();
+        let stats = kernel_injection_stats(&conn).unwrap();
+        assert_eq!(stats.get("fb1"), Some(&(2, 3000)));
+    }
+
+    #[test]
+    fn context_identity_logs_injected_ids() {
+        let conn = crate::db::open_in_memory().unwrap();
+        seed_typed(&conn, "u1", "user", "who-thaddeus-is", "identity");
+        seed_typed(
+            &conn,
+            "fb1",
+            "feedback",
+            "no-trailing-summaries",
+            "identity,tone",
+        );
+        let args = ContextArgs {
+            cwd: String::new(),
+            signals: String::new(),
+            limit: 5,
+            verbose: false,
+            scope: None,
+            tier: "identity".to_string(),
+        };
+        context_identity(&conn, &args, &ScopeFilter::All).unwrap();
+        let returned: String = conn
+            .query_row(
+                "SELECT returned FROM memory_context_log WHERE signals LIKE '%tier:identity%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(returned.contains("\"u1\""), "user row id must be logged");
+        assert!(returned.contains("\"fb1\""), "rule row id must be logged");
+        // And the stats reader closes the loop.
+        let stats = kernel_injection_stats(&conn).unwrap();
+        assert_eq!(stats.get("u1").map(|s| s.0), Some(1));
+        assert_eq!(stats.get("fb1").map(|s| s.0), Some(1));
     }
 
     #[test]
