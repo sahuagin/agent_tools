@@ -141,18 +141,38 @@ impl OpenRouterEmbedder {
         // 401s on every embedding call. Reading config.toml as
         // fallback lets the rotated key take effect immediately
         // without restarting every consumer.
-        let api_key = std::env::var("OPENROUTER_API_KEY")
+        // at-supersession-activation-gf2.4: every setting resolves
+        // env var (per-invocation OVERRIDE) → `[embed]` section of
+        // ~/.config/agent/config.toml (the source of truth) → code
+        // default. Endpoint/model/dims belong in config, not as
+        // standing shell exports — the key-rotation rationale above,
+        // generalized to the whole embedder configuration.
+        let model = std::env::var("AGENT_EMBED_MODEL")
             .ok()
             .filter(|s| !s.is_empty())
-            .or_else(read_openrouter_key_from_config_toml)?;
-        let model = std::env::var("AGENT_EMBED_MODEL")
-            .unwrap_or_else(|_| "baai/bge-large-en-v1.5".to_string());
+            .or_else(|| read_config_toml_value("embed", "model"))
+            .unwrap_or_else(|| "baai/bge-large-en-v1.5".to_string());
         let dims: usize = std::env::var("AGENT_EMBED_DIMS")
             .ok()
+            .filter(|s| !s.is_empty())
+            .or_else(|| read_config_toml_value("embed", "dims"))
             .and_then(|s| s.parse().ok())
             .unwrap_or(1024);
         let base_url = std::env::var("AGENT_EMBED_BASE_URL")
-            .unwrap_or_else(|_| "https://openrouter.ai/api/v1".to_string());
+            .ok()
+            .filter(|s| !s.is_empty())
+            .or_else(|| read_config_toml_value("embed", "base_url"))
+            .unwrap_or_else(|| "https://openrouter.ai/api/v1".to_string());
+        let api_key = std::env::var("OPENROUTER_API_KEY")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .or_else(read_openrouter_key_from_config_toml)
+            .or_else(|| {
+                // A non-OpenRouter endpoint (local ollama, etc.) does
+                // not authenticate; a missing key must not disable
+                // local embedding. OpenRouter still requires one.
+                (!base_url.contains("openrouter")).then(|| "unused".to_string())
+            })?;
         Some(Self {
             api_key,
             model,
@@ -163,34 +183,49 @@ impl OpenRouterEmbedder {
 }
 
 /// Read `[openrouter].api_key` from `~/.config/agent/config.toml` as a
-/// fallback when the env var is missing or stale. Hand-rolled mini-parser
-/// so we don't add a `toml` crate dep just for one fallback path.
+/// fallback when the env var is missing or stale.
 ///
 /// Returns `None` on any failure (file missing, key missing, permissions).
 fn read_openrouter_key_from_config_toml() -> Option<String> {
+    read_config_toml_value("openrouter", "api_key")
+}
+
+/// Read `[section].key` from `~/.config/agent/config.toml`. Hand-rolled
+/// mini-parser (flat `key = "value"` pairs under bracketed sections; no
+/// nesting, no arrays) so we don't add a `toml` crate dep for a fallback
+/// path. at-supersession-activation-gf2.4 generalized this from the
+/// api_key-only reader so `[embed]` settings resolve the same way.
+///
+/// Returns `None` on any failure (file missing, key missing, permissions).
+fn read_config_toml_value(section: &str, key: &str) -> Option<String> {
     let home = std::env::var("HOME").ok()?;
     let path = format!("{}/.config/agent/config.toml", home);
     let content = std::fs::read_to_string(&path).ok()?;
+    read_toml_value_from_str(&content, section, key)
+}
 
-    let mut in_openrouter = false;
+/// The parsing half of [`read_config_toml_value`], split out for tests.
+fn read_toml_value_from_str(content: &str, section: &str, key: &str) -> Option<String> {
+    let header = format!("[{section}]");
+    let mut in_section = false;
     for raw in content.lines() {
         let line = raw.trim();
         if line.starts_with('#') || line.is_empty() {
             continue;
         }
         if line.starts_with('[') && line.ends_with(']') {
-            in_openrouter = line == "[openrouter]";
+            in_section = line == header;
             continue;
         }
-        if !in_openrouter {
+        if !in_section {
             continue;
         }
-        // Match: api_key = "..." (or single-quoted; whitespace tolerant)
-        let (key, value) = match line.split_once('=') {
+        // Match: key = "..." (or single-quoted / bare; whitespace tolerant)
+        let (k, value) = match line.split_once('=') {
             Some(p) => p,
             None => continue,
         };
-        if key.trim() != "api_key" {
+        if k.trim() != key {
             continue;
         }
         // Strip an optional inline comment after the value (`val # comment`).
@@ -365,5 +400,58 @@ pub fn try_embed_one(conn: &Connection, id: &str, text: &str) {
     let embedder = select_embedder();
     if let Err(e) = embed_one(conn, embedder.as_ref(), id, text) {
         eprintln!("warning: embedding failed for {id}: {e}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SAMPLE: &str = r#"
+# comment line
+[openrouter]
+api_key = "sk-or-abc" # expires someday
+
+[embed]
+base_url = "http://debian13rtx4000:11434/v1"
+model = 'qwen3-embedding:8b'
+dims = 4096
+
+[other]
+model = "decoy"
+"#;
+
+    #[test]
+    fn toml_reader_resolves_section_scoped_keys() {
+        assert_eq!(
+            read_toml_value_from_str(SAMPLE, "embed", "base_url").as_deref(),
+            Some("http://debian13rtx4000:11434/v1")
+        );
+        assert_eq!(
+            read_toml_value_from_str(SAMPLE, "embed", "model").as_deref(),
+            Some("qwen3-embedding:8b"),
+            "single quotes stripped"
+        );
+        assert_eq!(
+            read_toml_value_from_str(SAMPLE, "embed", "dims").as_deref(),
+            Some("4096"),
+            "bare values pass through"
+        );
+        assert_eq!(
+            read_toml_value_from_str(SAMPLE, "openrouter", "api_key").as_deref(),
+            Some("sk-or-abc"),
+            "inline comment stripped"
+        );
+    }
+
+    #[test]
+    fn toml_reader_respects_section_boundaries() {
+        // `model` exists in [embed] and [other] — section gates the match.
+        assert_eq!(
+            read_toml_value_from_str(SAMPLE, "other", "model").as_deref(),
+            Some("decoy")
+        );
+        assert_eq!(read_toml_value_from_str(SAMPLE, "embed", "api_key"), None);
+        assert_eq!(read_toml_value_from_str(SAMPLE, "missing", "model"), None);
     }
 }
