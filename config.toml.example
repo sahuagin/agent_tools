@@ -1,0 +1,81 @@
+# agent_tools configuration — complete reference
+#
+# Install location: ~/.config/agent/config.toml   (chmod 600 — it holds keys)
+#
+# This file documents EVERY parameter the `agent` binary reads, in the
+# /usr/local/etc spirit: features are discoverable here, not by hunting
+# through source. Active values below are sane defaults or examples;
+# commented values show the built-in default.
+#
+# Precedence for every setting: env var (per-invocation override)
+# → this file → built-in default.
+
+# ── API keys ─────────────────────────────────────────────────────────────────
+
+[openrouter]
+# Used for OpenRouter-hosted embeddings (and as the 401-stale-env-key
+# fallback: if the env key gets HTTP 401, the value here is retried once).
+# Env override: OPENROUTER_API_KEY
+api_key = "sk-or-v1-REPLACE-ME"
+
+# ── Embeddings ───────────────────────────────────────────────────────────────
+# Backing store for `agent memory recall` / `reindex` / write-time
+# nomination. Any OpenAI-compatible /v1/embeddings endpoint works; a
+# non-OpenRouter base_url (e.g. local ollama) needs no API key.
+#
+# NOTE: memory_embeddings keys vectors by (memory_id, model). After
+# changing `model`, run `agent memory reindex` — recall finds nothing
+# under a model id it has no vectors for. Never mix vectors from
+# different servings of "the same" model (quantization drift); reindex
+# instead. Old rows remain as rollback.
+#
+# Env overrides: AGENT_EMBED_BASE_URL / AGENT_EMBED_MODEL / AGENT_EMBED_DIMS
+
+[embed]
+base_url = "http://localhost:11434/v1"
+model = "qwen3-embedding:8b"
+dims = 4096
+# Built-in defaults when this section is absent:
+# base_url = "https://openrouter.ai/api/v1"
+# model = "baai/bge-large-en-v1.5"
+# dims = 1024
+
+# ── Write-time supersession adjudication ─────────────────────────────────────
+# On `agent memory add`, nominate the most-similar stored memories
+# (embedding cosine ∪ FTS5; INCLUDING superseded rows, so re-learned
+# stale facts meet their tombstones) and ask this model for a typed
+# relation per candidate:
+#
+#   corrects  — the candidate was NEVER true; the new memory corrects it
+#   updates   — the candidate WAS true; the world changed
+#   duplicate — same assertion, no new information
+#   refines   — adds detail without contradicting
+#   unrelated — none of the above
+#
+# confidence >= auto_threshold        → supersession edge, automatically
+#               (typed, audited, actor='adjudicator', reversible)
+# queue_threshold <= conf < auto      → conflict_suspected queue row
+#               (list: `agent memory conflicts`; resolve: correct/retract)
+# candidate already superseded        → loud zombie warning + queue row
+#
+# FAIL-OPEN: endpoint down, model missing, malformed output — the add
+# always succeeds; adjudication degrades to a logged warning.
+#
+# Section absent (or no model) = adjudication OFF.
+# Per-call opt-out: `--no-adjudicate` or AGENT_NO_ADJUDICATE=1.
+# Env overrides: AGENT_ADJUDICATE_BASE_URL / AGENT_ADJUDICATE_MODEL
+#
+# Any OpenAI-compatible /v1/chat/completions endpoint works; a local
+# ollama coding/instruct model is plenty (verdicts are short JSON).
+
+[adjudicate]
+base_url = "http://localhost:11434/v1"
+model = "qwen3-coder-next-agent262k:latest"
+# auto_threshold = 0.8    # >= this confidence: create the edge
+# queue_threshold = 0.5   # >= this: park in the queue
+
+# ── Logging (env, not config) ────────────────────────────────────────────────
+# Status/diagnostics go through env_logger on stderr:
+#   RUST_LOG=warn   silence confirmations
+#   RUST_LOG=debug  verbose (compiled out of release builds above info)
+# Command RESULTS (listings, --json) are stdout and unaffected.

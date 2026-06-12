@@ -197,7 +197,7 @@ fn read_openrouter_key_from_config_toml() -> Option<String> {
 /// api_key-only reader so `[embed]` settings resolve the same way.
 ///
 /// Returns `None` on any failure (file missing, key missing, permissions).
-fn read_config_toml_value(section: &str, key: &str) -> Option<String> {
+pub(crate) fn read_config_toml_value(section: &str, key: &str) -> Option<String> {
     let home = std::env::var("HOME").ok()?;
     let path = format!("{}/.config/agent/config.toml", home);
     let content = std::fs::read_to_string(&path).ok()?;
