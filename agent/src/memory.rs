@@ -2971,6 +2971,9 @@ struct Scored {
     score: f32,
     t_eff: i64,
     vector: Vec<f32>,
+    /// gf2.6: set when this (active) result's match strength was
+    /// credited from a superseded chain member: "member-id (date)".
+    via: Option<String>,
 }
 
 /// ε-window recency tie-break for UNLINKED near-duplicates (the
@@ -2996,6 +2999,110 @@ fn rank_tie_break(scored: &mut [Scored]) {
         if !swapped {
             break;
         }
+    }
+}
+
+/// gf2.6: head-resolution match crediting — the structural fix for
+/// "the stale text is the stronger semantic match". A superseded
+/// candidate's match strength is CREDITED to its chain head instead of
+/// competing with it: no down-weight can do this (any penalty big
+/// enough to flip the worst case misfires elsewhere). Zep preserves and
+/// annotates instead — and dumps the temporal reasoning on the consuming
+/// LLM per query; here the ranker settles it. Returns active heads only;
+/// `via` records the member a credit came through (also a staleness
+/// signal: heads repeatedly reached through members should be rewritten/
+/// re-embedded). Cycle/depth errors in a chain drop that member with a
+/// warning — recall must not fail on corrupted supersession data.
+fn credit_heads(conn: &Connection, scored: Vec<Scored>, model: &str) -> Result<Vec<Scored>> {
+    let mut heads: Vec<Scored> = Vec::new();
+    let mut by_id: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut members: Vec<Scored> = Vec::new();
+    for s in scored {
+        if s.lifecycle == "superseded" {
+            members.push(s);
+        } else {
+            by_id.insert(s.id.clone(), heads.len());
+            heads.push(s);
+        }
+    }
+    for m in members {
+        let head_id = match resolve_current(conn, &m.id) {
+            Ok(hops) => match hops.last() {
+                Some(h) => h.clone(),
+                None => continue, // superseded but no FK — orphaned; drop
+            },
+            Err(e) => {
+                log::warn!("recall: skipping {} (chain unresolvable: {e:#})", m.id);
+                continue;
+            }
+        };
+        let annotation = format!("{} ({})", m.id, fmt_ts(m.updated_at));
+        if let Some(&i) = by_id.get(&head_id) {
+            if m.cosine > heads[i].cosine {
+                heads[i].cosine = m.cosine;
+                heads[i].via = Some(annotation);
+            }
+        } else {
+            // Head wasn't nominated by the query at all — load it. Only
+            // ACTIVE heads enter results (a chain ending on a retracted
+            // row surfaces nothing).
+            match load_scored_head(conn, &head_id, model)? {
+                Some(mut h) if h.lifecycle == "active" => {
+                    if m.cosine > h.cosine {
+                        h.cosine = m.cosine;
+                        h.via = Some(annotation);
+                    }
+                    by_id.insert(head_id, heads.len());
+                    heads.push(h);
+                }
+                _ => log::debug!("recall: head {head_id} of {} not active; dropped", m.id),
+            }
+        }
+    }
+    Ok(heads)
+}
+
+/// Load one memory as a Scored row (cosine 0 until credited; vector from
+/// the store when present so the tie-break can still compare it).
+fn load_scored_head(conn: &Connection, id: &str, model: &str) -> Result<Option<Scored>> {
+    let row = conn.query_row(
+        "SELECT m.id, m.type, m.name, m.description, m.content, m.tags, m.updated_at,
+                m.created_at, m.verified_at, m.lifecycle, m.author, e.vector
+         FROM memories m
+         LEFT JOIN memory_embeddings e ON e.memory_id = m.id AND e.model = ?2
+         WHERE m.id = ?1 AND m.is_active = 1",
+        params![id, model],
+        |r| {
+            Ok(Scored {
+                id: r.get(0)?,
+                type_: r.get(1)?,
+                name: r.get(2)?,
+                description: r.get(3)?,
+                content: r.get(4)?,
+                tags: r.get(5)?,
+                updated_at: r.get(6)?,
+                created_at: r.get(7)?,
+                verified_at: r.get(8)?,
+                lifecycle: r.get(9)?,
+                author: r.get(10)?,
+                cosine: 0.0,
+                score: 0.0,
+                t_eff: 0,
+                vector: r
+                    .get::<_, Option<Vec<u8>>>(11)?
+                    .map(|b| embed::blob_to_f32(&b))
+                    .unwrap_or_default(),
+                via: None,
+            })
+        },
+    );
+    match row {
+        Ok(mut h) => {
+            h.t_eff = rank_t_eff(h.created_at, h.updated_at, h.verified_at);
+            Ok(Some(h))
+        }
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e.into()),
     }
 }
 
@@ -3042,13 +3149,22 @@ fn recall(conn: &Connection, args: RecallArgs) -> Result<()> {
     let scope = ScopeFilter::for_explicit(args.scope.as_deref());
     let (scope_sql, scope_vals) = scope.sql_and("m.scope");
     // Pull content + tags too so --full / JSON can include them without a second query
+    // gf2.6: v1 ranking pulls superseded rows too — their match
+    // strength is credited to their chain heads (the structural fix for
+    // "stale text out-matches its correction"). Legacy keeps the
+    // exclusion for bit-identical behavior.
+    let rank_v1 = args.rank == "v1";
+    let lifecycle_sql = if rank_v1 {
+        ""
+    } else {
+        " AND m.lifecycle != 'superseded'"
+    };
     let sql = format!(
         "SELECT m.id, m.type, m.name, m.description, m.content, m.tags, m.updated_at, e.vector,
                 m.created_at, m.verified_at, m.lifecycle, m.author
                FROM memory_embeddings e
                JOIN memories m ON m.id = e.memory_id
-               WHERE m.is_active = 1 AND e.model = ?
-                 AND m.lifecycle != 'superseded'
+               WHERE m.is_active = 1 AND e.model = ?{lifecycle_sql}
                  AND (? IS NULL OR m.type = ?){scope_sql}"
     );
     let mut p: Vec<Value> = vec![
@@ -3075,7 +3191,6 @@ fn recall(conn: &Connection, args: RecallArgs) -> Result<()> {
         ))
     })?;
 
-    let rank_v1 = args.rank == "v1";
     let now_ts = now();
     let mut scored: Vec<Scored> = Vec::new();
     for row in rows {
@@ -3096,11 +3211,9 @@ fn recall(conn: &Connection, args: RecallArgs) -> Result<()> {
         let v = embed::blob_to_f32(&blob);
         let cosine = embed::cosine(&query_vec, &v);
         let t_eff = rank_t_eff(created_at, updated_at, verified_at);
-        let score = if rank_v1 {
-            cosine * rank_trust(now_ts, verified_at) * rank_fresh(now_ts, t_eff)
-        } else {
-            cosine
-        };
+        // v1 final scores are computed AFTER head-crediting (below);
+        // until then score carries the raw cosine.
+        let score = cosine;
         scored.push(Scored {
             id,
             type_,
@@ -3117,6 +3230,7 @@ fn recall(conn: &Connection, args: RecallArgs) -> Result<()> {
             score,
             t_eff,
             vector: v,
+            via: None,
         });
     }
 
@@ -3137,6 +3251,12 @@ fn recall(conn: &Connection, args: RecallArgs) -> Result<()> {
         return Ok(());
     }
 
+    if rank_v1 {
+        scored = credit_heads(conn, scored, &model)?;
+        for s in &mut scored {
+            s.score = s.cosine * rank_trust(now_ts, s.verified_at) * rank_fresh(now_ts, s.t_eff);
+        }
+    }
     scored.sort_by(|a, b| {
         b.score
             .partial_cmp(&a.score)
@@ -3194,6 +3314,11 @@ fn recall(conn: &Connection, args: RecallArgs) -> Result<()> {
                     // legacy mode to keep that output bit-identical.
                     obj["cosine"] = serde_json::json!(s.cosine);
                 }
+                if let Some(via) = &s.via {
+                    // gf2.6: this result's match strength came through a
+                    // superseded chain member.
+                    obj["matched_via_superseded"] = serde_json::json!(via);
+                }
                 if !conflict.is_empty() {
                     // gf2.10: ids of co-returned results similar enough
                     // to be the other side of a contradiction.
@@ -3245,6 +3370,9 @@ fn recall(conn: &Connection, args: RecallArgs) -> Result<()> {
                 s.author.as_deref().unwrap_or(""),
             )
         );
+        if let Some(via) = &s.via {
+            println!("  matched via superseded {via}");
+        }
         if !conflict.is_empty() {
             println!("  possible-conflict-with: {}", conflict.join(", "));
         }
@@ -3606,6 +3734,7 @@ mod tests {
             score,
             t_eff,
             vector,
+            via: None,
         }
     }
 
@@ -3701,6 +3830,98 @@ mod tests {
         ];
         rank_tie_break(&mut decisive);
         assert_eq!(decisive[0].id, "a");
+    }
+
+    // ── gf2.6: head-resolution match crediting ───────────────────────
+
+    fn link(conn: &Connection, old: &str, new: &str) {
+        apply_supersession(conn, old, new, "corrects", "", 1.0, "test").unwrap();
+    }
+
+    fn stub_superseded(conn: &Connection, id: &str, cosine: f32) -> Scored {
+        // lifecycle must reflect the DB state set by link()
+        let mut s = scored_stub(id, cosine, cosine, 1000, vec![1.0, 0.0]);
+        s.lifecycle = conn
+            .query_row(
+                "SELECT lifecycle FROM memories WHERE id=?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        s
+    }
+
+    #[test]
+    fn credit_heads_credits_member_match_to_in_set_head() {
+        let conn = crate::db::open_in_memory().unwrap();
+        seed(&conn, "stale", "old", "x");
+        seed(&conn, "head", "new", "y");
+        link(&conn, "stale", "head");
+        let scored = vec![
+            stub_superseded(&conn, "stale", 0.9),
+            stub_superseded(&conn, "head", 0.6),
+        ];
+        let out = credit_heads(&conn, scored, "test-model").unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].id, "head");
+        assert_eq!(out[0].cosine, 0.9, "member match must be credited");
+        assert!(out[0].via.as_deref().unwrap().starts_with("stale"));
+    }
+
+    #[test]
+    fn credit_heads_loads_unnominated_terminal_head_across_chain() {
+        let conn = crate::db::open_in_memory().unwrap();
+        for id in ["a", "b", "c"] {
+            seed(&conn, id, id, "x");
+        }
+        link(&conn, "a", "b");
+        link(&conn, "b", "c");
+        // only the deep-stale member was nominated by the query
+        let scored = vec![stub_superseded(&conn, "a", 0.88)];
+        let out = credit_heads(&conn, scored, "test-model").unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].id, "c", "must resolve to the TERMINAL head");
+        assert_eq!(out[0].cosine, 0.88);
+        assert!(out[0].via.is_some());
+    }
+
+    #[test]
+    fn credit_heads_drops_cyclic_and_inactive_chains_without_failing() {
+        let conn = crate::db::open_in_memory().unwrap();
+        // cycle
+        seed(&conn, "x1", "x1", "a");
+        seed(&conn, "y1", "y1", "b");
+        conn.execute(
+            "UPDATE memories SET lifecycle='superseded', superseded_by='y1' WHERE id='x1'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE memories SET lifecycle='superseded', superseded_by='x1' WHERE id='y1'",
+            [],
+        )
+        .unwrap();
+        // chain ending on a retracted head
+        seed(&conn, "m1", "m1", "c");
+        seed(&conn, "gone", "gone", "d");
+        link(&conn, "m1", "gone");
+        retract(
+            &conn,
+            RetractArgs {
+                id: "gone".into(),
+                reason: "test".into(),
+            },
+        )
+        .unwrap();
+        let scored = vec![
+            stub_superseded(&conn, "x1", 0.9),
+            stub_superseded(&conn, "m1", 0.8),
+        ];
+        let out = credit_heads(&conn, scored, "test-model").unwrap();
+        assert!(
+            out.is_empty(),
+            "cyclic + retracted-head chains must drop, not fail"
+        );
     }
 
     // ── gf2.10: read-time possible-conflict flag ─────────────────────
