@@ -102,6 +102,9 @@ pub struct AddArgs {
     /// Witness: who asserts this. Defaults $AGENT_AUTHOR, else $CLAUDE_PROFILE.
     #[arg(long)]
     pub author: Option<String>,
+    /// Skip write-time supersession adjudication (bulk imports, tests)
+    #[arg(long)]
+    pub no_adjudicate: bool,
 }
 
 #[derive(Args)]
@@ -481,7 +484,7 @@ fn short_id() -> String {
     Uuid::new_v4().to_string()[..8].to_string()
 }
 
-fn now() -> i64 {
+pub(crate) fn now() -> i64 {
     Utc::now().timestamp()
 }
 
@@ -856,6 +859,11 @@ fn add(conn: &Connection, args: AddArgs) -> Result<()> {
          VALUES (?1, 'agent', 'add', ?2, NULL, ?3)",
         params![ts, id, after],
     )?;
+    // gf2.7: the add has fully succeeded — adjudication runs after and
+    // can only ADD information (edges / queue rows), never fail the add.
+    if !args.no_adjudicate {
+        crate::adjudicate::maybe_adjudicate(conn, &id);
+    }
     println!("{id}");
     Ok(())
 }
@@ -1346,6 +1354,7 @@ fn apply_candidate(conn: &Connection, candidate: &ApplyCandidate) -> Result<()> 
                 scope: candidate.scope.clone(),
                 source_ref: candidate.source_report.clone(),
                 author: None,
+                no_adjudicate: true,
             },
         ),
         "update" => update(
@@ -1719,47 +1728,14 @@ fn default_author() -> String {
 /// at-usl: mark OLD superseded by NEW. The read paths take it from here —
 /// search shows the successor inline; recall drops the stale entry.
 fn correct(conn: &Connection, args: CorrectArgs) -> Result<()> {
-    if args.old == args.with_id {
-        bail!("a memory cannot supersede itself");
-    }
-    let before = memory_row_json(conn, &args.old)?
-        .ok_or_else(|| anyhow::anyhow!("no memory found with id={}", args.old))?;
-    memory_row_json(conn, &args.with_id)?
-        .ok_or_else(|| anyhow::anyhow!("no successor memory with id={}", args.with_id))?;
-    let ts = now();
-    conn.execute(
-        "UPDATE memories
-         SET superseded_by=?1, supersede_reason=?2, lifecycle='superseded', updated_at=?3
-         WHERE id=?4",
-        params![args.with_id, args.reason, ts, args.old],
-    )?;
-    // gf2.2: the typed edge is the full relation (the FK above stays as
-    // the fast path to the primary successor). Manual corrections carry
-    // confidence 1.0 — the write-time adjudicator (gf2.7) records less.
-    // OR IGNORE: re-asserting an existing pair is idempotent (the change
-    // history lives in memory_events, not in duplicate edges).
-    conn.execute(
-        "INSERT OR IGNORE INTO supersessions (old_id, new_id, kind, reason, confidence, actor, created_at)
-         VALUES (?1, ?2, ?3, ?4, 1.0, ?5, ?6)",
-        params![args.old, args.with_id, args.kind, args.reason, default_author(), ts],
-    )?;
-    // 'updates' = the world changed: the old fact WAS true — close its
-    // validity interval instead of leaving it ambiguous. 'corrects' = it
-    // was never true; the interval stays untouched (there is no era in
-    // which it held).
-    if args.kind == "updates" {
-        conn.execute(
-            "UPDATE memories SET valid_to = COALESCE(valid_to, ?1) WHERE id = ?2",
-            params![ts, args.old],
-        )?;
-    }
-    // lifecycle != 'active' drops it from the topic index (context injection).
-    rebuild_index_for(conn, &args.old)?;
-    let after = memory_row_json(conn, &args.old)?;
-    conn.execute(
-        "INSERT INTO memory_events (ts, actor, action, memory_id, before_json, after_json, reason)
-         VALUES (?1, 'agent', 'supersede', ?2, ?3, ?4, ?5)",
-        params![ts, args.old, before, after, args.reason],
+    apply_supersession(
+        conn,
+        &args.old,
+        &args.with_id,
+        &args.kind,
+        &args.reason,
+        1.0,
+        &default_author(),
     )?;
     log::info!(
         "{} superseded by {} ({})",
@@ -1767,6 +1743,64 @@ fn correct(conn: &Connection, args: CorrectArgs) -> Result<()> {
         args.with_id,
         args.kind
     );
+    Ok(())
+}
+
+/// gf2.7: the one supersession effector — shared by the manual `correct`
+/// verb (confidence 1.0, the invoking author) and the write-time
+/// adjudicator (its model confidence, actor "adjudicator"). FK fast path
+/// + typed edge + validity closure + topic-index drop + audit event:
+/// identical effects regardless of who decided.
+pub(crate) fn apply_supersession(
+    conn: &Connection,
+    old: &str,
+    new: &str,
+    kind: &str,
+    reason: &str,
+    confidence: f64,
+    actor: &str,
+) -> Result<()> {
+    if old == new {
+        bail!("a memory cannot supersede itself");
+    }
+    let before = memory_row_json(conn, old)?
+        .ok_or_else(|| anyhow::anyhow!("no memory found with id={old}"))?;
+    memory_row_json(conn, new)?
+        .ok_or_else(|| anyhow::anyhow!("no successor memory with id={new}"))?;
+    let ts = now();
+    conn.execute(
+        "UPDATE memories
+         SET superseded_by=?1, supersede_reason=?2, lifecycle='superseded', updated_at=?3
+         WHERE id=?4",
+        params![new, reason, ts, old],
+    )?;
+    // gf2.2: the typed edge is the full relation (the FK above stays as
+    // the fast path to the primary successor). OR IGNORE: re-asserting
+    // an existing pair is idempotent (the change history lives in
+    // memory_events, not in duplicate edges).
+    conn.execute(
+        "INSERT OR IGNORE INTO supersessions (old_id, new_id, kind, reason, confidence, actor, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![old, new, kind, reason, confidence, actor, ts],
+    )?;
+    // 'updates' = the world changed: the old fact WAS true — close its
+    // validity interval instead of leaving it ambiguous. 'corrects' = it
+    // was never true; the interval stays untouched (there is no era in
+    // which it held).
+    if kind == "updates" {
+        conn.execute(
+            "UPDATE memories SET valid_to = COALESCE(valid_to, ?1) WHERE id = ?2",
+            params![ts, old],
+        )?;
+    }
+    // lifecycle != 'active' drops it from the topic index (context injection).
+    rebuild_index_for(conn, old)?;
+    let after = memory_row_json(conn, old)?;
+    conn.execute(
+        "INSERT INTO memory_events (ts, actor, action, memory_id, before_json, after_json, reason)
+         VALUES (?1, ?2, 'supersede', ?3, ?4, ?5, ?6)",
+        params![ts, actor, old, before, after, reason],
+    )?;
     Ok(())
 }
 

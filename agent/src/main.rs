@@ -1,3 +1,4 @@
+mod adjudicate;
 mod db;
 mod embed;
 mod memory;

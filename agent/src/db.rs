@@ -145,6 +145,16 @@ fn migrate(conn: &Connection) -> Result<()> {
         conn.execute_batch("COMMIT")?;
     }
 
+    if version < 10 {
+        conn.execute_batch("BEGIN")?;
+        conn.execute_batch(SCHEMA_V10)?;
+        conn.execute(
+            "INSERT INTO schema_version (version, applied) VALUES (10, ?)",
+            [chrono::Utc::now().timestamp()],
+        )?;
+        conn.execute_batch("COMMIT")?;
+    }
+
     Ok(())
 }
 
@@ -375,4 +385,26 @@ CREATE INDEX idx_sup_new ON supersessions(new_id);
 
 ALTER TABLE memories ADD COLUMN valid_from INTEGER;
 ALTER TABLE memories ADD COLUMN valid_to   INTEGER;
+";
+
+// v10 (at-supersession-activation-gf2.7): the conflict-suspected queue —
+// where the write-time adjudicator parks relations it is not confident
+// enough to act on (and zombie flags: a new memory matching an already-
+// superseded/retracted row). Resolution verbs are the existing `correct`
+// / `retract`; `agent memory conflicts` (gf2.8) lists and dismisses.
+// UNIQUE(old_id, new_id): the same pair is queued once; re-adjudication
+// is INSERT OR IGNORE.
+const SCHEMA_V10: &str = "
+CREATE TABLE conflict_suspected (
+    id         INTEGER PRIMARY KEY,
+    old_id     TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+    new_id     TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+    relation   TEXT NOT NULL,
+    confidence REAL,
+    rationale  TEXT NOT NULL DEFAULT '',
+    status     TEXT NOT NULL DEFAULT 'open',
+    created_at INTEGER NOT NULL,
+    UNIQUE (old_id, new_id)
+);
+CREATE INDEX idx_cs_status ON conflict_suspected(status, created_at DESC);
 ";
