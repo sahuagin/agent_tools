@@ -63,6 +63,9 @@ pub enum MemoryAction {
     Retract(RetractArgs),
     /// Follow a memory's supersession chain to its current head
     Resolve(ResolveArgs),
+    /// List/dismiss suspected-conflict queue rows (write-time adjudicator
+    /// and sweep park uncertain relations here; resolve with correct/retract)
+    Conflicts(ConflictsArgs),
     /// Identity-kernel editor: see and curate exactly what
     /// `context --tier identity` injects (at-kernel-editor-oio)
     Kernel(KernelCmd),
@@ -261,6 +264,22 @@ pub struct CorrectArgs {
 pub struct ResolveArgs {
     /// Memory id (or exact name) to resolve to its current head
     pub key: String,
+    /// Emit JSON instead of human-readable text
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Args)]
+pub struct ConflictsArgs {
+    /// Dismiss a queue row by its numeric id (false positive; logged)
+    #[arg(long)]
+    pub dismiss: Option<i64>,
+    /// Why this suspected conflict is a false positive (with --dismiss)
+    #[arg(long, default_value = "")]
+    pub reason: String,
+    /// Include dismissed/resolved rows, not just open ones
+    #[arg(long)]
+    pub all: bool,
     /// Emit JSON instead of human-readable text
     #[arg(long)]
     pub json: bool,
@@ -607,6 +626,7 @@ pub fn run(conn: Connection, cmd: MemoryCmd) -> Result<()> {
         MemoryAction::Correct(args) => correct(&conn, args),
         MemoryAction::Retract(args) => retract(&conn, args),
         MemoryAction::Resolve(args) => resolve(&conn, args),
+        MemoryAction::Conflicts(args) => conflicts(&conn, args),
         MemoryAction::Kernel(cmd) => kernel(&conn, cmd),
         MemoryAction::Verify(args) => verify(&conn, args),
         MemoryAction::Export => export(&conn),
@@ -1880,6 +1900,15 @@ pub(crate) fn apply_supersession(
          VALUES (?1, ?2, 'supersede', ?3, ?4, ?5, ?6)",
         params![ts, actor, old, before, after, reason],
     )?;
+    // gf2.8: an edge settles the question — close any matching open
+    // queue row (either orientation: the adjudicator queues new-corrects-
+    // old, but the operator may correct in the opposite direction).
+    conn.execute(
+        "UPDATE conflict_suspected SET status='resolved'
+         WHERE status='open'
+           AND ((old_id=?1 AND new_id=?2) OR (old_id=?2 AND new_id=?1))",
+        params![old, new],
+    )?;
     Ok(())
 }
 
@@ -1904,6 +1933,12 @@ fn retract(conn: &Connection, args: RetractArgs) -> Result<()> {
         "INSERT INTO supersessions (old_id, new_id, kind, reason, confidence, actor, created_at)
          VALUES (?1, NULL, 'retracts', ?2, 1.0, ?3, ?4)",
         params![args.id, args.reason, default_author(), ts],
+    )?;
+    // gf2.8: retraction settles any open suspicion touching this memory.
+    conn.execute(
+        "UPDATE conflict_suspected SET status='resolved'
+         WHERE status='open' AND (old_id=?1 OR new_id=?1)",
+        params![args.id],
     )?;
     rebuild_index_for(conn, &args.id)?;
     let after = memory_row_json(conn, &args.id)?;
@@ -1982,6 +2017,120 @@ fn resolve(conn: &Connection, args: ResolveArgs) -> Result<()> {
         }
     }
     println!("current: {head}");
+    Ok(())
+}
+
+/// gf2.8: the suspected-conflict queue — list what the adjudicator /
+/// sweep parked, dismiss false positives. Resolution happens through
+/// the normal verbs (`correct` / `retract` close matching rows).
+fn conflicts(conn: &Connection, args: ConflictsArgs) -> Result<()> {
+    if let Some(row_id) = args.dismiss {
+        let (old_id, new_id): (String, String) = conn
+            .query_row(
+                "SELECT old_id, new_id FROM conflict_suspected WHERE id=?1 AND status='open'",
+                params![row_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .map_err(|_| anyhow::anyhow!("no open conflict row with id={row_id}"))?;
+        conn.execute(
+            "UPDATE conflict_suspected SET status='dismissed' WHERE id=?1",
+            params![row_id],
+        )?;
+        let ts = now();
+        conn.execute(
+            "INSERT INTO memory_events (ts, actor, action, memory_id, before_json, after_json, reason)
+             VALUES (?1, ?2, 'conflict-dismiss', ?3, NULL, ?4, ?5)",
+            params![
+                ts,
+                default_author(),
+                old_id,
+                format!("{{\"row\":{row_id},\"new_id\":\"{new_id}\"}}"),
+                args.reason
+            ],
+        )?;
+        log::info!("conflict {row_id} ({old_id} vs {new_id}) dismissed");
+        return Ok(());
+    }
+
+    let status_clause = if args.all {
+        ""
+    } else {
+        " WHERE c.status='open'"
+    };
+    let sql = format!(
+        "SELECT c.id, c.old_id, c.new_id, c.relation, c.confidence, c.rationale,
+                c.status, c.created_at,
+                mo.name, mn.name
+         FROM conflict_suspected c
+         JOIN memories mo ON mo.id = c.old_id
+         JOIN memories mn ON mn.id = c.new_id{status_clause}
+         ORDER BY c.created_at DESC"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows: Vec<(
+        i64,
+        String,
+        String,
+        String,
+        Option<f64>,
+        String,
+        String,
+        i64,
+        String,
+        String,
+    )> = stmt
+        .query_map([], |r| {
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+                r.get(6)?,
+                r.get(7)?,
+                r.get(8)?,
+                r.get(9)?,
+            ))
+        })?
+        .collect::<std::result::Result<_, _>>()?;
+
+    if args.json {
+        let out: Vec<serde_json::Value> = rows
+            .iter()
+            .map(|(id, old, new, rel, conf, rat, status, ts, oname, nname)| {
+                serde_json::json!({
+                    "id": id, "old_id": old, "old_name": oname,
+                    "new_id": new, "new_name": nname,
+                    "relation": rel, "confidence": conf,
+                    "rationale": rat, "status": status, "created_at": ts,
+                })
+            })
+            .collect();
+        println!("{}", serde_json::json!({"conflicts": out}));
+        return Ok(());
+    }
+    if rows.is_empty() {
+        println!(
+            "no {} conflicts",
+            if args.all { "recorded" } else { "open" }
+        );
+        return Ok(());
+    }
+    println!("## Suspected conflicts ({})\n", rows.len());
+    for (id, old, new, rel, conf, rat, status, ts, oname, nname) in &rows {
+        let conf_s = conf
+            .map(|c| format!("{c:.2}"))
+            .unwrap_or_else(|| "-".into());
+        println!(
+            "#{id} [{status}] {new} ({nname}) --{rel} {conf_s}--> {old} ({oname})  [{}]",
+            fmt_ts(*ts)
+        );
+        if !rat.is_empty() {
+            println!("    {rat}");
+        }
+        println!("    resolve: agent memory correct {old} --with {new}   |   dismiss: agent memory conflicts --dismiss {id}");
+    }
     Ok(())
 }
 
@@ -3617,6 +3766,112 @@ mod tests {
         }
         let err = resolve_current(&conn, "m0").unwrap_err().to_string();
         assert!(err.contains("exceeds"), "{err}");
+    }
+
+    // ── gf2.8: conflict queue lifecycle ──────────────────────────────
+
+    fn queue_pair(conn: &Connection, old: &str, new: &str) -> i64 {
+        conn.execute(
+            "INSERT INTO conflict_suspected (old_id, new_id, relation, confidence, rationale, status, created_at)
+             VALUES (?1, ?2, 'corrects', 0.6, 'test', 'open', 1000)",
+            params![old, new],
+        )
+        .unwrap();
+        conn.last_insert_rowid()
+    }
+
+    fn queue_status(conn: &Connection, id: i64) -> String {
+        conn.query_row(
+            "SELECT status FROM conflict_suspected WHERE id=?1",
+            params![id],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn correct_resolves_matching_queue_rows_both_orientations() {
+        let conn = crate::db::open_in_memory().unwrap();
+        seed(&conn, "o1", "old1", "x");
+        seed(&conn, "n1", "new1", "y");
+        seed(&conn, "o2", "old2", "x");
+        seed(&conn, "n2", "new2", "y");
+        let q1 = queue_pair(&conn, "o1", "n1");
+        // reverse orientation: operator corrects the other way round
+        let q2 = queue_pair(&conn, "n2", "o2");
+        correct(
+            &conn,
+            CorrectArgs {
+                old: "o1".into(),
+                with_id: "n1".into(),
+                kind: "corrects".into(),
+                reason: String::new(),
+            },
+        )
+        .unwrap();
+        correct(
+            &conn,
+            CorrectArgs {
+                old: "o2".into(),
+                with_id: "n2".into(),
+                kind: "corrects".into(),
+                reason: String::new(),
+            },
+        )
+        .unwrap();
+        assert_eq!(queue_status(&conn, q1), "resolved");
+        assert_eq!(
+            queue_status(&conn, q2),
+            "resolved",
+            "reverse orientation must resolve too"
+        );
+    }
+
+    #[test]
+    fn retract_resolves_queue_rows_touching_the_id() {
+        let conn = crate::db::open_in_memory().unwrap();
+        seed(&conn, "r1", "doomed", "x");
+        seed(&conn, "other", "bystander", "y");
+        let q = queue_pair(&conn, "r1", "other");
+        retract(
+            &conn,
+            RetractArgs {
+                id: "r1".into(),
+                reason: "gone".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(queue_status(&conn, q), "resolved");
+    }
+
+    #[test]
+    fn dismiss_marks_row_and_requires_open() {
+        let conn = crate::db::open_in_memory().unwrap();
+        seed(&conn, "a1", "a", "x");
+        seed(&conn, "b1", "b", "y");
+        let q = queue_pair(&conn, "a1", "b1");
+        conflicts(
+            &conn,
+            ConflictsArgs {
+                dismiss: Some(q),
+                reason: "false positive".into(),
+                all: false,
+                json: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(queue_status(&conn, q), "dismissed");
+        // dismissing again: no longer open -> error
+        assert!(conflicts(
+            &conn,
+            ConflictsArgs {
+                dismiss: Some(q),
+                reason: String::new(),
+                all: false,
+                json: false,
+            },
+        )
+        .is_err());
     }
 
     #[test]
