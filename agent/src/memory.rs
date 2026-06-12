@@ -61,6 +61,8 @@ pub enum MemoryAction {
     /// Retract a memory: no longer true, nothing replaces it (AGM
     /// contraction — hidden everywhere; restorable)
     Retract(RetractArgs),
+    /// Follow a memory's supersession chain to its current head
+    Resolve(ResolveArgs),
     /// Identity-kernel editor: see and curate exactly what
     /// `context --tier identity` injects (at-kernel-editor-oio)
     Kernel(KernelCmd),
@@ -250,6 +252,15 @@ pub struct CorrectArgs {
     #[arg(long, default_value = "corrects",
           value_parser = ["corrects", "updates", "refines", "consolidates"])]
     pub kind: String,
+}
+
+#[derive(Args)]
+pub struct ResolveArgs {
+    /// Memory id (or exact name) to resolve to its current head
+    pub key: String,
+    /// Emit JSON instead of human-readable text
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Args)]
@@ -592,6 +603,7 @@ pub fn run(conn: Connection, cmd: MemoryCmd) -> Result<()> {
         MemoryAction::Reindex(args) => reindex(&conn, args),
         MemoryAction::Correct(args) => correct(&conn, args),
         MemoryAction::Retract(args) => retract(&conn, args),
+        MemoryAction::Resolve(args) => resolve(&conn, args),
         MemoryAction::Kernel(cmd) => kernel(&conn, cmd),
         MemoryAction::Verify(args) => verify(&conn, args),
         MemoryAction::Export => export(&conn),
@@ -1033,7 +1045,19 @@ fn show(conn: &Connection, args: ShowArgs) -> Result<()> {
                     }
                     if let Some(succ) = superseded_by {
                         println!();
-                        print_successor(conn, &succ)?;
+                        // gf2.5: show the chain HEAD, not a possibly-stale
+                        // middle link.
+                        let hops = resolve_current(conn, &succ)?;
+                        let head = hops.last().map(String::as_str).unwrap_or(&succ);
+                        print_successor(conn, head)?;
+                        if head != succ {
+                            println!(
+                                "  (resolved through {} superseded link(s): {} → {})",
+                                hops.len(),
+                                succ,
+                                hops.join(" → ")
+                            );
+                        }
                     }
                 }
             }
@@ -1581,9 +1605,22 @@ fn search(conn: &Connection, args: SearchArgs) -> Result<()> {
         let ts = fmt_ts(updated_at);
         // at-usl: a superseded memory is never shown without its successor —
         // successor first with full content, the stale entry as a labeled stub.
+        // gf2.5: the successor shown is the CHAIN HEAD, not the direct
+        // successor — a middle link of A→B→C is itself stale, and showing
+        // it as "CURRENT" reintroduces the very failure supersession fixes.
         if lifecycle == "superseded" {
             if let Some(succ_id) = superseded_by.as_deref() {
-                print_successor(conn, succ_id)?;
+                let hops = resolve_current(conn, succ_id)?;
+                let head = hops.last().map(String::as_str).unwrap_or(succ_id);
+                print_successor(conn, head)?;
+                if head != succ_id {
+                    println!(
+                        "  (resolved through {} superseded link(s): {} → {})",
+                        hops.len(),
+                        succ_id,
+                        hops.join(" → ")
+                    );
+                }
             }
             println!(
                 "[{id}] ({type_}) {name} — {desc}  [{ts}]\n  {}",
@@ -1673,6 +1710,48 @@ fn print_successor(conn: &Connection, succ_id: &str) -> Result<()> {
         Err(e) => return Err(e.into()),
     }
     Ok(())
+}
+
+/// gf2.5: maximum supersession-chain hops before we declare the data
+/// pathological. Chains are human-made and short; 16 is far beyond any
+/// legitimate history.
+const RESOLVE_MAX_DEPTH: usize = 16;
+
+/// gf2.5: follow `superseded_by` (the primary-successor fast path) to
+/// the terminal head. Returns the hop list AFTER `start` (empty = start
+/// is not superseded / already the head). Errors on a cycle or a chain
+/// deeper than RESOLVE_MAX_DEPTH — both mean corrupted supersession
+/// data and must be loud, not silently truncated.
+fn resolve_current(conn: &Connection, start: &str) -> Result<Vec<String>> {
+    let mut hops: Vec<String> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    seen.insert(start.to_string());
+    let mut cur = start.to_string();
+    loop {
+        let next: Option<String> = conn
+            .query_row(
+                "SELECT superseded_by FROM memories WHERE id = ?1",
+                params![cur],
+                |r| r.get(0),
+            )
+            .unwrap_or(None);
+        match next {
+            None => return Ok(hops),
+            Some(n) => {
+                if !seen.insert(n.clone()) {
+                    bail!(
+                        "supersession CYCLE at {n} (path: {start} → {})",
+                        hops.join(" → ")
+                    );
+                }
+                if hops.len() >= RESOLVE_MAX_DEPTH {
+                    bail!("supersession chain from {start} exceeds {RESOLVE_MAX_DEPTH} hops");
+                }
+                hops.push(n.clone());
+                cur = n;
+            }
+        }
+    }
 }
 
 /// at-usl: testimony label shown on every read path. Memories are
@@ -1800,6 +1879,75 @@ fn retract(conn: &Connection, args: RetractArgs) -> Result<()> {
         params![ts, args.id, before, after, args.reason],
     )?;
     log::info!("{} retracted", args.id);
+    Ok(())
+}
+
+/// gf2.5: `agent memory resolve <id|name>` — walk the supersession
+/// chain to its head, showing each hop's kind/reason from the edge
+/// table. Turns "superseded, silence" into "superseded; current is X".
+fn resolve(conn: &Connection, args: ResolveArgs) -> Result<()> {
+    let start: String = conn
+        .query_row(
+            "SELECT id FROM memories WHERE id = ?1 OR name = ?1
+             ORDER BY CASE WHEN id = ?1 THEN 0 ELSE 1 END LIMIT 1",
+            params![args.key],
+            |r| r.get(0),
+        )
+        .map_err(|_| anyhow::anyhow!("no memory found for id/name={}", args.key))?;
+    let hops = resolve_current(conn, &start)?;
+    let head = hops.last().cloned().unwrap_or_else(|| start.clone());
+
+    // Annotate each hop with the typed edge, where one exists (edges
+    // older than schema v9 have FK-only supersessions — kind unknown).
+    let mut edges: Vec<(String, String, Option<String>, Option<String>)> = Vec::new();
+    let mut from = start.clone();
+    for to in &hops {
+        let edge: Option<(String, String)> = conn
+            .query_row(
+                "SELECT kind, reason FROM supersessions WHERE old_id = ?1 AND new_id = ?2",
+                params![from, to],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .ok();
+        let (kind, reason) = match edge {
+            Some((k, r)) => (Some(k), Some(r).filter(|s| !s.is_empty())),
+            None => (None, None),
+        };
+        edges.push((from.clone(), to.clone(), kind, reason));
+        from = to.clone();
+    }
+
+    if args.json {
+        let hops_json: Vec<serde_json::Value> = edges
+            .iter()
+            .map(|(f, t, k, r)| serde_json::json!({"from": f, "to": t, "kind": k, "reason": r}))
+            .collect();
+        println!(
+            "{}",
+            serde_json::json!({
+                "start": start,
+                "head": head,
+                "depth": hops.len(),
+                "current": hops.is_empty(),
+                "hops": hops_json,
+            })
+        );
+        return Ok(());
+    }
+
+    if hops.is_empty() {
+        println!("{start} is current (no supersession)");
+        return Ok(());
+    }
+    println!("{start}");
+    for (_, to, kind, reason) in &edges {
+        let kind = kind.as_deref().unwrap_or("superseded-by (untyped, pre-v9)");
+        match reason {
+            Some(r) => println!("  → {kind} → {to}  ({r})"),
+            None => println!("  → {kind} → {to}"),
+        }
+    }
+    println!("current: {head}");
     Ok(())
 }
 
@@ -3373,6 +3521,68 @@ mod tests {
             scored_stub("b", 0.8, 0.8, now, vec![0.0, 1.0]),
         ];
         assert!(conflict_partners(&scored).iter().all(Vec::is_empty));
+    }
+
+    // ── gf2.5: chain resolution ──────────────────────────────────────
+
+    #[test]
+    fn resolve_current_walks_chains_and_stops_at_heads() {
+        let conn = crate::db::open_in_memory().unwrap();
+        for id in ["a", "b", "c"] {
+            seed(&conn, id, id, "x");
+        }
+        for (old, new) in [("a", "b"), ("b", "c")] {
+            correct(
+                &conn,
+                CorrectArgs {
+                    old: old.into(),
+                    with_id: new.into(),
+                    reason: String::new(),
+                    kind: "corrects".into(),
+                },
+            )
+            .unwrap();
+        }
+        // From any member, the head is c.
+        assert_eq!(resolve_current(&conn, "a").unwrap(), vec!["b", "c"]);
+        assert_eq!(resolve_current(&conn, "b").unwrap(), vec!["c"]);
+        assert!(resolve_current(&conn, "c").unwrap().is_empty());
+        // Unknown id: nothing to follow, not an error (callers pass
+        // ids they already hold).
+        assert!(resolve_current(&conn, "nope").unwrap().is_empty());
+    }
+
+    #[test]
+    fn resolve_current_errors_loudly_on_cycles() {
+        let conn = crate::db::open_in_memory().unwrap();
+        seed(&conn, "x", "x", "1");
+        seed(&conn, "y", "y", "2");
+        // Forge a cycle directly (correct() can't make one in a single
+        // step, but bad data can exist).
+        conn.execute("UPDATE memories SET superseded_by='y' WHERE id='x'", [])
+            .unwrap();
+        conn.execute("UPDATE memories SET superseded_by='x' WHERE id='y'", [])
+            .unwrap();
+        let err = resolve_current(&conn, "x").unwrap_err().to_string();
+        assert!(err.contains("CYCLE"), "{err}");
+    }
+
+    #[test]
+    fn resolve_current_caps_pathological_depth() {
+        let conn = crate::db::open_in_memory().unwrap();
+        let n = RESOLVE_MAX_DEPTH + 3;
+        for i in 0..=n {
+            seed(&conn, &format!("m{i}"), &format!("m{i}"), "x");
+        }
+        for i in 0..n {
+            conn.execute(
+                "UPDATE memories SET superseded_by=?1 WHERE id=?2",
+                params![format!("m{}", i + 1), format!("m{i}")],
+            )
+            .unwrap();
+        }
+        let err = resolve_current(&conn, "m0").unwrap_err().to_string();
+        assert!(err.contains("exceeds"), "{err}");
     }
 
     #[test]
