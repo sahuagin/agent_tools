@@ -67,6 +67,33 @@ fn parse_listen(args: &[String]) -> Option<String> {
     None
 }
 
+/// Parse `--allow-host <h>` (repeatable) / `--allow-host=<h>`, falling back to
+/// `AGENT_MCP_ALLOWED_HOSTS` (comma-separated). Empty result = allow any Host
+/// (the trusted-network default).
+fn parse_allowed_hosts(args: &[String]) -> Vec<String> {
+    let mut hosts = Vec::new();
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        if let Some(h) = a.strip_prefix("--allow-host=") {
+            hosts.push(h.to_string());
+        } else if a == "--allow-host" {
+            if let Some(h) = it.next() {
+                hosts.push(h.clone());
+            }
+        }
+    }
+    if hosts.is_empty() {
+        if let Ok(env) = std::env::var("AGENT_MCP_ALLOWED_HOSTS") {
+            hosts.extend(
+                env.split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty()),
+            );
+        }
+    }
+    hosts
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -77,19 +104,25 @@ async fn main() -> Result<()> {
             Ok("1") | Ok("true")
         );
     let listen = parse_listen(&args).or_else(|| std::env::var("AGENT_MCP_ADDR").ok());
+    let allowed_hosts = parse_allowed_hosts(&args);
 
     let agent_bin = resolve_agent_bin();
     let reg = Arc::new(build_registry(&agent_bin)?);
     let (total, writes) = reg.counts();
     eprintln!(
-        "agent-mcp: {total} tools ({writes} write-gated, {} read); writes {}",
+        "agent-mcp: {total} tools ({writes} write-gated, {} read); writes {}; hosts {}",
         total - writes,
-        if allow_writes { "ENABLED" } else { "disabled" }
+        if allow_writes { "ENABLED" } else { "disabled" },
+        if allowed_hosts.is_empty() {
+            "any (trusted network)".to_string()
+        } else {
+            allowed_hosts.join(",")
+        }
     );
     let agent_bin = Arc::new(agent_bin);
 
     match listen {
-        Some(addr) => serve_http(&addr, reg, allow_writes, agent_bin).await,
+        Some(addr) => serve_http(&addr, reg, allow_writes, agent_bin, allowed_hosts).await,
         None => {
             use rmcp::ServiceExt;
             eprintln!("agent-mcp: stdio");
@@ -110,6 +143,7 @@ async fn serve_http(
     reg: Arc<Registry>,
     allow_writes: bool,
     agent_bin: Arc<String>,
+    allowed_hosts: Vec<String>,
 ) -> Result<()> {
     use axum::Router;
     use rmcp::transport::streamable_http_server::{
@@ -117,21 +151,13 @@ async fn serve_http(
         StreamableHttpServerConfig,
     };
 
-    // allowed_hosts must include whatever Host header clients send. Unlike a
-    // localhost-only service, agent-mcp is meant to be reachable on its bind
-    // address — so allow-list it (and its host part), not just loopback.
-    let host = addr.rsplit_once(':').map(|(h, _)| h.to_string());
-    let mut config = StreamableHttpServerConfig::default();
-    let mut allowed = vec![
-        "localhost".to_string(),
-        "127.0.0.1".to_string(),
-        "::1".to_string(),
-        addr.to_string(),
-    ];
-    if let Some(h) = host {
-        allowed.push(h);
-    }
-    config.allowed_hosts = allowed;
+    // Host allow-list (rmcp validates the inbound Host header). EMPTY = allow
+    // any Host — the right default for a trusted-network bind, where remote
+    // clients connect by the server's LAN IP/hostname. rmcp's own default is
+    // localhost-only, which 403s every remote client even on a 0.0.0.0 bind;
+    // that is the bug this fixes. Lock a public bind down with --allow-host /
+    // AGENT_MCP_ALLOWED_HOSTS.
+    let config = StreamableHttpServerConfig::default().with_allowed_hosts(allowed_hosts);
 
     let service: StreamableHttpService<AgentMcpServer, LocalSessionManager> =
         StreamableHttpService::new(
