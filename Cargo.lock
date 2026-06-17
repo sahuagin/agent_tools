@@ -26,6 +26,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "agent-mcp"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "rmcp",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "ahash"
 version = "0.8.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
