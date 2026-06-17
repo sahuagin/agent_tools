@@ -1,0 +1,95 @@
+#!/bin/sh
+#
+# agent_mcp — rc.d service for the agent-mcp server (HTTP).
+#
+# Serves the `agent` CLI (memory / tasks / metrics) as MCP tools over rmcp
+# Streamable HTTP (axum, route /mcp), discovered at startup from
+# `agent --help-ai --json`. Lets MCP clients (Claude Code, mu) and the
+# `agent --via-mcp <url>` CLI operate on the central agent store from any
+# machine on the trusted network.
+#
+# Install:
+#   install target/release/agent-mcp ~/.local/bin/agent-mcp        # binary (unprivileged)
+#   doas install -m 0555 agent-mcp/deploy/agent_mcp.rc /usr/local/etc/rc.d/agent_mcp
+#   doas sysrc agent_mcp_enable="YES"
+#   doas sysrc agent_mcp_user="tcovert"
+#   doas sysrc agent_mcp_listen="0.0.0.0:7700"
+#   # optional: doas sysrc agent_mcp_allow_writes="YES"   # let agents RECORD memory
+#   doas service agent_mcp start
+#
+# rc.conf knobs (all prefixed agent_mcp_):
+#   enable        — required: YES to start at boot / via 'service start'
+#   user          — user to run as (rc.subr su -m switch). Default tcovert.
+#   group         — primary group. Default = user.
+#   listen        — host:port to bind. Default 0.0.0.0:7700 (bind all; never a pinned IP).
+#   bin           — agent-mcp binary. Default /home/tcovert/.local/bin/agent-mcp
+#   agent_bin     — the `agent` binary it shells to (AGENT_BIN). Default /home/tcovert/.local/bin/agent
+#   db            — AGENT_DB override. Default empty (agent's default ~/.local/share/agent.sqlite, the central store).
+#   allow_writes  — YES exposes mutating tools (memory add/correct/...). Default NO.
+#                   Read-only until biscuit-scoped worker access lands; flip to YES
+#                   to use it as the full c137_mem replacement (agents record memory).
+#   logfile       — Default /var/log/agent_mcp.log
+#
+# PROVIDE: agent_mcp
+# REQUIRE: NETWORKING
+# KEYWORD: shutdown
+
+. /etc/rc.subr
+
+name="agent_mcp"
+rcvar="${name}_enable"
+
+load_rc_config "$name"
+
+: ${agent_mcp_enable:="NO"}
+: ${agent_mcp_user:="tcovert"}
+: ${agent_mcp_listen:="0.0.0.0:7700"}
+: ${agent_mcp_bin:="/home/tcovert/.local/bin/agent-mcp"}
+: ${agent_mcp_agent_bin:="/home/tcovert/.local/bin/agent"}
+: ${agent_mcp_db:=""}
+: ${agent_mcp_allow_writes:="NO"}
+: ${agent_mcp_logfile:="/var/log/${name}.log"}
+
+# Resolve the run-user's home for HOME and chdir.
+agent_mcp_home="$(getent passwd ${agent_mcp_user} 2>/dev/null | cut -d: -f6)"
+: ${agent_mcp_home:="/home/${agent_mcp_user}"}
+: ${agent_mcp_group:="${agent_mcp_user}"}
+: ${agent_mcp_chdir:="${agent_mcp_home}"}
+
+# Optional env, built conditionally so we never pass an empty AGENT_DB or a
+# spurious writes flag.
+_agent_mcp_db_env=""
+[ -n "${agent_mcp_db}" ] && _agent_mcp_db_env="AGENT_DB=${agent_mcp_db}"
+_agent_mcp_writes_env=""
+checkyesno agent_mcp_allow_writes && _agent_mcp_writes_env="AGENT_MCP_ALLOW_WRITES=1"
+
+# Set ${name}_user/_group (rc.subr does the su -m switch); deliberately do NOT
+# pass `daemon -u` — that + `-r` loops in setusercontext() and crashes on every
+# restart on this box (same lesson as code_index_mcp / claude_proxy /
+# c137_memory_worker). HOME is injected via env so the spawned `agent` resolves
+# ~/.config/agent/config.toml (the embedder) and its default central DB.
+pidfile="/var/run/${name}/${name}.pid"
+command="/usr/sbin/daemon"
+command_args="-r -t ${name} -P ${pidfile} -o ${agent_mcp_logfile} \
+    /usr/bin/env HOME=${agent_mcp_home} \
+    AGENT_BIN=${agent_mcp_agent_bin} ${_agent_mcp_db_env} ${_agent_mcp_writes_env} \
+    ${agent_mcp_bin} --listen ${agent_mcp_listen}"
+required_files="${agent_mcp_bin} ${agent_mcp_agent_bin}"
+
+start_precmd="agent_mcp_prestart"
+agent_mcp_prestart() {
+    if [ ! -x "${agent_mcp_bin}" ]; then
+        err 1 "agent-mcp binary not found or not executable: ${agent_mcp_bin}"
+    fi
+    if [ ! -x "${agent_mcp_agent_bin}" ]; then
+        err 1 "agent binary (AGENT_BIN) not found or not executable: ${agent_mcp_agent_bin}"
+    fi
+    # Pidfile dir must be writable by the unprivileged run-user: daemon runs as
+    # ${agent_mcp_user} (via rc.subr's su -m) and /var/run is root:wheel 0755.
+    install -d -o "${agent_mcp_user}" -g "${agent_mcp_group}" -m 0755 "/var/run/${name}"
+    install -o "${agent_mcp_user}" -g "${agent_mcp_group}" -m 0644 \
+        /dev/null "${agent_mcp_logfile}" 2>/dev/null || \
+        chown "${agent_mcp_user}:${agent_mcp_group}" "${agent_mcp_logfile}"
+}
+
+run_rc_command "$1"
