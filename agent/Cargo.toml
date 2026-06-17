@@ -13,6 +13,7 @@ path = "src/main.rs"
 anyhow = "1"
 chrono = "0.4"
 clap = { version = "4", features = ["derive"] }
+clap-catalog = { path = "../clap-catalog" }
 # log + env_logger (operator preference, 2026-06-12): diagnostics and
 # status messages go through `log` macros — RUST_LOG controls them at
 # runtime, and release builds compile debug/trace out via the

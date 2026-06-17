@@ -15,6 +15,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "clap",
+ "clap-catalog",
  "env_logger",
  "log",
  "rusqlite",
@@ -307,6 +308,14 @@ checksum = "1ddb117e43bbf7dacf0a4190fef4d345b9bad68dfc649cb349e7d17d28428e51"
 dependencies = [
  "clap_builder",
  "clap_derive",
+]
+
+[[package]]
+name = "clap-catalog"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "serde_json",
 ]
 
 [[package]]
