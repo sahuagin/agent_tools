@@ -6,7 +6,7 @@ mod metrics;
 mod tasks;
 
 use anyhow::Result;
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 
 #[derive(Parser)]
 #[command(
@@ -66,8 +66,15 @@ fn main() -> Result<()> {
 
 // ── Agent-oriented help (--help-ai) ──────────────────────────────────────────
 // Terse, structured help meant for an agent driving the CLI: documents inputs,
-// output shape, and when-to-use rules the human --help leaves implicit. Plain
-// text by default; `--json` wraps it as {command, help_ai} for programmatic use.
+// output shape, and when-to-use rules the human --help leaves implicit.
+//
+// Plain text (`ai_text`) by default. `--json` emits a STRUCTURED command spec
+// introspected from the live clap tree — every group, subcommand, arg, flag,
+// value-name, default, and possible-value, recursively — scoped to the
+// requested path. Because it walks the real `Command`, it cannot drift from
+// the actual surface the way the hand-written prose does; this is the catalog
+// an rmcp layer reads to advertise each leaf as a tool. The curated prose for
+// the scoped node rides along under `help_ai`.
 
 fn print_ai_help(argv: &[String], json: bool) {
     let positional: Vec<&str> = argv
@@ -79,18 +86,128 @@ fn print_ai_help(argv: &[String], json: bool) {
     let sub = positional.get(1).copied().unwrap_or("");
     let text = ai_text(group, sub);
     if json {
-        let command = format!("agent {group} {sub}")
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ");
-        let v = serde_json::json!({ "command": command, "help_ai": text });
+        // Descend the live clap tree to the requested group/sub, then emit
+        // that node (and everything under it) as a structured spec.
+        let root = Cli::command();
+        let mut node = &root;
+        let mut path = vec![root.get_name().to_string()];
+        for name in positional.iter().filter(|s| !s.is_empty()) {
+            match node.find_subcommand(name) {
+                Some(child) => {
+                    node = child;
+                    path.push((*name).to_string());
+                }
+                None => break,
+            }
+        }
+        let mut spec = command_to_json(node, &path.join(" "));
+        if let serde_json::Value::Object(map) = &mut spec {
+            map.insert(
+                "help_ai".into(),
+                serde_json::Value::String(text.to_string()),
+            );
+        }
         println!(
             "{}",
-            serde_json::to_string_pretty(&v).unwrap_or_else(|_| v.to_string())
+            serde_json::to_string_pretty(&spec).unwrap_or_else(|_| spec.to_string())
         );
     } else {
         println!("{text}");
     }
+}
+
+/// Recursively render a clap `Command` as a structured JSON spec: name, full
+/// invocation path, description, args, and nested subcommands. `invokable` is
+/// true for leaves (no subcommands) — i.e. the nodes an MCP layer maps to a
+/// callable tool.
+fn command_to_json(cmd: &clap::Command, path: &str) -> serde_json::Value {
+    let args: Vec<serde_json::Value> = cmd
+        .get_arguments()
+        .filter(|a| {
+            // Drop clap's auto-generated --help/--version.
+            !matches!(
+                a.get_action(),
+                clap::ArgAction::Help
+                    | clap::ArgAction::HelpShort
+                    | clap::ArgAction::HelpLong
+                    | clap::ArgAction::Version
+            )
+        })
+        .map(arg_to_json)
+        .collect();
+
+    let subcommands: Vec<serde_json::Value> = cmd
+        .get_subcommands()
+        .filter(|c| c.get_name() != "help") // skip clap's auto `help` subcommand
+        .map(|c| command_to_json(c, &format!("{path} {}", c.get_name())))
+        .collect();
+
+    let mut obj = serde_json::Map::new();
+    obj.insert("name".into(), serde_json::json!(cmd.get_name()));
+    obj.insert("path".into(), serde_json::json!(path));
+    if let Some(about) = cmd.get_about() {
+        obj.insert("about".into(), serde_json::json!(about.to_string()));
+    }
+    let aliases: Vec<String> = cmd.get_all_aliases().map(str::to_string).collect();
+    if !aliases.is_empty() {
+        obj.insert("aliases".into(), serde_json::json!(aliases));
+    }
+    obj.insert(
+        "invokable".into(),
+        serde_json::json!(subcommands.is_empty()),
+    );
+    if !args.is_empty() {
+        obj.insert("args".into(), serde_json::json!(args));
+    }
+    if !subcommands.is_empty() {
+        obj.insert("subcommands".into(), serde_json::json!(subcommands));
+    }
+    serde_json::Value::Object(obj)
+}
+
+/// Render a single clap `Arg` as JSON: enough for a caller to build an
+/// invocation or an MCP input-schema property (flag vs option, required,
+/// repeatable, allowed values, default).
+fn arg_to_json(arg: &clap::Arg) -> serde_json::Value {
+    use clap::ArgAction;
+    let takes_value = matches!(arg.get_action(), ArgAction::Set | ArgAction::Append);
+    let multiple = matches!(arg.get_action(), ArgAction::Append);
+
+    let mut obj = serde_json::Map::new();
+    obj.insert("name".into(), serde_json::json!(arg.get_id().as_str()));
+    if let Some(long) = arg.get_long() {
+        obj.insert("long".into(), serde_json::json!(format!("--{long}")));
+    }
+    if let Some(short) = arg.get_short() {
+        obj.insert("short".into(), serde_json::json!(format!("-{short}")));
+    }
+    obj.insert("positional".into(), serde_json::json!(arg.is_positional()));
+    obj.insert("required".into(), serde_json::json!(arg.is_required_set()));
+    obj.insert("takes_value".into(), serde_json::json!(takes_value));
+    obj.insert("multiple".into(), serde_json::json!(multiple));
+    if let Some(vn) = arg.get_value_names().and_then(<[_]>::first) {
+        obj.insert("value_name".into(), serde_json::json!(vn.to_string()));
+    }
+    if let Some(help) = arg.get_help() {
+        obj.insert("help".into(), serde_json::json!(help.to_string()));
+    }
+    let possible: Vec<String> = arg
+        .get_possible_values()
+        .iter()
+        .map(|p| p.get_name().to_string())
+        .collect();
+    if !possible.is_empty() {
+        obj.insert("possible_values".into(), serde_json::json!(possible));
+    }
+    let defaults: Vec<String> = arg
+        .get_default_values()
+        .iter()
+        .map(|s| s.to_string_lossy().into_owned())
+        .collect();
+    if !defaults.is_empty() {
+        obj.insert("default".into(), serde_json::json!(defaults));
+    }
+    serde_json::Value::Object(obj)
 }
 
 fn ai_text(group: &str, sub: &str) -> &'static str {

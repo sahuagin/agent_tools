@@ -1874,8 +1874,8 @@ fn correct(conn: &Connection, args: CorrectArgs) -> Result<()> {
 
 /// gf2.7: the one supersession effector — shared by the manual `correct`
 /// verb (confidence 1.0, the invoking author) and the write-time
-/// adjudicator (its model confidence, actor "adjudicator"). FK fast path
-/// + typed edge + validity closure + topic-index drop + audit event:
+/// adjudicator (its model confidence, actor "adjudicator"). FK fast path +
+/// typed edge + validity closure + topic-index drop + audit event:
 /// identical effects regardless of who decided.
 pub(crate) fn apply_supersession(
     conn: &Connection,
@@ -2094,7 +2094,10 @@ fn conflicts(conn: &Connection, args: ConflictsArgs) -> Result<()> {
          ORDER BY c.created_at DESC"
     );
     let mut stmt = conn.prepare(&sql)?;
-    let rows: Vec<(
+    // One row of the suspected-conflict queue:
+    // (id, old_id, new_id, relation, confidence, rationale, status,
+    //  created_at, old_name, new_name).
+    type ConflictRow = (
         i64,
         String,
         String,
@@ -2105,7 +2108,8 @@ fn conflicts(conn: &Connection, args: ConflictsArgs) -> Result<()> {
         i64,
         String,
         String,
-    )> = stmt
+    );
+    let rows: Vec<ConflictRow> = stmt
         .query_map([], |r| {
             Ok((
                 r.get(0)?,
