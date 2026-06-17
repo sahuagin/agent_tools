@@ -14,6 +14,8 @@
 //!   AGENT_MCP_ALLOW_WRITES=1           # enable mutating tools
 
 mod catalog;
+#[cfg(test)]
+mod integration_tests;
 mod invoke;
 mod schema;
 mod server;
