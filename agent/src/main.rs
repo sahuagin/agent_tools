@@ -1,6 +1,7 @@
 mod adjudicate;
 mod db;
 mod embed;
+mod forward;
 mod memory;
 mod metrics;
 mod tasks;
@@ -45,6 +46,13 @@ fn main() -> Result<()> {
     if argv.iter().any(|a| a == "--help-ai") {
         print_ai_help(&argv, argv.iter().any(|a| a == "--json"));
         return Ok(());
+    }
+
+    // Client mode: forward to a remote agent-mcp instead of the local DB when
+    // `--via-mcp <url>` (or AGENT_MCP_URL) is given. Handled before clap so the
+    // local DB/embedder are never opened in client mode.
+    if let Some((url, rest)) = forward::target(&argv) {
+        return forward::run(&url, &rest);
     }
 
     let cli = Cli::parse();
