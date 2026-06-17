@@ -1,0 +1,18 @@
+[package]
+name = "clap-catalog"
+version = "0.1.0"
+edition = "2021"
+license = "BSD-3-Clause"
+description = "Structured JSON catalog of a clap Command tree — 'autocomplete for machines' (MCP / agent tool discovery)."
+repository = "https://github.com/sahuagin/agent_tools"
+
+[lib]
+name = "clap_catalog"
+path = "src/lib.rs"
+
+[dependencies]
+clap = "4"
+serde_json = "1"
+
+[dev-dependencies]
+clap = { version = "4", features = ["derive"] }
