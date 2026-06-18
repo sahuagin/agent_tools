@@ -228,7 +228,7 @@ impl OpenRouterEmbedder {
 
 /// Resolve one setting: env var (per-invocation override) → `[section].key`
 /// in ~/.config/agent/config.toml → `None` (caller supplies the default).
-pub(crate) fn resolve_setting(section: &str, key: &str, env: &str) -> Option<String> {
+fn resolve_setting(section: &str, key: &str, env: &str) -> Option<String> {
     std::env::var(env)
         .ok()
         .filter(|s| !s.is_empty())
