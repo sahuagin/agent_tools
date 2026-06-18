@@ -35,10 +35,34 @@ api_key = "sk-or-v1-REPLACE-ME"
 base_url = "http://localhost:11434/v1"
 model = "qwen3-embedding:8b"
 dims = 4096
+# timeout_ms = 8000   # per-call HTTP read timeout; bounds the hang when the
+#                     # endpoint (e.g. an occupied ollama box) accepts the
+#                     # connection but never responds. Env: AGENT_EMBED_TIMEOUT_MS
 # Built-in defaults when this section is absent:
 # base_url = "https://openrouter.ai/api/v1"
 # model = "baai/bge-large-en-v1.5"
 # dims = 1024
+
+# ── Embedding fallback (at-7mp) ──────────────────────────────────────────────
+# OPTIONAL second embedder, tried only when [embed] above fails (timeout /
+# connection refused / 5xx). Strictly opt-in: omit this section and behavior is
+# unchanged. Use it to keep recall working when the primary (e.g. the local
+# ollama box) is occupied or down.
+#
+# How it stays correct: memory_embeddings keys vectors by (memory_id, model),
+# and recall filters by the model that produced the QUERY vector — so a
+# fallback in a different vector space never cross-matches the primary's rows.
+# For the fallback to return real semantic hits (not just empty), memories must
+# ALSO be embedded under this model: `agent memory reindex` now embeds under
+# EVERY configured embedder, and `agent memory add` dual-writes. If every
+# embedder is down, recall degrades to FTS lexical search rather than hanging.
+#
+# Env overrides: AGENT_EMBED_FALLBACK_BASE_URL / _MODEL / _DIMS / _TIMEOUT_MS
+# [embed.fallback]
+# base_url = "https://openrouter.ai/api/v1"   # OpenRouter serves /embeddings
+# model = "openai/text-embedding-3-small"      # 1536-dim; uses [openrouter].api_key
+# dims = 1536
+# timeout_ms = 15000
 
 # ── Write-time supersession adjudication ─────────────────────────────────────
 # On `agent memory add`, nominate the most-similar stored memories

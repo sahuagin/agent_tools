@@ -3141,14 +3141,45 @@ fn conflict_partners(scored: &[Scored]) -> Vec<Vec<String>> {
 }
 
 fn recall(conn: &Connection, args: RecallArgs) -> Result<()> {
-    let embedder = embed::select_embedder();
-    let model = embedder.model_id().to_string();
-
-    let query_vec = embedder
-        .embed(std::slice::from_ref(&args.query))?
-        .into_iter()
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("embedder returned no vector"))?;
+    // Try the primary embedder, then the configured fallback. `model` is
+    // whichever one produced the query vector, so the `e.model = ?` filter
+    // below always compares within a single vector space. If EVERY embedder is
+    // down (e.g. ollama busy AND OpenRouter unreachable), degrade to lexical
+    // FTS search rather than hanging or erroring — "return what it can." (at-7mp)
+    let (query_vec, model) = match embed::embed_query_with_fallback(&args.query) {
+        Some(pair) => pair,
+        None => {
+            eprintln!(
+                "recall: no embedder available (primary + fallback both failed); \
+                 falling back to FTS lexical search"
+            );
+            if args.json {
+                // Human-readable FTS output would corrupt stdout for
+                // programmatic consumers; surface a valid structured note
+                // instead and let them rerun without --json. (at-7mp)
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "model": "lexical-fallback",
+                        "query": args.query,
+                        "results": [],
+                        "error": "all embedders unavailable; rerun without --json for FTS lexical results",
+                    })
+                );
+                return Ok(());
+            }
+            return search(
+                conn,
+                SearchArgs {
+                    query: args.query.clone(),
+                    r#type: args.r#type.clone(),
+                    limit: args.k,
+                    scope: args.scope.clone(),
+                    author: None,
+                },
+            );
+        }
+    };
 
     let scope = ScopeFilter::for_explicit(args.scope.as_deref());
     let (scope_sql, scope_vals) = scope.sql_and("m.scope");
@@ -3633,7 +3664,20 @@ fn recall_stats(conn: &Connection, args: RecallStatsArgs) -> Result<()> {
 }
 
 fn reindex(conn: &Connection, args: ReindexArgs) -> Result<()> {
-    let embedder = embed::select_embedder();
+    // Reindex under every embedder in the chain so the fallback's
+    // (memory_id, model) rows are (re)built alongside the primary's — that
+    // parallel index is what lets recall match during a primary outage. (at-7mp)
+    for embedder in embed::embedder_chain() {
+        reindex_one(conn, &args, embedder.as_ref())?;
+    }
+    Ok(())
+}
+
+fn reindex_one(
+    conn: &Connection,
+    args: &ReindexArgs,
+    embedder: &dyn embed::Embedder,
+) -> Result<()> {
     let model = embedder.model_id().to_string();
 
     let row_to_tuple = |r: &rusqlite::Row| -> rusqlite::Result<(String, String, String, String)> {
