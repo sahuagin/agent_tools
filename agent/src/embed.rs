@@ -2,6 +2,15 @@ use anyhow::{anyhow, Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::time::Duration;
+
+/// Default per-call embedding HTTP read timeout (ms). Bounds the hang when the
+/// embedding endpoint (e.g. an occupied ollama box) accepts the connection but
+/// never responds. Override per-section via `timeout_ms` /
+/// `AGENT_EMBED[_FALLBACK]_TIMEOUT_MS`. (at-7mp)
+const DEFAULT_EMBED_TIMEOUT_MS: u64 = 8_000;
+/// Connect-phase timeout (ms) — bounds an unreachable host fast.
+const CONNECT_TIMEOUT_MS: u64 = 5_000;
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -124,53 +133,87 @@ pub struct OpenRouterEmbedder {
     model: String,
     base_url: String,
     dims: usize,
+    timeout_ms: u64,
 }
 
 impl OpenRouterEmbedder {
+    /// Primary embedder from the `[embed]` config section (env `AGENT_EMBED_*`
+    /// overrides). On this stack it points at the local ollama box; the same
+    /// OpenAI-compatible `/embeddings` shape also serves OpenRouter directly.
+    ///
+    /// Every setting resolves env var (per-invocation OVERRIDE) → `[embed]` in
+    /// ~/.config/agent/config.toml (source of truth) → code default
+    /// (at-supersession-activation-gf2.4).
+    ///
+    /// The api key resolves $OPENROUTER_API_KEY → `[openrouter].api_key`. Why
+    /// the config fallback: long-running parents (claude-code, pi) cache the
+    /// env value at spawn, so after a key rotation the running process keeps a
+    /// stale key and 401s on every embed; reading config.toml lets the rotated
+    /// key take effect without restarting every consumer. A non-OpenRouter
+    /// endpoint (local ollama) doesn't authenticate, so a missing key there is
+    /// fine ("unused").
     pub fn from_env() -> Option<Self> {
-        // Fallback chain for the api key:
-        //   1. $OPENROUTER_API_KEY   — process env (fast path)
-        //   2. ~/.config/agent/config.toml [openrouter].api_key
-        //
-        // Why fallback: long-running parent processes (claude-code,
-        // pi, anything inheriting env from the user's shell) cache
-        // the env value at spawn. After a key rotation, the env in
-        // the running process stays stale even though config.toml
-        // is updated. Subprocess invocations of `agent memory ...`
-        // (and any embedding-using path) inherit the stale env →
-        // 401s on every embedding call. Reading config.toml as
-        // fallback lets the rotated key take effect immediately
-        // without restarting every consumer.
-        // at-supersession-activation-gf2.4: every setting resolves
-        // env var (per-invocation OVERRIDE) → `[embed]` section of
-        // ~/.config/agent/config.toml (the source of truth) → code
-        // default. Endpoint/model/dims belong in config, not as
-        // standing shell exports — the key-rotation rationale above,
-        // generalized to the whole embedder configuration.
-        let model = std::env::var("AGENT_EMBED_MODEL")
-            .ok()
-            .filter(|s| !s.is_empty())
-            .or_else(|| read_config_toml_value("embed", "model"))
-            .unwrap_or_else(|| "baai/bge-large-en-v1.5".to_string());
-        let dims: usize = std::env::var("AGENT_EMBED_DIMS")
-            .ok()
-            .filter(|s| !s.is_empty())
-            .or_else(|| read_config_toml_value("embed", "dims"))
+        Self::from_section(
+            "embed",
+            "AGENT_EMBED",
+            "https://openrouter.ai/api/v1",
+            "baai/bge-large-en-v1.5",
+            1024,
+        )
+    }
+
+    /// Optional fallback embedder from `[embed.fallback]` (env
+    /// `AGENT_EMBED_FALLBACK_*`). Strictly opt-in: returns `None` unless the
+    /// section is configured (a `base_url` or `model` is present), so installs
+    /// without the section behave exactly as before. Defaults target
+    /// OpenRouter's `openai/text-embedding-3-small` (1536-dim). (at-7mp)
+    pub fn fallback_from_config() -> Option<Self> {
+        let configured = resolve_setting(
+            "embed.fallback",
+            "base_url",
+            "AGENT_EMBED_FALLBACK_BASE_URL",
+        )
+        .is_some()
+            || resolve_setting("embed.fallback", "model", "AGENT_EMBED_FALLBACK_MODEL").is_some();
+        if !configured {
+            return None;
+        }
+        Self::from_section(
+            "embed.fallback",
+            "AGENT_EMBED_FALLBACK",
+            "https://openrouter.ai/api/v1",
+            "openai/text-embedding-3-small",
+            1536,
+        )
+    }
+
+    /// Build an embedder from a config section + env prefix, applying the
+    /// env → config.toml → default resolution to every setting.
+    fn from_section(
+        section: &str,
+        env_prefix: &str,
+        default_base: &str,
+        default_model: &str,
+        default_dims: usize,
+    ) -> Option<Self> {
+        let model = resolve_setting(section, "model", &format!("{env_prefix}_MODEL"))
+            .unwrap_or_else(|| default_model.to_string());
+        let dims: usize = resolve_setting(section, "dims", &format!("{env_prefix}_DIMS"))
             .and_then(|s| s.parse().ok())
-            .unwrap_or(1024);
-        let base_url = std::env::var("AGENT_EMBED_BASE_URL")
-            .ok()
-            .filter(|s| !s.is_empty())
-            .or_else(|| read_config_toml_value("embed", "base_url"))
-            .unwrap_or_else(|| "https://openrouter.ai/api/v1".to_string());
+            .unwrap_or(default_dims);
+        let base_url = resolve_setting(section, "base_url", &format!("{env_prefix}_BASE_URL"))
+            .unwrap_or_else(|| default_base.to_string());
+        let timeout_ms: u64 =
+            resolve_setting(section, "timeout_ms", &format!("{env_prefix}_TIMEOUT_MS"))
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(DEFAULT_EMBED_TIMEOUT_MS);
         let api_key = std::env::var("OPENROUTER_API_KEY")
             .ok()
             .filter(|s| !s.is_empty())
             .or_else(read_openrouter_key_from_config_toml)
             .or_else(|| {
-                // A non-OpenRouter endpoint (local ollama, etc.) does
-                // not authenticate; a missing key must not disable
-                // local embedding. OpenRouter still requires one.
+                // A non-OpenRouter endpoint (local ollama, etc.) does not
+                // authenticate; a missing key must not disable local embedding.
                 (!base_url.contains("openrouter")).then(|| "unused".to_string())
             })?;
         Some(Self {
@@ -178,8 +221,18 @@ impl OpenRouterEmbedder {
             model,
             base_url,
             dims,
+            timeout_ms,
         })
     }
+}
+
+/// Resolve one setting: env var (per-invocation override) → `[section].key`
+/// in ~/.config/agent/config.toml → `None` (caller supplies the default).
+fn resolve_setting(section: &str, key: &str, env: &str) -> Option<String> {
+    std::env::var(env)
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or_else(|| read_config_toml_value(section, key))
 }
 
 /// Read `[openrouter].api_key` from `~/.config/agent/config.toml` as a
@@ -299,7 +352,15 @@ impl OpenRouterEmbedder {
         };
         let json = serde_json::to_value(&body)?;
 
-        let resp = match ureq::post(&url)
+        // Bounded timeouts so an occupied/unreachable endpoint fails fast
+        // instead of hanging the caller (recall used to block ~40s on a busy
+        // ollama box before returning empty). (at-7mp)
+        let agent = ureq::AgentBuilder::new()
+            .timeout_connect(Duration::from_millis(CONNECT_TIMEOUT_MS))
+            .timeout_read(Duration::from_millis(self.timeout_ms))
+            .build();
+        let resp = match agent
+            .post(&url)
             .set("Authorization", &format!("Bearer {}", key))
             .set("Content-Type", "application/json")
             .send_json(json)
@@ -355,6 +416,51 @@ pub fn select_embedder() -> Box<dyn Embedder> {
     }
 }
 
+/// The embedder chain: primary (`[embed]`) then the optional fallback
+/// (`[embed.fallback]`). Empty config falls back to the deterministic mock so
+/// wiring/tests still function. recall + the write path + reindex iterate this
+/// so the parallel `(memory_id, model)` index stays populated for every
+/// configured embedder. (at-7mp)
+pub fn embedder_chain() -> Vec<Box<dyn Embedder>> {
+    let mut chain: Vec<Box<dyn Embedder>> = Vec::new();
+    if let Some(e) = OpenRouterEmbedder::from_env() {
+        chain.push(Box::new(e));
+    }
+    if let Some(e) = OpenRouterEmbedder::fallback_from_config() {
+        chain.push(Box::new(e));
+    }
+    if chain.is_empty() {
+        chain.push(Box::new(MockEmbedder::new()));
+    }
+    chain
+}
+
+/// Embed a single query, trying each embedder in the chain (primary, then
+/// fallback) until one succeeds. Returns the vector AND the `model_id` that
+/// produced it — recall filters `memory_embeddings` by that model, so results
+/// are always compared within one vector space. Returns `None` only if EVERY
+/// embedder failed (e.g. ollama busy AND OpenRouter unreachable); the caller
+/// should then degrade to lexical search rather than hang. (at-7mp)
+pub fn embed_query_with_fallback(query: &str) -> Option<(Vec<f32>, String)> {
+    let input = [query.to_string()];
+    for embedder in embedder_chain() {
+        match embedder.embed(&input) {
+            Ok(mut vs) => {
+                if let Some(v) = vs.drain(..).next() {
+                    return Some((v, embedder.model_id().to_string()));
+                }
+            }
+            Err(e) => {
+                eprintln!(
+                    "info: embedder '{}' unavailable ({e:#}); trying next in chain",
+                    embedder.model_id()
+                );
+            }
+        }
+    }
+    None
+}
+
 // ── Storage helpers ──────────────────────────────────────────────────────────
 
 pub fn embed_one(conn: &Connection, embedder: &dyn Embedder, id: &str, text: &str) -> Result<bool> {
@@ -397,9 +503,16 @@ pub fn embed_one(conn: &Connection, embedder: &dyn Embedder, id: &str, text: &st
 }
 
 pub fn try_embed_one(conn: &Connection, id: &str, text: &str) {
-    let embedder = select_embedder();
-    if let Err(e) = embed_one(conn, embedder.as_ref(), id, text) {
-        eprintln!("warning: embedding failed for {id}: {e}");
+    // Dual-write: embed under every embedder in the chain so the fallback's
+    // (memory_id, model) rows stay populated and recall can match them during
+    // a primary-endpoint outage. Fail-open per embedder. (at-7mp)
+    for embedder in embedder_chain() {
+        if let Err(e) = embed_one(conn, embedder.as_ref(), id, text) {
+            eprintln!(
+                "warning: embedding ({}) failed for {id}: {e}",
+                embedder.model_id()
+            );
+        }
     }
 }
 
@@ -453,5 +566,33 @@ model = "decoy"
         );
         assert_eq!(read_toml_value_from_str(SAMPLE, "embed", "api_key"), None);
         assert_eq!(read_toml_value_from_str(SAMPLE, "missing", "model"), None);
+    }
+
+    #[test]
+    fn toml_reader_handles_dotted_fallback_section() {
+        // [embed.fallback] is a distinct flat section to the hand-rolled
+        // reader; keys must not bleed between it and [embed] either way. (at-7mp)
+        const S: &str = "\
+[embed]
+model = \"primary\"
+
+[embed.fallback]
+model = \"openai/text-embedding-3-small\"
+dims = 1536
+";
+        assert_eq!(
+            read_toml_value_from_str(S, "embed", "model").as_deref(),
+            Some("primary")
+        );
+        assert_eq!(
+            read_toml_value_from_str(S, "embed.fallback", "model").as_deref(),
+            Some("openai/text-embedding-3-small")
+        );
+        assert_eq!(
+            read_toml_value_from_str(S, "embed.fallback", "dims").as_deref(),
+            Some("1536")
+        );
+        // No bleed: [embed] has no `dims` key here.
+        assert_eq!(read_toml_value_from_str(S, "embed", "dims"), None);
     }
 }
