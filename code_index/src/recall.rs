@@ -111,6 +111,15 @@ impl Default for RecallTuning {
 ///    `/test/` (singular too), `/spec/`, ending in `_test.<ext>` or
 ///    `.test.<ext>` or `.spec.<ext>`.
 /// 3. Function/method name starts with `test_` or `should_`.
+/// 4. The chunk body carries a Rust test attribute: `#[test]`,
+///    `#[tokio::test]`, or `#[rstest]`. This catches inline
+///    `mod tests { #[test] fn descriptive_name() { ... } }` fns whose
+///    descriptive names and `src/`-rooted paths slip past 2 and 3, and
+///    whose parent `mod tests` chunk has been dropped (at-f5y oversize
+///    filter) so there is no module context to fall back on. The
+///    attribute sits directly above the fn, so it travels inside the
+///    captured chunk text — an unambiguous test signal regardless of
+///    name or path. See at-p4b.
 ///
 /// The combination misclassifies some non-test chunks (e.g. a function
 /// named `test_connection` that's part of real connection logic), but
@@ -122,6 +131,14 @@ pub(crate) fn looks_like_test(chunk: &Chunk) -> bool {
     }
     let name_lower = chunk.name.to_ascii_lowercase();
     if name_lower.starts_with("test_") || name_lower.starts_with("should_") {
+        return true;
+    }
+
+    // Rust test attributes travel inside the captured chunk body. An
+    // inline `#[test]` fn is unambiguously a test even when its name is
+    // descriptive and its path has no `tests` component.
+    let test_attrs = ["#[test]", "#[tokio::test]", "#[rstest]"];
+    if test_attrs.iter().any(|m| chunk.text.contains(m)) {
         return true;
     }
     let path_lower = chunk.file.to_string_lossy().to_ascii_lowercase();
@@ -616,5 +633,115 @@ mod tests {
         .unwrap();
         assert_eq!(hits.len(), 1, "test chunk should be filtered out");
         assert_eq!(hits[0].chunk.as_ref().unwrap().name, "compute_value");
+    }
+
+    #[test]
+    fn inline_mod_test_attribute_demotes_descriptive_test_below_real_source() {
+        // Regression for at-p4b. On flywheel-3p4 the inline test
+        // `shared_dispatch_unknown_tool_returns_invalid_request` — defined
+        // inside `mod tests { ... }` in src/extensions.rs — ranked #1 for
+        // "Unknown command dispatch error message" even after at-ix1's
+        // test-penalty tuning. It slips past every pre-existing signal:
+        // its name is descriptive (no `test_`/`should_` prefix), its path
+        // has no `tests` component, and its kind is Function (the parent
+        // `mod tests` chunk was dropped by the at-f5y oversize filter, so
+        // there is no module context to fall back on). The only
+        // unambiguous signal left is the `#[test]` attribute in the body.
+        let mut s = SqliteStore::open_in_memory().unwrap();
+        // Ordinary real-source chunk for the same query.
+        s.upsert_chunk(&Chunk {
+            id: ChunkId(0),
+            file: "src/extensions.rs".into(),
+            lines: 1..2,
+            kind: ChunkKind::Function,
+            name: "dispatch_unknown_tool".into(),
+            signature_hash: 0,
+            text: "dispatch unknown tool returns invalid request".into(),
+        })
+        .unwrap();
+        // Inline `mod tests` fn: descriptive name, src/ path, Function
+        // kind — a test ONLY by virtue of the `#[test]` attribute.
+        s.upsert_chunk(&Chunk {
+            id: ChunkId(0),
+            file: "src/extensions.rs".into(),
+            lines: 10..20,
+            kind: ChunkKind::Function,
+            name: "shared_dispatch_unknown_tool_returns_invalid_request".into(),
+            signature_hash: 0,
+            text: "#[test]\nfn shared_dispatch_unknown_tool_returns_invalid_request() { \
+                   dispatch unknown tool returns invalid request }"
+                .into(),
+        })
+        .unwrap();
+        let m = MockEmbedder::default();
+        embed_pending(&mut s, &m, 8).unwrap();
+
+        let query = "dispatch unknown tool returns invalid request";
+
+        // BEFORE the fix — modeled by disabling the penalty, since the
+        // sole effect of test-classification is the penalty: the inline
+        // test outranks the real source, exactly the flywheel-3p4 bug.
+        let pre = recall_tuned(
+            &s,
+            &m,
+            query,
+            5,
+            true,
+            RecallMode::Hybrid,
+            RecallTuning {
+                test_penalty: 1.0,
+                exclude_tests: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            pre[0].chunk.as_ref().unwrap().name,
+            "shared_dispatch_unknown_tool_returns_invalid_request",
+            "pre-fix: the un-penalized inline test ranks #1"
+        );
+
+        // AFTER the fix — the `#[test]` attribute classifies the inline fn
+        // as a test, so the default penalty demotes it below the ordinary
+        // chunk.
+        let post = recall_tuned(
+            &s,
+            &m,
+            query,
+            5,
+            true,
+            RecallMode::Hybrid,
+            RecallTuning::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            post[0].chunk.as_ref().unwrap().name,
+            "dispatch_unknown_tool",
+            "post-fix: real source ranks above the demoted inline test"
+        );
+
+        // The mechanism is the attribute, not name/path/kind: strip the
+        // attribute and the same chunk is no longer classified as a test;
+        // restore it and classification flips back on.
+        let without_attr = Chunk {
+            id: ChunkId(0),
+            file: "src/extensions.rs".into(),
+            lines: 10..20,
+            kind: ChunkKind::Function,
+            name: "shared_dispatch_unknown_tool_returns_invalid_request".into(),
+            signature_hash: 0,
+            text: "fn shared_dispatch_unknown_tool_returns_invalid_request() { unknown }".into(),
+        };
+        assert!(
+            !looks_like_test(&without_attr),
+            "control: descriptive name + src/ path + Function kind, no attribute → not a test"
+        );
+        let with_attr = Chunk {
+            text: "#[test]\nfn shared_dispatch_unknown_tool_returns_invalid_request() {}".into(),
+            ..without_attr
+        };
+        assert!(
+            looks_like_test(&with_attr),
+            "the #[test] attribute alone classifies the inline fn as a test"
+        );
     }
 }
