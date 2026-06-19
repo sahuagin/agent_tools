@@ -194,6 +194,39 @@ pub fn recall_with_mode(
     )
 }
 
+/// Candidate-window depth pulled from each retrieval source before
+/// fusion/truncation. Over-pulls past the caller's `k` for two reasons:
+///
+/// 1. Hybrid fusion: RRF needs more than `k` candidates per list so the
+///    merge has overlap to work with. 2x is the common heuristic — bounded
+///    cost, meaningful overlap.
+/// 2. Test filtering: when we'll drop some candidates we want enough left
+///    to still fill `k`. 4x is conservative (tests are typically <30% of a
+///    codebase's chunks, so 4x reliably hits `k` after filtering).
+///
+/// Decision at-hybrid-pool-k-noop-tz6 (A): this depth is UNIFORM across
+/// every `RecallMode` — Hybrid does NOT get a deeper multiplier. `mode` is
+/// taken (and deliberately ignored) so the mode-independence is part of the
+/// type contract: any future re-introduction of a divergent Hybrid branch
+/// has to touch this signature and trip `pool_depth_is_uniform_across_modes`.
+///
+/// Rationale: `RRF_K = 60` heavily damps intra-pool rank differences
+/// (`1/(60+1)=0.0164` at rank 1 vs `1/(60+40)=0.0100` at rank 4k), so what
+/// promotes a chunk is appearing in *both* lists (~0.033) rather than depth
+/// within one. The fusion gain past 2x–4x therefore has steep diminishing
+/// returns, and unlike every other tuning constant in this file (at-ix1,
+/// at-p4b) there is no benchmarked recall gap to justify the extra
+/// vector-scan + per-candidate `get_chunk` cost a deeper pool would incur.
+fn pool_depth(k: usize, mode: RecallMode, tuning: &RecallTuning) -> usize {
+    let _ = mode; // mode-independent by decision A; see doc comment.
+    let scale = if tuning.exclude_tests || tuning.test_penalty < 1.0 {
+        4
+    } else {
+        2
+    };
+    k.saturating_mul(scale).max(k)
+}
+
 pub fn recall_tuned(
     store: &dyn Store,
     embedder: &dyn Embedder,
@@ -203,25 +236,7 @@ pub fn recall_tuned(
     mode: RecallMode,
     tuning: RecallTuning,
 ) -> Result<Vec<Hit>> {
-    // For hybrid we deliberately pull a wider window from each side
-    // than the caller's k so RRF has more candidates to fuse over.
-    // 2x the requested k is a common heuristic; keeps cost bounded
-    // while giving the merge meaningful overlap to work with.
-    //
-    // We also OVER-PULL when test filtering is active — if we'll drop
-    // some fraction of candidates, we want enough left to fill the
-    // requested k. 4x is conservative; tests are typically <30% of a
-    // codebase's chunks so 4x ensures we still hit k after filtering.
-    let scale = if tuning.exclude_tests || tuning.test_penalty < 1.0 {
-        4
-    } else {
-        2
-    };
-    // NOTE: a vestigial `if Hybrid` branch here computed the same value in
-    // both arms (clippy::if_same_then_else); collapsed behavior-neutrally.
-    // Whether Hybrid should over-pull a *deeper* pool for RRF overlap is
-    // tracked in at-hybrid-pool-k-noop-tz6.
-    let pool_k = k.saturating_mul(scale).max(k);
+    let pool_k = pool_depth(k, mode, &tuning);
 
     let semantic = match mode {
         RecallMode::Lexical => Vec::new(),
@@ -499,6 +514,64 @@ mod tests {
         let m = MockEmbedder::default();
         let hits = recall(&s, &m, "anything", 10, true).unwrap();
         assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn pool_depth_is_uniform_across_modes() {
+        // Pins decision at-hybrid-pool-k-noop-tz6 (A): the candidate-window
+        // depth is identical for every RecallMode — Hybrid gets NO deeper
+        // pool. Fails if a future change re-introduces a divergent Hybrid
+        // branch or alters the 2x/4x scale constants.
+        let k = 10;
+        let modes = [
+            RecallMode::Semantic,
+            RecallMode::Lexical,
+            RecallMode::Hybrid,
+        ];
+
+        // No test filtering → scale 2, identical across modes.
+        let no_filter = RecallTuning {
+            test_penalty: 1.0,
+            exclude_tests: false,
+        };
+        for mode in modes {
+            assert_eq!(
+                pool_depth(k, mode, &no_filter),
+                2 * k,
+                "scale=2 when no test filtering, mode={mode:?}"
+            );
+        }
+
+        // Test filtering active (either penalty<1.0 or exclude_tests) →
+        // scale 4, still identical across modes.
+        let penalized = RecallTuning {
+            test_penalty: 0.5,
+            exclude_tests: false,
+        };
+        let excluded = RecallTuning {
+            test_penalty: 1.0,
+            exclude_tests: true,
+        };
+        for tuning in [penalized, excluded] {
+            for mode in modes {
+                assert_eq!(
+                    pool_depth(k, mode, &tuning),
+                    4 * k,
+                    "scale=4 when test filtering active, mode={mode:?}"
+                );
+            }
+        }
+
+        // The contract the decision pins explicitly: Hybrid is NOT deeper
+        // than the single-source modes for the same k and tuning.
+        assert_eq!(
+            pool_depth(k, RecallMode::Hybrid, &no_filter),
+            pool_depth(k, RecallMode::Semantic, &no_filter),
+            "Hybrid must not over-pull a deeper pool than other modes (decision A)"
+        );
+
+        // k=0 floor stays well-defined via .max(k).
+        assert_eq!(pool_depth(0, RecallMode::Hybrid, &no_filter), 0);
     }
 
     // ── test-tuning suite ──────────────────────────────────────────
