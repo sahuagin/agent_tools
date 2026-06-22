@@ -1,0 +1,116 @@
+#!/bin/sh
+# sprint-start — claim a bead + enter a unique jj workspace, atomically.
+#
+# The enforcement is correct-by-construction: there is no way to run this and
+# end up in the shared workspace or on a bead another session already holds.
+#   - beads claim is atomic mutual exclusion (REFUSES if assigned elsewhere).
+#   - the claim always targets the canonical beadsd service (sprint-lib resolves it).
+#   - a fresh per-bead jj workspace gives file-level isolation from siblings.
+#
+# Usage:
+#   sprint-start <bead-id>            claim the bead, workspace <repo>-<bead>
+#   sprint-start --no-bead <label>    no claim (or no-beads repo), workspace <repo>-<label>
+#   sprint-start <bead> --base <rev>  base the workspace on <rev> (default: trunk)
+#   sprint-start <bead> --as <name>   register <name> as a unique etcd session
+#                                     identity + use it as the beads claim actor
+#
+# Run it from anywhere inside the target repo. It prints the `cd` to run.
+set -eu
+. "$HOME/.local/lib/sprint-lib.sh"
+
+die() { printf 'sprint-start: %s\n' "$1" >&2; exit 1; }
+
+BEAD=""; LABEL=""; BASE=""; AS_NAME=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --no-bead) shift; [ $# -gt 0 ] || die "--no-bead needs a label"; LABEL="$1" ;;
+        --base) shift; [ $# -gt 0 ] || die "--base needs a revset"; BASE="$1" ;;
+        --as) shift; [ $# -gt 0 ] || die "--as needs a name"; AS_NAME="$1" ;;
+        -h|--help) sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -*) die "unknown flag: $1" ;;
+        *) [ -z "$BEAD" ] || die "unexpected arg: $1"; BEAD="$1" ;;
+    esac
+    shift
+done
+[ -n "$BEAD" ] || [ -n "$LABEL" ] || die "give a <bead-id> or --no-bead <label>"
+[ -z "$BEAD" ] || [ -z "$LABEL" ] || die "give a bead OR --no-bead, not both"
+
+ROOT=$(backing_root) || die "not inside a jj repo"
+[ -n "$ROOT" ] || die "could not resolve backing repo root"
+REPO=$(basename "$ROOT")
+
+# --- identity ---
+# With --as, the operator's chosen name becomes a registered, mutually-exclusive
+# etcd session identity (refuses if another LIVE session holds it) AND the
+# beads claim actor — one registry unifying claude sessions and agents.
+# Register BEFORE claiming so a name collision fails fast, before any mutation.
+# Without --as, fall back to the auto per-session actor (no etcd registration).
+REGISTERED=0
+if [ -n "$AS_NAME" ]; then
+    command -v agent-slot >/dev/null 2>&1 || die "--as needs 'agent-slot' on PATH"
+    if ! reg=$(agent-slot register "$AS_NAME" 2>&1); then
+        die "could not register session name '$AS_NAME' (held by a live session?): $reg"
+    fi
+    ACTOR="$AS_NAME"
+    REGISTERED=1
+    printf 'sprint-start: registered session identity %s\n' "$AS_NAME" >&2
+else
+    ACTOR=$(session_actor)
+    [ -n "${CLAUDE_CODE_SESSION_ID:-}" ] || \
+        printf 'sprint-start: warning: no CLAUDE_CODE_SESSION_ID; actor=%s (pid-based)\n' "$ACTOR" >&2
+fi
+
+# token = the workspace-name suffix; sanitize to a safe single path token.
+TOKEN=$(printf '%s' "${BEAD:-$LABEL}" | tr -c 'A-Za-z0-9._-' '-')
+WS="$(dirname "$ROOT")/${REPO}-${TOKEN}"
+
+# --- claim (bead mode only) ---
+if [ -n "$BEAD" ]; then
+    ENDPOINT=$(beads_endpoint "$REPO")
+    if [ -n "$ENDPOINT" ]; then
+        # Centralized: claim through the single-writer beadsd service. `beads`
+        # exits non-zero on a claim conflict (already held by another actor).
+        if ! out=$(beads --url "$ENDPOINT" claim "$BEAD" --actor "$ACTOR" 2>&1); then
+            # Idempotent resume: if WE already hold it, that's fine.
+            held=$(beads --url "$ENDPOINT" show "$BEAD" 2>/dev/null | \
+                python3 -c "import json,sys;i=json.load(sys.stdin);i=i if isinstance(i,dict) else i[0];print(i.get('assignee') or '')" 2>/dev/null || true)
+            if [ "$held" = "$ACTOR" ]; then
+                printf 'sprint-start: %s already claimed by this session — resuming.\n' "$BEAD" >&2
+            else
+                die "claim failed: $out"
+            fi
+        fi
+    else
+        # `beads` is the beadsd service client — it has no local-DB mode. A repo
+        # with no beadsd endpoint can't be bead-claimed here: centralize it into
+        # beadsd (add it to ~/.config/beads/remotes.env) or run no-claim work
+        # with --no-bead.
+        die "repo $REPO is not centralized into beadsd (no endpoint in ~/.config/beads/remotes.env) — centralize it, or use: sprint-start --no-bead <label>"
+    fi
+fi
+
+# --- workspace ---
+if [ -e "$WS" ]; then
+    # Idempotent resume: only if it's genuinely a jj workspace backed by THIS repo.
+    if [ -e "$WS/.jj" ] && [ "$(backing_root "$WS")" = "$ROOT" ]; then
+        printf 'sprint-start: workspace already exists — resuming.\n' >&2
+    else
+        die "path $WS exists and is not a workspace of $REPO — refusing to touch it"
+    fi
+else
+    BASE="${BASE:-$(cd "$ROOT" && trunk_rev)}"
+    ( cd "$ROOT" && jj workspace add "$WS" >/dev/null 2>&1 ) || die "jj workspace add failed"
+    ( cd "$WS" && jj new "$BASE" >/dev/null 2>&1 ) || die "jj new $BASE failed in workspace"
+fi
+
+# Record the actor (+ whether it's a registered etcd name) so sprint-end
+# releases with the SAME actor the bead was claimed with.
+sprint_write_actor "$WS" "$ACTOR" "$REGISTERED"
+
+# --- record the pairing in the shared task log (best-effort) ---
+agent task create --cwd "$WS" \
+    --objective "sprint-start ${BEAD:-$LABEL} ($REPO) [sprint,$REPO,${TOKEN}] claimed=${BEAD:-none} actor=$ACTOR ws=$WS" >/dev/null 2>&1 || true
+
+printf '\n  repo:      %s\n  bead:      %s\n  actor:     %s\n  workspace: %s\n\n' \
+    "$REPO" "${BEAD:-<none, label=$LABEL>}" "$ACTOR" "$WS"
+printf 'cd %s\n' "$WS"

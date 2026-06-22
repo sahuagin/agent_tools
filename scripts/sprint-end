@@ -1,0 +1,118 @@
+#!/bin/sh
+# sprint-end — release a sprint's bead + tear down its jj workspace.
+#
+# Conservative by default: UNCLAIMS (assignee cleared, status -> open) but does
+# NOT close. Closing is a deliberate act (a false auto-close to a durable record
+# is exactly the failure this whole effort exists to prevent), so it requires
+# --close. Refuses while the workspace has uncommitted changes unless --force.
+#
+# Usage:
+#   sprint-end                 release the bead for the CURRENT workspace
+#   sprint-end <bead-id>       release a specific bead's workspace
+#   sprint-end --close         close the bead instead of unclaiming it
+#   sprint-end --keep          unclaim/close but DON'T delete the workspace dir
+#   sprint-end --keep-name     DON'T unregister the etcd session identity
+#                              (keep it for further sprints in this session)
+#   sprint-end --force         proceed even if the workspace is dirty
+#
+# Run from inside the workspace (or anywhere, with <bead-id>). If the sprint was
+# started with --as <name>, that etcd identity is unregistered here by default.
+set -eu
+. "$HOME/.local/lib/sprint-lib.sh"
+
+die() { printf 'sprint-end: %s\n' "$1" >&2; exit 1; }
+
+BEAD=""; MODE="unclaim"; KEEP=0; FORCE=0; KEEPNAME=0
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --close) MODE="close" ;;
+        --unclaim) MODE="unclaim" ;;
+        --keep) KEEP=1 ;;
+        --keep-name) KEEPNAME=1 ;;
+        --force) FORCE=1 ;;
+        -h|--help) sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -*) die "unknown flag: $1" ;;
+        *) [ -z "$BEAD" ] || die "unexpected arg: $1"; BEAD="$1" ;;
+    esac
+    shift
+done
+
+ROOT=$(backing_root) || die "not inside a jj repo"
+REPO=$(basename "$ROOT")
+
+# Identify the workspace. If a bead was named, derive its workspace dir;
+# otherwise use the current one (must be a secondary workspace, not backing).
+if [ -n "$BEAD" ]; then
+    TOKEN=$(printf '%s' "$BEAD" | tr -c 'A-Za-z0-9._-' '-')
+    WS="$(dirname "$ROOT")/${REPO}-${TOKEN}"
+else
+    WS=$(jj root 2>/dev/null) || die "could not resolve current workspace"
+    [ "$WS" != "$ROOT" ] || die "you are in the backing workspace; pass a <bead-id> or cd into a sprint workspace"
+    # recover bead/token from the workspace dir name: <repo>-<token>
+    TOKEN=$(basename "$WS" | sed "s/^${REPO}-//")
+    # Is that token a real bead in beadsd? If so, release it below.
+    _ep=$(beads_endpoint "$REPO")
+    if [ -n "$_ep" ] && beads --url "$_ep" show "$TOKEN" >/dev/null 2>&1; then BEAD="$TOKEN"; else BEAD=""; fi
+fi
+
+# Resolve the actor from the workspace sidecar so the RELEASE uses the SAME actor
+# as the CLAIM — a bead claimed via --as <name> must be released by that name,
+# not the auto session_actor (which would mismatch and refuse the release).
+ACTOR=$(sprint_actor "$WS")
+REGISTERED=$(sprint_registered "$WS")
+
+# Dirty-state guard.
+if [ -d "$WS" ]; then
+    dirty=$( ( cd "$WS" && jj status 2>/dev/null ) | grep -c '^[AMDR] ' || true )
+    if [ "${dirty:-0}" -gt 0 ] && [ "$FORCE" -eq 0 ]; then
+        die "workspace $WS has uncommitted changes; commit them or pass --force"
+    fi
+fi
+
+# Release the bead, only if it's actually ours.
+if [ -n "$BEAD" ]; then
+    ENDPOINT=$(beads_endpoint "$REPO")
+    if [ -n "$ENDPOINT" ]; then
+        # Centralized: release through the beadsd service.
+        held=$(beads --url "$ENDPOINT" show "$BEAD" 2>/dev/null | \
+            python3 -c "import json,sys;i=json.load(sys.stdin);i=i if isinstance(i,dict) else i[0];print(i.get('assignee') or '')" 2>/dev/null || true)
+        if [ -n "$held" ] && [ "$held" != "$ACTOR" ]; then
+            die "bead $BEAD is held by '$held', not this session — refusing to release it"
+        fi
+        if [ "$MODE" = "close" ]; then
+            beads --url "$ENDPOINT" close "$BEAD" --reason "sprint-end" --actor "$ACTOR" >/dev/null 2>&1 \
+                && printf 'sprint-end: closed %s\n' "$BEAD"
+        else
+            beads --url "$ENDPOINT" unclaim "$BEAD" --actor "$ACTOR" >/dev/null 2>&1 \
+                && printf 'sprint-end: unclaimed %s (back to open)\n' "$BEAD"
+        fi
+    fi
+fi
+
+# Drop the etcd session identity (default) unless asked to keep it for further
+# sprints. Best-effort and idempotent: unregister only removes our own name, and
+# the lease would self-expire regardless.
+if [ "$REGISTERED" = "1" ] && [ "$KEEPNAME" -eq 0 ]; then
+    if command -v agent-slot >/dev/null 2>&1; then
+        agent-slot unregister "$ACTOR" >/dev/null 2>&1 \
+            && printf 'sprint-end: unregistered session identity %s\n' "$ACTOR"
+    fi
+fi
+
+# Tear down the workspace (must not be standing in it when we forget+rm).
+# jj names a workspace after the last path component at `jj workspace add` time,
+# so the workspace name == basename of the dir (verified 2026-05-31).
+if [ "$KEEP" -eq 0 ] && [ -d "$WS" ]; then
+    if [ -e "$WS/.jj" ] && [ "$(backing_root "$WS")" = "$ROOT" ]; then
+        ( cd "$ROOT" && jj workspace forget "$(basename "$WS")" >/dev/null 2>&1 ) || true
+        rm -rf "$WS"
+        sprint_clear_actor "$WS"
+        printf 'sprint-end: removed workspace %s\n' "$WS"
+        printf 'cd %s\n' "$ROOT"
+    else
+        die "refusing to rm $WS — not a workspace of $REPO"
+    fi
+fi
+
+agent task create --cwd "$ROOT" \
+    --objective "sprint-end ${BEAD:-$TOKEN} ($REPO) [sprint,$REPO,${TOKEN},end] mode=$MODE bead=${BEAD:-none} actor=$ACTOR (completed)" >/dev/null 2>&1 || true
