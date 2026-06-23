@@ -221,32 +221,34 @@ struct ErrorBody {
     code: Option<i64>,
 }
 
-/// Hand-rolled `[openrouter].api_key` parser over `~/.config/agent/config.toml`.
-/// Mirrors agent::embed's helper of the same name. Returns `None` on any
-/// failure (file missing, key missing, permissions). No `toml` crate dep.
-fn read_openrouter_key_from_config_toml() -> Option<String> {
+/// Read `[section].key` from `~/.config/agent/config.toml`. Hand-rolled flat
+/// mini-parser (bracketed sections, `key = "value"` pairs; no nesting/arrays)
+/// so we add no `toml` crate dep. Mirrors `agent::embed::read_config_toml_value`.
+/// Returns `None` on any failure (file missing, key missing, permissions).
+pub fn read_config_toml_value(section: &str, key: &str) -> Option<String> {
     let home = std::env::var("HOME").ok()?;
     let path: PathBuf = format!("{}/.config/agent/config.toml", home).into();
     let content = std::fs::read_to_string(&path).ok()?;
 
-    let mut in_openrouter = false;
+    let header = format!("[{section}]");
+    let mut in_section = false;
     for raw in content.lines() {
         let line = raw.trim();
         if line.starts_with('#') || line.is_empty() {
             continue;
         }
         if line.starts_with('[') && line.ends_with(']') {
-            in_openrouter = line == "[openrouter]";
+            in_section = line == header;
             continue;
         }
-        if !in_openrouter {
+        if !in_section {
             continue;
         }
-        let (key, value) = match line.split_once('=') {
+        let (k, value) = match line.split_once('=') {
             Some(p) => p,
             None => continue,
         };
-        if key.trim() != "api_key" {
+        if k.trim() != key {
             continue;
         }
         let value = value.split('#').next().unwrap_or("").trim();
@@ -259,6 +261,11 @@ fn read_openrouter_key_from_config_toml() -> Option<String> {
         return Some(stripped.to_string());
     }
     None
+}
+
+/// `[openrouter].api_key` convenience wrapper over [`read_config_toml_value`].
+fn read_openrouter_key_from_config_toml() -> Option<String> {
+    read_config_toml_value("openrouter", "api_key")
 }
 
 // ──────────────────────────────────────────────────────────────────────────
