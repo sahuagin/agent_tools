@@ -56,10 +56,13 @@ pub fn catalog_scoped<C: CommandFactory>(path: &[&str]) -> Value {
     command_to_json(node, &full.join(" "))
 }
 
-/// Recursively render a clap `Command` as a structured JSON spec: `name`, full
-/// invocation `path`, `about`, `aliases`, `invokable` (true for leaves — the
-/// nodes a tool layer maps to a callable tool), `args`, and nested
-/// `subcommands`.
+/// Recursively render a clap `Command` as the `--help-ai` superset
+/// (crates/t4c/docs/help-ai-standard.md): `name`, discovery-facing `summary`
+/// (from clap's `about`; also emitted as `about` for back-compat), full
+/// invocation `path`, `aliases`, `invokable` (true for leaves — the nodes a tool
+/// layer maps to a callable tool), rich `args`, and nested `subcommands`.
+/// (`keywords` / `output_schema` have no clap source, so they're left to a
+/// hand-rolled emitter; unknown fields are forward-compatible regardless.)
 pub fn command_to_json(cmd: &Command, path: &str) -> Value {
     let args: Vec<Value> = cmd
         .get_arguments()
@@ -83,7 +86,12 @@ pub fn command_to_json(cmd: &Command, path: &str) -> Value {
     obj.insert("name".into(), json!(cmd.get_name()));
     obj.insert("path".into(), json!(path));
     if let Some(about) = cmd.get_about() {
-        obj.insert("about".into(), json!(about.to_string()));
+        let about = about.to_string();
+        // The superset standard's discovery-facing field is `summary` (NOT clap's
+        // native `about`). Emit `summary` as the canonical name; keep `about` too
+        // so existing clap-catalog consumers don't break.
+        obj.insert("summary".into(), json!(about.clone()));
+        obj.insert("about".into(), json!(about));
     }
     let aliases: Vec<String> = cmd.get_all_aliases().map(str::to_string).collect();
     if !aliases.is_empty() {
@@ -227,6 +235,25 @@ mod tests {
         // positional
         let q = args.iter().find(|a| a["name"] == "query").unwrap();
         assert_eq!(q["positional"], true);
+    }
+
+    #[test]
+    fn summary_aliases_about() {
+        // The superset standard's discovery-facing field is `summary`;
+        // clap-catalog emits it from clap's `about` and keeps `about` for
+        // back-compat (the two carry the same value).
+        let c = catalog::<Cli>();
+        let mem = c["subcommands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["name"] == "memory")
+            .unwrap();
+        assert_eq!(mem["summary"], "Memory things");
+        assert_eq!(mem["about"], "Memory things");
+        // a nested leaf carries its own summary
+        let add = catalog_scoped::<Cli>(&["memory", "add"]);
+        assert_eq!(add["summary"], "Add a memory");
     }
 
     #[test]
