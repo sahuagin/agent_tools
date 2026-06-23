@@ -1,0 +1,95 @@
+#!/usr/bin/env bash
+# jj-orphan-audit — categorize jj loose heads vs a base revision
+#
+# For each non-empty loose head (a head not reachable from --base), report:
+#   [LANDED]      loose head's substantive files match base content
+#   [DIVERGENT]   loose head has files that differ from base, or new files
+#                 not in base (potentially lost work)
+#   [BEAD-ONLY]   only modifies bead/briefing/morning files (safe noise)
+#
+# Files filtered as noise (never affect classification):
+#   .beads/**, *.jsonl, MORNING_*, docs/MORNING_*, docs/process/MORNING_*,
+#   worktrees/**, .claude/**
+#
+# Usage:
+#   jj-orphan-audit                          # all loose heads vs main@origin
+#   jj-orphan-audit --base <rev>             # different base
+#   jj-orphan-audit -r <rev1> -r <rev2> ...  # specific revs only
+#   jj-orphan-audit --verbose                # show line-counts for diffs
+
+set -uo pipefail
+
+base="main@origin"
+revs=()
+verbose=0
+
+usage() {
+  sed -n '2,/^$/p' "$0" | sed 's/^# \?//'
+  exit "${1:-0}"
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --base)    base="$2"; shift 2 ;;
+    -r)        revs+=("$2"); shift 2 ;;
+    --verbose) verbose=1; shift ;;
+    -h|--help) usage 0 ;;
+    *)         echo "unknown arg: $1" >&2; usage 2 ;;
+  esac
+done
+
+if [ ${#revs[@]} -eq 0 ]; then
+  mapfile -t revs < <(jj log -r "heads(all() ~ ::${base}) & ~empty()" --no-graph \
+      -T 'change_id.short(12) ++ "\n"' 2>/dev/null)
+fi
+
+NOISE_RE='^\.beads/|\.jsonl$|^MORNING_|^docs/MORNING_|^docs/process/MORNING_|^worktrees/|^\.claude/'
+
+for ch in "${revs[@]}"; do
+  [ -z "$ch" ] && continue
+  desc=$(jj log -r "$ch" --no-graph -T 'description.first_line()' 2>/dev/null | head -c 90)
+
+  files=$(jj diff --git -r "$ch" 2>/dev/null \
+      | grep -E '^diff --git' | awk '{print $4}' | sed 's|^b/||')
+  substantive=$(echo "$files" | grep -vE "$NOISE_RE" | grep -v '^$' || true)
+
+  if [ -z "$substantive" ]; then
+    printf '[BEAD-ONLY] %-13s %s\n' "$ch" "$desc"
+    continue
+  fi
+
+  divergent=()
+  new_files=()
+  while IFS= read -r f; do
+    [ -z "$f" ] && continue
+    if ! jj file show -r "$base" "$f" >/dev/null 2>&1; then
+      if jj file show -r "$ch" "$f" >/dev/null 2>&1; then
+        new_files+=("$f")
+      fi
+      continue
+    fi
+    d=$(diff <(jj file show -r "$ch" "$f" 2>/dev/null) \
+             <(jj file show -r "$base" "$f" 2>/dev/null) | wc -l | tr -d ' ')
+    if [ "$d" -gt 0 ]; then
+      if [ "$verbose" -eq 1 ]; then
+        divergent+=("$f ($d-line diff)")
+      else
+        divergent+=("$f")
+      fi
+    fi
+  done <<< "$substantive"
+
+  if [ ${#divergent[@]} -eq 0 ] && [ ${#new_files[@]} -eq 0 ]; then
+    printf '[LANDED]    %-13s %s\n' "$ch" "$desc"
+  else
+    printf '[DIVERGENT] %-13s %s\n' "$ch" "$desc"
+    if [ ${#new_files[@]} -gt 0 ]; then
+      printf '              files not in %s:\n' "$base"
+      for f in "${new_files[@]}"; do printf '                %s\n' "$f"; done
+    fi
+    if [ ${#divergent[@]} -gt 0 ]; then
+      printf '              files differ from %s:\n' "$base"
+      for d in "${divergent[@]}"; do printf '                %s\n' "$d"; done
+    fi
+  fi
+done
