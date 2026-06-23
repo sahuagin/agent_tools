@@ -1,7 +1,9 @@
 mod adjudicate;
 mod db;
+mod dialogue;
 mod embed;
 mod forward;
+mod mcp;
 mod memory;
 mod metrics;
 mod tasks;
@@ -28,6 +30,8 @@ enum Command {
     Task(tasks::TaskCmd),
     /// Metrics: record-completion, record-usage, report, list
     Metrics(metrics::MetricsCmd),
+    /// Inter-agent dialogue over the mu-dialogue MCP: watch, poll, say, peers
+    Dialogue(dialogue::DialogueCmd),
     /// Print path to agent.sqlite
     DbPath,
 }
@@ -57,18 +61,17 @@ fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
-    if let Command::DbPath = cli.command {
-        println!("{}", db::db_path().display());
-        return Ok(());
-    }
-
-    let conn = db::open()?;
-
+    // DbPath and Dialogue never touch the local DB — handle them without opening
+    // it (Dialogue talks to a remote mu-dialogue MCP, like a thin client).
     match cli.command {
-        Command::Memory(cmd) => memory::run(conn, cmd),
-        Command::Task(cmd) => tasks::run(conn, cmd),
-        Command::Metrics(cmd) => metrics::run(conn, cmd),
-        Command::DbPath => unreachable!(),
+        Command::DbPath => {
+            println!("{}", db::db_path().display());
+            Ok(())
+        }
+        Command::Dialogue(cmd) => dialogue::run(cmd),
+        Command::Memory(cmd) => memory::run(db::open()?, cmd),
+        Command::Task(cmd) => tasks::run(db::open()?, cmd),
+        Command::Metrics(cmd) => metrics::run(db::open()?, cmd),
     }
 }
 
@@ -138,6 +141,7 @@ fn ai_text(group: &str, sub: &str) -> &'static str {
         ("metrics", "report") => METRICS_REPORT_AI,
         ("metrics", "list") => METRICS_LIST_AI,
         ("metrics", _) => METRICS_OVERVIEW_AI,
+        ("dialogue", _) => DIALOGUE_AI,
         ("db-path", _) => DBPATH_AI,
         _ => ROOT_AI,
     }
@@ -167,6 +171,7 @@ GROUPS
            rebuild-index/reindex/export/migrate
   task     create/update/list/show/resume
   metrics  record-completion/record-usage/report/list
+  dialogue watch/poll/say/peers — inter-agent mailbox (mu-dialogue MCP)
   db-path  print path to agent.sqlite
 
 DETAIL
@@ -428,6 +433,25 @@ const METRICS_LIST_AI: &str = "\
 
 USAGE
   agent metrics list [--limit N]";
+
+const DIALOGUE_AI: &str = "\
+# agent dialogue — inter-agent mailbox over mu-dialogue MCP (agent-oriented help)
+
+ACTIONS
+  watch  long-poll for new messages to <id>; print one line per NEW message
+         (built to run under a Monitor — wakes the agent only when a peer writes)
+  poll   one-shot poll; print the raw {messages:[...]} JSON
+  say    send a message (--from --to --content [--thread])
+  peers  list peers on the channel
+
+USAGE
+  agent dialogue watch cc:$CLAUDE_CODE_SESSION_ID
+  agent dialogue say --from cc:<me> --to cc:<peer> --content \"...\"
+
+NOTES
+  Endpoint: --url, else AGENT_DIALOGUE_URL, else the deployed server. A thin
+  sync MCP client (ureq); no local DB. watch keeps a `since` watermark so each
+  message surfaces once.";
 
 const DBPATH_AI: &str = "\
 # agent db-path — print the store path

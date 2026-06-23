@@ -9,9 +9,9 @@
 
 use std::collections::HashMap;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, bail, Result};
 use clap::CommandFactory;
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value};
 
 use crate::Cli;
 
@@ -37,7 +37,7 @@ pub fn target(argv: &[String]) -> Option<(String, Vec<String>)> {
 /// Map argv → tool call, invoke the remote, print the result text.
 pub fn run(url: &str, args: &[String]) -> Result<()> {
     let (tool, arguments) = map_invocation(args)?;
-    let text = call_tool(url, &tool, arguments)?;
+    let text = crate::mcp::call_tool(url, &tool, arguments, None)?;
     println!("{text}");
     Ok(())
 }
@@ -175,86 +175,10 @@ fn put(arguments: &mut Map<String, Value>, name: &str, multiple: bool, val: Valu
     }
 }
 
-const ACCEPT: &str = "application/json, text/event-stream";
-
-/// Minimal synchronous MCP-over-streamable-HTTP client: initialize (capturing
-/// the session id) → notifications/initialized → tools/call → result text.
-fn call_tool(url: &str, tool: &str, arguments: Value) -> Result<String> {
-    let init = json!({
-        "jsonrpc":"2.0","id":1,"method":"initialize","params":{
-            "protocolVersion":"2025-03-26","capabilities":{},
-            "clientInfo":{"name":"agent-cli","version":env!("CARGO_PKG_VERSION")}
-        }
-    });
-    let resp = ureq::post(url)
-        .set("Content-Type", "application/json")
-        .set("Accept", ACCEPT)
-        .send_json(init)
-        .map_err(|e| anyhow!("initialize failed: {e}"))?;
-    let session = resp.header("mcp-session-id").map(String::from);
-    read_sse_result(resp)?; // drain the initialize result
-
-    let mut notif = ureq::post(url)
-        .set("Content-Type", "application/json")
-        .set("Accept", ACCEPT);
-    if let Some(s) = &session {
-        notif = notif.set("Mcp-Session-Id", s);
-    }
-    let _ = notif.send_json(json!({"jsonrpc":"2.0","method":"notifications/initialized"}));
-
-    let mut call = ureq::post(url)
-        .set("Content-Type", "application/json")
-        .set("Accept", ACCEPT);
-    if let Some(s) = &session {
-        call = call.set("Mcp-Session-Id", s);
-    }
-    let resp = call
-        .send_json(json!({
-            "jsonrpc":"2.0","id":2,"method":"tools/call",
-            "params":{"name":tool,"arguments":arguments}
-        }))
-        .map_err(|e| anyhow!("tools/call failed: {e}"))?;
-    let result = read_sse_result(resp)?;
-
-    let text = result
-        .get("content")
-        .and_then(Value::as_array)
-        .and_then(|c| c.first())
-        .and_then(|c| c.get("text"))
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string();
-    if result
-        .get("isError")
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-    {
-        bail!("{text}");
-    }
-    Ok(text)
-}
-
-/// Extract the JSON-RPC `result` from a streamable-HTTP response (SSE `data:`
-/// frames, or a plain JSON body).
-fn read_sse_result(resp: ureq::Response) -> Result<Value> {
-    let body = resp.into_string().context("reading response body")?;
-    let payload = body
-        .lines()
-        .filter_map(|l| l.strip_prefix("data:").map(str::trim))
-        .next_back()
-        .or_else(|| body.trim_start().starts_with('{').then(|| body.trim()))
-        .ok_or_else(|| anyhow!("no JSON-RPC payload in response: {body:?}"))?;
-    let env: Value = serde_json::from_str(payload).context("parsing JSON-RPC envelope")?;
-    if let Some(err) = env.get("error") {
-        bail!("remote error: {err}");
-    }
-    env.get("result")
-        .cloned()
-        .ok_or_else(|| anyhow!("response has no result"))
-}
-
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
     use super::*;
 
     fn sv(xs: &[&str]) -> Vec<String> {
