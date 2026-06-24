@@ -16,9 +16,19 @@ build+deploy from their own packages/repos; checking them in is wrong.
   workspace, so two sessions can't collide). Pairs with `sprint-end`.
 - **sprint-end** — release a sprint's bead and tear down its jj workspace
   (`--close` closes the bead instead of unclaiming; refuses while the workspace is
-  dirty unless `--force`).
+  dirty unless `--force`). Run bare from *inside* a workspace it refuses with a
+  redirect to the arg form (`cd <root> && sprint-end <token>`), because removing
+  the caller's cwd would strand the shell on getcwd — a child process can't cd its
+  parent back out.
 - **sprint-lib.sh** — shared library for sprint-start/end (beadsd endpoint + actor
   resolution, trunk revision). Sourced by both as `$HOME/.local/lib/sprint-lib.sh`,
   so it deploys to `~/.local/lib/` (not `bin/`).
+- **sprint-funcs.sh** — bash shell helpers. Defines `sprint-end` as a shell
+  *function* (shadowing the binary) that hops the shell to the repo root before the
+  binary tears the workspace down, so bare `sprint-end` from inside a workspace Just
+  Works with no strand. Deploys to `~/.local/lib/` (not on PATH). It's for the
+  *consumers* of sprint-start/end: load it by sourcing from `~/.bashrc` (interactive
+  bash) or by giving a consumer script a `#!/usr/bin/env bash` shebang and
+  `. ~/.bashrc` near the top.
 - **jj-orphan-audit** — categorize jj loose heads vs a base revision; a recovery
   aid referenced by the `jj-runbook` skill.
