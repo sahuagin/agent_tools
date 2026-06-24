@@ -98,6 +98,24 @@ model = "qwen3-coder-next-agent262k:latest"
 # auto_threshold = 0.8    # >= this confidence: create the edge
 # queue_threshold = 0.5   # >= this: park in the queue
 
+# ── Inter-agent dialogue ─────────────────────────────────────────────────────
+# `agent dialogue` (watch/poll/say/peers) talks to a mu-dialogue MCP server.
+# Resolution: --url flag → AGENT_DIALOGUE_URL env → this file → built-in default
+# (http://localhost:7740/mcp). Set your deployed server here so the address is
+# not baked into the binary; every caller (cc hooks, mu, your shell) reads it.
+# Env override: AGENT_DIALOGUE_URL
+[dialogue]
+url = "http://localhost:7740/mcp"
+
+# ── code-index MCP server (--listen) ─────────────────────────────────────────
+# When code-index-mcp runs as an HTTP server (`--listen host:port`), the Host
+# header is validated. localhost/127.0.0.1/::1 and the bind address are always
+# allowed; list any EXTRA hostnames/IPs it is reached at (comma-separated) — the
+# bare host and host:port forms are both allowed automatically.
+# Env override: CODE_INDEX_ALLOWED_HOSTS
+[code_index]
+# allowed_hosts = "10.0.0.5"
+
 # ── Logging (env, not config) ────────────────────────────────────────────────
 # Status/diagnostics go through env_logger on stderr:
 #   RUST_LOG=warn   silence confirmations

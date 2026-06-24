@@ -12,9 +12,11 @@ use serde_json::{json, Value};
 
 use crate::mcp;
 
-/// Default endpoint: the deployed mu-dialogue server. Override with `--url` or
-/// the `AGENT_DIALOGUE_URL` env var.
-const DEFAULT_URL: &str = "http://10.1.1.172:7740/mcp";
+/// Default endpoint when nothing else is configured. Resolution order:
+/// `--url` flag → `AGENT_DIALOGUE_URL` env → `[dialogue].url` in
+/// ~/.config/agent/config.toml → this localhost fallback. Deployments point at
+/// their real server via config/env, so no host-specific address is baked in.
+const DEFAULT_URL: &str = "http://localhost:7740/mcp";
 
 #[derive(Args)]
 pub struct DialogueCmd {
@@ -87,7 +89,7 @@ struct Peers {
 
 fn endpoint(url: &Option<String>) -> String {
     url.clone()
-        .or_else(|| std::env::var("AGENT_DIALOGUE_URL").ok())
+        .or_else(|| crate::embed::resolve_setting("dialogue", "url", "AGENT_DIALOGUE_URL"))
         .unwrap_or_else(|| DEFAULT_URL.to_string())
 }
 

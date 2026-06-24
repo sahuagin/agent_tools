@@ -312,14 +312,30 @@ async fn serve_http(addr: &str, db_path: PathBuf) -> anyhow::Result<()> {
 
     let db = db_path.clone();
     let mut config = StreamableHttpServerConfig::default();
-    config.allowed_hosts = vec![
+    // localhost/loopback and the bind address are always allowed. Any extra
+    // reachable hostnames/IPs (e.g. the LAN address this server is served at)
+    // come from config, not hardcoded, so no deploy-specific address lands in
+    // the public repo: CODE_INDEX_ALLOWED_HOSTS (comma-separated) env override →
+    // `[code_index].allowed_hosts` in ~/.config/agent/config.toml. For each
+    // entry the bare host and `host:port` form are both allowed.
+    let port = addr.rsplit(':').next().unwrap_or("7622");
+    let mut allowed: Vec<String> = vec![
         "localhost".into(),
         "127.0.0.1".into(),
         "::1".into(),
-        "10.1.1.172".into(),
-        format!("10.1.1.172:{}", addr.rsplit(':').next().unwrap_or("7622")),
         addr.to_string(),
     ];
+    let extra = std::env::var("CODE_INDEX_ALLOWED_HOSTS")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or_else(|| code_index::embed::read_config_toml_value("code_index", "allowed_hosts"));
+    if let Some(extra) = extra {
+        for h in extra.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            allowed.push(h.to_string());
+            allowed.push(format!("{h}:{port}"));
+        }
+    }
+    config.allowed_hosts = allowed;
     let service: StreamableHttpService<CodeIndexServer, LocalSessionManager> =
         StreamableHttpService::new(
             move || Ok(CodeIndexServer::new(db.clone())),
