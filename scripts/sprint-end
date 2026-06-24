@@ -50,9 +50,20 @@ else
     [ "$WS" != "$ROOT" ] || die "you are in the backing workspace; pass a <bead-id> or cd into a sprint workspace"
     # recover bead/token from the workspace dir name: <repo>-<token>
     TOKEN=$(basename "$WS" | sed "s/^${REPO}-//")
-    # Is that token a real bead in beadsd? If so, release it below.
-    _ep=$(beads_endpoint "$REPO")
-    if [ -n "$_ep" ] && beads --url "$_ep" show "$TOKEN" >/dev/null 2>&1; then BEAD="$TOKEN"; else BEAD=""; fi
+    # A bare (no <bead-id>) invocation means the caller's shell is standing INSIDE
+    # this workspace, so tearing it down would `rm` the caller's cwd and strand
+    # the shell on getcwd — a child process can't cd its parent back out. Refuse
+    # and redirect to the arg form, which removes the now-sibling workspace from
+    # the repo root with no strand. (The `sprint-end` shell function in
+    # sprint-funcs.sh performs this hop automatically for interactive shells.)
+    _flags=""
+    [ "$MODE" = "close" ] && _flags="$_flags --close"
+    [ "$KEEP" -eq 1 ] && _flags="$_flags --keep"
+    [ "$KEEPNAME" -eq 1 ] && _flags="$_flags --keep-name"
+    [ "$FORCE" -eq 1 ] && _flags="$_flags --force"
+    die "standing inside workspace $WS — removing it here would strand your shell.
+Run from the repo root instead (tears down with no strand):
+    cd $ROOT && sprint-end$_flags $TOKEN"
 fi
 
 # Resolve the actor from the workspace sidecar so the RELEASE uses the SAME actor
