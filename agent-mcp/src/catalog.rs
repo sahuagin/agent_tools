@@ -58,31 +58,9 @@ pub struct ToolSpec {
     pub has_json_flag: bool,
 }
 
-/// Leaf names (normalized snake_case) that ONLY read. Everything else is
-/// treated as a write and gated behind `--allow-writes`. A startup assertion
-/// checks every entry maps to a real leaf, so this cannot silently drift.
-const READ_TOOLS: &[&str] = &[
-    "memory_show",
-    "memory_events",
-    "memory_patch_log",
-    "memory_diff",
-    "memory_search",
-    "memory_recent",
-    "memory_list",
-    "memory_context",
-    "memory_context_stats",
-    "memory_recall",
-    "memory_recall_stats",
-    "memory_resolve",
-    "memory_kernel_show",
-    "memory_export",
-    "task_list",
-    "task_show",
-    "task_resume",
-    "metrics_report",
-    "metrics_list",
-    "db_path",
-];
+// The read/write leaf classification (`READ_TOOLS` + `is_write`) now lives in
+// the shared `agent::classify` module — single source of truth for both the
+// client routing policy (agent/src/forward.rs) and this server's write-gating.
 
 /// Parse the full `agent --help-ai --json` tree into one `ToolSpec` per
 /// invokable leaf, with collision + drift guards.
@@ -110,7 +88,7 @@ pub fn parse_catalog(root: &Value) -> Result<Vec<ToolSpec>> {
 /// so the hand-maintained read allow-list cannot silently drift from the CLI.
 /// Kept separate from `parse_catalog` so unit tests can use partial fixtures.
 pub fn validate_read_classification(specs: &[ToolSpec]) -> Result<()> {
-    for r in READ_TOOLS {
+    for r in agent::classify::READ_TOOLS {
         if !specs.iter().any(|s| s.name == *r) {
             bail!("READ_TOOLS entry '{r}' is not a live tool (catalog drift)");
         }
@@ -155,7 +133,7 @@ fn tool_from_node(node: &Value) -> Option<ToolSpec> {
         .map(|a| a.iter().map(arg_from_json).collect())
         .unwrap_or_default();
     let has_json_flag = args.iter().any(|a| a.name == "json");
-    let is_write = !READ_TOOLS.contains(&name.as_str());
+    let is_write = agent::classify::is_write(&name);
     Some(ToolSpec {
         name,
         argv,

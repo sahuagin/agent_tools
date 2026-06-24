@@ -52,17 +52,31 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    // Client mode: forward to a remote agent-mcp instead of the local DB when
-    // `--via-mcp <url>` (or AGENT_MCP_URL) is given. Handled before clap so the
-    // local DB/embedder are never opened in client mode.
+    // Client mode: forward to a remote agent-mcp instead of the local DB when a
+    // target resolves — `--via-mcp <url>` flag, `AGENT_MCP_URL`, or the
+    // config-default `[agent] mcp_url`. Handled before clap so the local
+    // DB/embedder are never opened in client mode. If the endpoint is unreachable
+    // for a read-only verb, fall back to the local DB (writes fail loud inside
+    // `forward::run`).
     if let Some((url, rest)) = forward::target(&argv) {
-        return forward::run(&url, &rest);
+        match forward::run(&url, &rest)? {
+            forward::Outcome::Done => return Ok(()),
+            forward::Outcome::FallBackLocal => {
+                // Re-parse the stripped argv (no --via-mcp) for the local path.
+                return dispatch_local(Cli::parse_from(
+                    std::iter::once("agent".to_string()).chain(rest),
+                ));
+            }
+        }
     }
 
-    let cli = Cli::parse();
+    dispatch_local(Cli::parse())
+}
 
-    // DbPath and Dialogue never touch the local DB — handle them without opening
-    // it (Dialogue talks to a remote mu-dialogue MCP, like a thin client).
+/// Dispatch a parsed command against the LOCAL SQLite DB (the non-forwarded
+/// path). DbPath and Dialogue never open the DB — DbPath just prints the path,
+/// Dialogue talks to a remote mu-dialogue MCP like a thin client.
+fn dispatch_local(cli: Cli) -> Result<()> {
     match cli.command {
         Command::DbPath => {
             println!("{}", db::db_path().display());
