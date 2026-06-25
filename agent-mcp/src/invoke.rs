@@ -74,6 +74,10 @@ fn scalar_to_string(v: &Value) -> Result<String> {
 pub fn run_agent(agent_bin: &str, argv: &[String]) -> Result<(bool, String, String)> {
     let out = std::process::Command::new(agent_bin)
         .args(argv)
+        // Loop-guard: the spawned `agent` is the LOCAL-DB backend and must never
+        // re-forward to an agent-mcp (would loop back into this server). See
+        // `agent/src/forward.rs::target`.
+        .env("AGENT_NO_FORWARD", "1")
         .output()
         .with_context(|| format!("spawning `{agent_bin}`"))?;
     Ok((

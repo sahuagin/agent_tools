@@ -1,11 +1,13 @@
-//! `--via-mcp <url>` / `AGENT_MCP_URL`: forward an `agent` invocation to a
-//! remote agent-mcp as an MCP `tools/call`, instead of opening the local DB.
+//! `--via-mcp <url>` / `AGENT_MCP_URL` / config-default `[agent] mcp_url`:
+//! forward an `agent` invocation to a remote agent-mcp as an MCP `tools/call`,
+//! instead of opening the local DB. Only the DB-backed groups (memory/task/
+//! metrics) route; `dialogue` and `db-path` always stay local.
 //!
 //! This is the inverse of agent-mcp's argv builder: `["memory","recall","x",
 //! "--k","6"]` → tool `memory_recall`, arguments `{"query":"x","k":"6"}`. It
 //! uses a synchronous `ureq` client — no async runtime is pulled into `agent`.
-//! Loop-safe: forwarding is opt-in, and the server-side `agent` runs normally
-//! (local DB), so `agent(client) → agent-mcp → agent(server)` terminates.
+//! Loop-safe: agent-mcp sets `AGENT_NO_FORWARD` on the inner `agent` it spawns,
+//! so the server-side backend always uses the local DB and never re-forwards.
 
 use std::collections::HashMap;
 
@@ -15,9 +17,18 @@ use serde_json::{Map, Value};
 
 use crate::Cli;
 
-/// Pull `--via-mcp <url>` / `--via-mcp=<url>` out of argv, returning the URL
-/// and the remaining (subcommand) argv. Falls back to `AGENT_MCP_URL`.
+/// Resolve the forward target: `Some((url, subcommand-argv))` if the CLI should
+/// forward to a remote agent-mcp instead of opening the local DB, else `None`
+/// (run locally). Precedence: `--via-mcp <url>` flag > `AGENT_MCP_URL` env >
+/// config `[agent] mcp_url` > local DB. The config-default routes to the central
+/// store by default so memory/tasks/metrics stop drifting per-machine.
 pub fn target(argv: &[String]) -> Option<(String, Vec<String>)> {
+    // Loop-guard: agent-mcp sets AGENT_NO_FORWARD on the inner `agent` it spawns,
+    // so that backend always opens the LOCAL DB and never re-forwards — else
+    // `agent(client) → agent-mcp → agent(server) → agent-mcp → …` would loop.
+    if std::env::var_os("AGENT_NO_FORWARD").is_some() {
+        return None;
+    }
     let mut url = None;
     let mut rest = Vec::new();
     let mut it = argv.iter();
@@ -30,16 +41,94 @@ pub fn target(argv: &[String]) -> Option<(String, Vec<String>)> {
             rest.push(a.clone());
         }
     }
-    let url = url.or_else(|| std::env::var("AGENT_MCP_URL").ok())?;
+    // Only the DB-backed groups route to the shared store. `dialogue` has its own
+    // endpoint + streaming (watch/poll), and `db-path` is an inherently-local
+    // query, so neither is ever forwarded — which also keeps the dialogue monitor
+    // pointed at its own MCP regardless of the config-default.
+    let group = rest
+        .iter()
+        .find(|a| !a.starts_with('-'))
+        .map(String::as_str);
+    if !matches!(group, Some("memory" | "task" | "metrics")) {
+        return None;
+    }
+    let url = url
+        .or_else(|| {
+            std::env::var("AGENT_MCP_URL")
+                .ok()
+                .filter(|s| !s.is_empty())
+        })
+        .or_else(default_mcp_url_from_config)?;
     Some((url, rest))
 }
 
-/// Map argv → tool call, invoke the remote, print the result text.
-pub fn run(url: &str, args: &[String]) -> Result<()> {
+/// The config-default endpoint: `[agent] mcp_url` in `~/.config/agent/config.toml`.
+/// Reuses the same hand-rolled reader as the embed/adjudicate config fallbacks,
+/// so there's one config-resolution path for the whole crate.
+fn default_mcp_url_from_config() -> Option<String> {
+    crate::embed::read_config_toml_value("agent", "mcp_url").filter(|s| !s.is_empty())
+}
+
+/// Outcome of a forward attempt. `Done` = the call completed (its result, or a
+/// real remote error, was already handled). `FallBackLocal` = the endpoint was
+/// unreachable for a READ-only verb, so the caller should serve it from the
+/// LOCAL DB. A write to an unreachable endpoint is a hard error (`Err`), never a
+/// silent local write — that silent write is exactly the drift this routing kills.
+pub enum Outcome {
+    Done,
+    FallBackLocal,
+}
+
+/// Map argv → tool call, invoke the remote, print the result. Applies the
+/// unreachable policy (operator decision, 2026-06-24): a READ against an
+/// unreachable endpoint falls back to the local DB; a WRITE fails loud. A
+/// *reachable* server error propagates as-is (never masked by a local read).
+pub fn run(url: &str, args: &[String]) -> Result<Outcome> {
     let (tool, arguments) = map_invocation(args)?;
-    let text = crate::mcp::call_tool(url, &tool, arguments, None)?;
-    println!("{text}");
-    Ok(())
+    match crate::mcp::call_tool(url, &tool, arguments, None) {
+        Ok(text) => {
+            println!("{text}");
+            Ok(Outcome::Done)
+        }
+        // The endpoint was reached but the server returned an error — surface it;
+        // don't fall back to a (possibly stale) local read.
+        Err(e) if endpoint_reachable(url) => Err(e),
+        // Endpoint unreachable: writes fail loud, reads fall back to local.
+        Err(_) if agent::classify::is_write(&tool) => bail!(
+            "agent-mcp at {url} is unreachable; refusing to run write `{tool}` against the local DB \
+             (that would re-introduce the per-machine drift this routing exists to kill). Bring the \
+             endpoint up, or pass an explicit --via-mcp / set AGENT_MCP_URL to override."
+        ),
+        Err(_) => {
+            log::warn!("agent-mcp at {url} unreachable; serving read `{tool}` from the local DB");
+            Ok(Outcome::FallBackLocal)
+        }
+    }
+}
+
+/// Best-effort TCP reachability probe, used ONLY on the error path to tell
+/// "endpoint down" from "server reached but returned an error". A parse/connect
+/// failure reads as unreachable (→ the read/write policy applies).
+fn endpoint_reachable(url: &str) -> bool {
+    host_port(url).is_some_and(|addr| {
+        std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(800)).is_ok()
+    })
+}
+
+/// Resolve `host[:port]` from an `http(s)://host[:port]/...` URL to a SocketAddr.
+fn host_port(url: &str) -> Option<std::net::SocketAddr> {
+    use std::net::ToSocketAddrs;
+    let https = url.starts_with("https://");
+    let rest = url
+        .strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"))?;
+    let authority = rest.split('/').next().unwrap_or(rest);
+    let default_port = if https { 443 } else { 80 };
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((h, p)) => (h, p.parse().unwrap_or(default_port)),
+        None => (authority, default_port),
+    };
+    (host, port).to_socket_addrs().ok()?.next()
 }
 
 struct ArgMeta {
@@ -237,5 +326,67 @@ mod tests {
         let (url2, rest2) = target(&sv(&["--via-mcp=http://y/mcp", "task", "list"])).unwrap();
         assert_eq!(url2, "http://y/mcp");
         assert_eq!(rest2, sv(&["task", "list"]));
+    }
+
+    /// Completeness ("can't list" guard): every DB-backed leaf the CLI exposes
+    /// maps to a non-empty agent-mcp tool name, so routing can never silently
+    /// drop a verb — the failure that motivated this work.
+    #[test]
+    fn every_db_leaf_forwards_to_a_tool() {
+        let root = Cli::command();
+        let mut leaves: Vec<Vec<String>> = Vec::new();
+        collect_leaves(&root, &mut Vec::new(), &mut leaves);
+        let db_leaves: Vec<&Vec<String>> = leaves
+            .iter()
+            .filter(|p| {
+                matches!(
+                    p.first().map(String::as_str),
+                    Some("memory" | "task" | "metrics")
+                )
+            })
+            .collect();
+        assert!(!db_leaves.is_empty(), "no DB-backed leaves found");
+        for path in db_leaves {
+            let (tool, _) =
+                map_invocation(path).unwrap_or_else(|e| panic!("leaf {path:?} did not map: {e}"));
+            assert!(
+                !tool.is_empty(),
+                "leaf {path:?} produced an empty tool name"
+            );
+            // Always classifiable — asserts the wiring; agent-mcp's
+            // validate_read_classification is the real drift guard.
+            let _ = agent::classify::is_write(&tool);
+        }
+    }
+
+    fn collect_leaves(cmd: &clap::Command, prefix: &mut Vec<String>, out: &mut Vec<Vec<String>>) {
+        let mut subs = cmd.get_subcommands().peekable();
+        if subs.peek().is_none() {
+            if !prefix.is_empty() {
+                out.push(prefix.clone());
+            }
+            return;
+        }
+        for sub in subs {
+            prefix.push(sub.get_name().to_string());
+            collect_leaves(sub, prefix, out);
+            prefix.pop();
+        }
+    }
+
+    #[test]
+    fn dialogue_and_dbpath_are_not_forwarded() {
+        // Even with an explicit --via-mcp, the non-DB groups stay local.
+        assert!(target(&sv(&["--via-mcp", "http://x/mcp", "dialogue", "peers"])).is_none());
+        assert!(target(&sv(&["db-path"])).is_none());
+        // DB-backed groups still forward when a url is present.
+        assert!(target(&sv(&["--via-mcp", "http://x/mcp", "memory", "list"])).is_some());
+    }
+
+    #[test]
+    fn host_port_resolves() {
+        assert!(host_port("http://127.0.0.1:7700/mcp").is_some());
+        assert!(host_port("https://127.0.0.1/mcp").is_some());
+        assert!(host_port("not-a-url").is_none());
     }
 }

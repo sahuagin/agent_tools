@@ -10,6 +10,20 @@
 # Precedence for every setting: env var (per-invocation override)
 # → this file → built-in default.
 
+# ── Default store routing ────────────────────────────────────────────────────
+# `agent memory` / `task` / `metrics` route to a central agent-mcp by DEFAULT
+# when this is set, instead of the per-machine local DB (~/.local/share/
+# agent.sqlite) — so the store stays in ONE shared place rather than drifting
+# per host. Precedence: --via-mcp <url> flag → AGENT_MCP_URL env → this key →
+# local DB (when unset). `dialogue` and `db-path` are never routed (dialogue has
+# its own [dialogue] endpoint + streaming watch/poll; db-path is a local query).
+#
+# When the endpoint is set but UNREACHABLE: reads fall back to the local DB,
+# writes fail loud (never a silent local write — that is the drift this avoids).
+# Env override: AGENT_MCP_URL
+[agent]
+# mcp_url = "http://10.1.1.172:7700/mcp"
+
 # ── API keys ─────────────────────────────────────────────────────────────────
 
 [openrouter]

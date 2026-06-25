@@ -30,6 +30,7 @@ dependencies = [
 name = "agent-mcp"
 version = "0.1.0"
 dependencies = [
+ "agent",
  "anyhow",
  "axum",
  "rmcp",

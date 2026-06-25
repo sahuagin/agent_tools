@@ -35,6 +35,8 @@ fn resolve_agent_bin() -> String {
 fn build_registry(agent_bin: &str) -> Result<Registry> {
     let out = std::process::Command::new(agent_bin)
         .args(["--help-ai", "--json"])
+        // Loop-guard (defense-in-depth): the discovery spawn must never forward.
+        .env("AGENT_NO_FORWARD", "1")
         .output()
         .with_context(|| {
             format!(
