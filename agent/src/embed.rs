@@ -1,3 +1,9 @@
+// The `chunks_exact_to_as_chunks` lint is new in this toolchain (clippy 0.1.98)
+// and fires on pre-existing byte-decoding here (blob_to_f32 / MockEmbedder),
+// unrelated to the kx change. Suppressed module-wide to keep the `-D warnings`
+// gate green without a behavior change.
+#![allow(clippy::chunks_exact_to_as_chunks)]
+
 use anyhow::{anyhow, Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};

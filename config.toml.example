@@ -130,6 +130,75 @@ url = "http://localhost:7740/mcp"
 [code_index]
 # allowed_hosts = "10.0.0.5"
 
+# ── kx knowledge index (`agent kx`) ──────────────────────────────────────────
+# A kx entry is a POINTER (+ one-line summary + metadata + embedding) to one
+# document in a configured corpus; the documents themselves stay as files on
+# disk. `agent kx ingest` scans the [[kx.sources]] below and stores one row per
+# document (type='kx') — reusing the same embedding + FTS machinery as
+# `agent memory`, but kept OUT of personal-memory recall/context. Query it with
+# `agent kx recall` (semantic), `agent kx search` (FTS lexical), `agent kx list`
+# (browse). Retrieval is OPEN by default; --scope/--tag/--from/--to NARROW it.
+#
+# This section is host-local: ingest scans the paths on whatever host runs it.
+# API keys live in OTHER sections above and are NEVER read or logged by kx.
+[kx]
+# Global knobs (all optional). Commented values show the built-in default.
+#
+# default_scope: ownership scope for entries whose source sets none. The scope
+#   axis is work / personal / shared (a concrete profile sees its own + shared).
+# default_scope = "work"
+#
+# summarize / summarize_model: PR #2 (model-summarized ingest). Parsed now but
+#   NOT implemented — `kx ingest` errors loudly if summarize = true.
+# summarize = false
+# summarize_model = "qwen3-coder-next-agent262k:latest"
+#
+# embed_model: defaults to [embed].model; PR #1 embeds via the shared chain.
+# embed_model = "qwen3-embedding:8b"
+#
+# min_score: cosine floor for `kx recall` (override per-call with --min-score).
+# min_score = 0.60
+#
+# max_hits: operational hit cap for recall/search (override with --k / --limit).
+# max_hits = 4
+#
+# max_depth: how deep the ingest walk descends below each source root (files in
+#   the root are depth 0). The walk skips symlinks (so it can't loop or follow a
+#   link off-tree); this caps REAL deep trees, nested mount points, and network
+#   shares so a pathological corpus stays slow-but-finite. A capped dir is logged.
+# max_depth = 64
+#
+# default_extensions: file types ingested when a source does not override them.
+# default_extensions = ["md"]
+#
+# default_exclude: globs dropped from EVERY source (unioned with a source's own
+#   exclude-globs). Real glob matching: `*` = any run of non-/, `**` = any run
+#   of path segments, a slash-less pattern matches the basename anywhere.
+# default_exclude = [
+#     "**/.git/**", "**/.jj/**", "**/target/**", "**/node_modules/**",
+#     "**/.venv/**", "**/__pycache__/**",
+#     "*.log", "*.jsonl", "*.prompt.txt", "*.lock",
+# ]
+
+# A corpus to index. Repeat the [[kx.sources]] table for each one.
+#   path         : root directory scanned recursively (there is no separate
+#                  source "name" — `--source` matches this path, exact or by its
+#                  trailing component).
+#   extensions   : include only these; omit to use default_extensions.
+#   exclude-globs: extra excludes, unioned with default_exclude.
+#   scope        : ownership scope for this corpus (falls back to default_scope).
+#   tags         : applied to every entry; combine with the auto tags
+#                  repo:<leaf dir> and cat:<category>. Use topic:/cat:/repo:
+#                  prefixes so --tag filters compose (ANDed, comma-anchored).
+#   category     : adds a cat:<category> tag.
+[[kx.sources]]
+path = "/home/you/notes"
+extensions = ["md"]
+exclude-globs = ["**/drafts/**"]
+scope = "work"
+tags = ["topic:notes"]
+category = "reference"
+
 # ── Logging (env, not config) ────────────────────────────────────────────────
 # Status/diagnostics go through env_logger on stderr:
 #   RUST_LOG=warn   silence confirmations
