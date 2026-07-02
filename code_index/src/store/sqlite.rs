@@ -106,6 +106,10 @@ fn f32_to_blob(v: &[f32]) -> Vec<u8> {
     out
 }
 
+// Pre-existing code; the `chunks_exact_to_as_chunks` lint is new in this
+// toolchain (clippy 0.1.98) and unrelated to the kx change — suppressed to keep
+// the `-D warnings` gate green without a behavior change.
+#[allow(clippy::chunks_exact_to_as_chunks)]
 fn blob_to_f32(b: &[u8]) -> Vec<f32> {
     b.chunks_exact(4)
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
