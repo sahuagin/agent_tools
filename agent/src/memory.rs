@@ -559,7 +559,7 @@ fn resolve_write_scope(flag: Option<&str>) -> String {
 }
 
 /// Which scopes a READ should include.
-enum ScopeFilter {
+pub(crate) enum ScopeFilter {
     /// No predicate — span every scope.
     All,
     /// `scope IN (...)` — the listed scopes only.
@@ -591,15 +591,16 @@ impl ScopeFilter {
     }
 
     /// Filter for `recall` / `search`: span all by default, narrow only when
-    /// `--scope` is explicitly passed (keep semantic recall global).
-    fn for_explicit(flag: Option<&str>) -> ScopeFilter {
+    /// `--scope` is explicitly passed (keep semantic recall global). Shared with
+    /// the `kx` retrieval paths.
+    pub(crate) fn for_explicit(flag: Option<&str>) -> ScopeFilter {
         ScopeFilter::from_resolved(flag)
     }
 
     /// A ` AND <col> IN (?, ?)` SQL fragment plus its bound values. Uses
     /// anonymous placeholders, so the caller must bind these values at the
     /// position the fragment appears in the statement. Empty when `All`.
-    fn sql_and(&self, col: &str) -> (String, Vec<Value>) {
+    pub(crate) fn sql_and(&self, col: &str) -> (String, Vec<Value>) {
         match self {
             ScopeFilter::All => (String::new(), Vec::new()),
             ScopeFilter::Include(scopes) => {
@@ -612,11 +613,31 @@ impl ScopeFilter {
     }
 }
 
-/// A memory `type` filter (`Option<String>`) as a bindable value.
-fn type_value(t: &Option<String>) -> Value {
-    match t {
-        Some(s) => Value::Text(s.clone()),
-        None => Value::Null,
+/// How a retrieval path constrains `memories.type`. The generic `memory
+/// recall`/`search` paths must never surface the `kx` knowledge-index corpus;
+/// the `kx` paths pin to a single type. Both route their type predicate through
+/// this one helper (clarification #9 / punch-list #5) rather than hand-writing
+/// per-command SQL.
+pub(crate) enum TypeFilter {
+    /// Generic memory: exclude `type = 'kx'`, optionally restrict to one type.
+    ExcludeKx(Option<String>),
+    /// Pin to exactly this type (the kx corpus passes `"kx"`).
+    Only(String),
+}
+
+impl TypeFilter {
+    /// A ` AND <col> ...` predicate fragment plus its bound values, appended in
+    /// statement order like [`ScopeFilter::sql_and`]. `'kx'` is a compile-time
+    /// constant (inlined, no injection surface); the optional/pinned type binds.
+    fn sql_and(&self, col: &str) -> (String, Vec<Value>) {
+        match self {
+            TypeFilter::ExcludeKx(None) => (format!(" AND {col} != 'kx'"), Vec::new()),
+            TypeFilter::ExcludeKx(Some(t)) => (
+                format!(" AND {col} != 'kx' AND {col} = ?"),
+                vec![Value::Text(t.clone())],
+            ),
+            TypeFilter::Only(t) => (format!(" AND {col} = ?"), vec![Value::Text(t.clone())]),
+        }
     }
 }
 
@@ -1591,64 +1612,120 @@ fn diff(conn: &Connection, args: DiffArgs) -> Result<()> {
 
 // ── Queries ───────────────────────────────────────────────────────────────────
 
-fn search(conn: &Connection, args: SearchArgs) -> Result<()> {
+/// One row of an FTS lexical search — the projection [`search_rows`] returns.
+/// `valid_from` rides along for the `kx` renderers (doc date); the `memory`
+/// renderer ignores it.
+pub(crate) struct SearchRow {
+    pub(crate) id: String,
+    pub(crate) type_: String,
+    pub(crate) name: String,
+    pub(crate) description: String,
+    pub(crate) content: String,
+    pub(crate) tags: String,
+    pub(crate) updated_at: i64,
+    pub(crate) created_at: i64,
+    pub(crate) verified_at: Option<i64>,
+    pub(crate) lifecycle: String,
+    pub(crate) superseded_by: Option<String>,
+    pub(crate) author: Option<String>,
+    pub(crate) valid_from: Option<i64>,
+}
+
+/// Shared FTS5 retrieval used by BOTH `memory search` and `kx search`
+/// (punch-list #5). Runs the neutralized MATCH query with the given
+/// type/scope/author filters plus an extra predicate fragment (`kx` tag/date),
+/// in FTS `rank` order. Only the filters + rendering differ per caller.
+///
+/// `extra_sql` is appended verbatim to the WHERE clause and must reference the
+/// `m` alias; `extra_vals` binds its `?` placeholders in order.
+#[allow(clippy::too_many_arguments)] // orthogonal filters; a struct would only shift the noise
+pub(crate) fn search_rows(
+    conn: &Connection,
+    query: &str,
+    type_filter: &TypeFilter,
+    scope: &ScopeFilter,
+    author: Option<&str>,
+    extra_sql: &str,
+    extra_vals: &[Value],
+    limit: usize,
+) -> Result<Vec<SearchRow>> {
     // The raw query is free text. FTS5 treats `-`, `:`, `*`, `^`, `(`, `)` and
     // the bareword operators AND/OR/NOT as query syntax, so an unescaped query
     // like `mu-slat` errored (`no such column: slat`) and silently returned
     // nothing. fts5_match_query() neutralizes that — see its doc comment.
-    let match_query = fts5_match_query(&args.query);
+    let match_query = fts5_match_query(query);
     if match_query.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
 
-    let scope = ScopeFilter::for_explicit(args.scope.as_deref());
+    let (type_sql, type_vals) = type_filter.sql_and("m.type");
     let (scope_sql, scope_vals) = scope.sql_and("m.scope");
+    let (author_sql, author_vals) = match author {
+        Some(a) => (
+            " AND m.author = ?".to_string(),
+            vec![Value::Text(a.to_string())],
+        ),
+        None => (String::new(), Vec::new()),
+    };
     let sql = format!(
         "SELECT m.id, m.type, m.name, m.description, m.content, m.tags, m.updated_at,
-                m.created_at, m.verified_at, m.lifecycle, m.superseded_by, m.author
+                m.created_at, m.verified_at, m.lifecycle, m.superseded_by, m.author, m.valid_from
          FROM memories_fts fts
          JOIN memories m ON m.rowid = fts.rowid
-         WHERE memories_fts MATCH ? AND m.is_active = 1
-           AND (? IS NULL OR m.type = ?)
-           AND (? IS NULL OR m.author = ?){scope_sql}
+         WHERE memories_fts MATCH ? AND m.is_active = 1{type_sql}{author_sql}{scope_sql}{extra_sql}
          ORDER BY rank
          LIMIT ?"
     );
 
-    let mut p: Vec<Value> = vec![
-        Value::Text(match_query),
-        type_value(&args.r#type),
-        type_value(&args.r#type),
-        type_value(&args.author),
-        type_value(&args.author),
-    ];
+    let mut p: Vec<Value> = vec![Value::Text(match_query)];
+    p.extend(type_vals);
+    p.extend(author_vals);
     p.extend(scope_vals);
-    p.push(Value::Integer(args.limit as i64));
+    p.extend(extra_vals.iter().cloned());
+    p.push(Value::Integer(limit as i64));
 
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(params_from_iter(p.iter()), |r| {
-        Ok((
-            r.get::<_, String>(0)?,
-            r.get::<_, String>(1)?,
-            r.get::<_, String>(2)?,
-            r.get::<_, String>(3)?,
-            r.get::<_, String>(4)?,
-            r.get::<_, String>(5)?,
-            r.get::<_, i64>(6)?,
-            r.get::<_, i64>(7)?,
-            r.get::<_, Option<i64>>(8)?,
-            r.get::<_, String>(9)?,
-            r.get::<_, Option<String>>(10)?,
-            r.get::<_, Option<String>>(11)?,
-        ))
+        Ok(SearchRow {
+            id: r.get(0)?,
+            type_: r.get(1)?,
+            name: r.get(2)?,
+            description: r.get(3)?,
+            content: r.get(4)?,
+            tags: r.get(5)?,
+            updated_at: r.get(6)?,
+            created_at: r.get(7)?,
+            verified_at: r.get(8)?,
+            lifecycle: r.get(9)?,
+            superseded_by: r.get(10)?,
+            author: r.get(11)?,
+            valid_from: r.get(12)?,
+        })
     })?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(Into::into)
+}
+
+fn search(conn: &Connection, args: SearchArgs) -> Result<()> {
+    let scope = ScopeFilter::for_explicit(args.scope.as_deref());
+    let type_filter = TypeFilter::ExcludeKx(args.r#type.clone());
+    let rows = search_rows(
+        conn,
+        &args.query,
+        &type_filter,
+        &scope,
+        args.author.as_deref(),
+        "",
+        &[],
+        args.limit,
+    )?;
 
     for row in rows {
-        let (
+        let SearchRow {
             id,
             type_,
             name,
-            desc,
+            description: desc,
             content,
             tags,
             updated_at,
@@ -1657,7 +1734,8 @@ fn search(conn: &Connection, args: SearchArgs) -> Result<()> {
             lifecycle,
             superseded_by,
             author,
-        ) = row?;
+            valid_from: _,
+        } = row;
         let ts = fmt_ts(updated_at);
         // at-usl: a superseded memory is never shown without its successor —
         // successor first with full content, the stale entry as a labeled stub.
@@ -2956,28 +3034,32 @@ fn rank_trust(now_ts: i64, verified_at: Option<i64>) -> f32 {
 
 /// One scored recall candidate. Lifted out of `recall()` so the ranking
 /// passes are unit-testable; `vector` is retained for the tie-break's
-/// pairwise-similarity gate.
-struct Scored {
-    id: String,
-    type_: String,
-    name: String,
-    description: String,
-    content: String,
-    tags: String,
-    updated_at: i64,
-    created_at: i64,
-    verified_at: Option<i64>,
-    lifecycle: String,
-    author: Option<String>,
+/// pairwise-similarity gate. Crate-visible so the shared [`semantic_recall`]
+/// engine can hand ranked hits to both `memory recall` and `kx recall`.
+pub(crate) struct Scored {
+    pub(crate) id: String,
+    pub(crate) type_: String,
+    pub(crate) name: String,
+    pub(crate) description: String,
+    pub(crate) content: String,
+    pub(crate) tags: String,
+    pub(crate) updated_at: i64,
+    pub(crate) created_at: i64,
+    pub(crate) verified_at: Option<i64>,
+    pub(crate) lifecycle: String,
+    pub(crate) author: Option<String>,
+    /// The document date (`valid_from`) — used by the `kx` renderers; the
+    /// `memory` recall renderer ignores it.
+    pub(crate) valid_from: Option<i64>,
     /// Raw semantic similarity to the query.
-    cosine: f32,
-    /// Ranking score (== cosine under --rank legacy).
-    score: f32,
-    t_eff: i64,
-    vector: Vec<f32>,
+    pub(crate) cosine: f32,
+    /// Ranking score (== cosine under --rank legacy / kx).
+    pub(crate) score: f32,
+    pub(crate) t_eff: i64,
+    pub(crate) vector: Vec<f32>,
     /// gf2.6: set when this (active) result's match strength was
     /// credited from a superseded chain member: "member-id (date)".
-    via: Option<String>,
+    pub(crate) via: Option<String>,
 }
 
 /// ε-window recency tie-break for UNLINKED near-duplicates (the
@@ -3071,7 +3153,7 @@ fn credit_heads(conn: &Connection, scored: Vec<Scored>, model: &str) -> Result<V
 fn load_scored_head(conn: &Connection, id: &str, model: &str) -> Result<Option<Scored>> {
     let row = conn.query_row(
         "SELECT m.id, m.type, m.name, m.description, m.content, m.tags, m.updated_at,
-                m.created_at, m.verified_at, m.lifecycle, m.author, e.vector
+                m.created_at, m.verified_at, m.lifecycle, m.author, e.vector, m.valid_from
          FROM memories m
          LEFT JOIN memory_embeddings e ON e.memory_id = m.id AND e.model = ?2
          WHERE m.id = ?1 AND m.is_active = 1",
@@ -3089,6 +3171,7 @@ fn load_scored_head(conn: &Connection, id: &str, model: &str) -> Result<Option<S
                 verified_at: r.get(8)?,
                 lifecycle: r.get(9)?,
                 author: r.get(10)?,
+                valid_from: r.get(12)?,
                 cosine: 0.0,
                 score: 0.0,
                 t_eff: 0,
@@ -3140,13 +3223,170 @@ fn conflict_partners(scored: &[Scored]) -> Vec<Vec<String>> {
     partners
 }
 
+/// Options controlling the shared semantic-recall engine [`semantic_recall`].
+pub(crate) struct RecallOpts<'a> {
+    /// Free-text query — embedded and cosine-compared to every candidate.
+    pub(crate) query: &'a str,
+    /// Type predicate: `ExcludeKx` for `memory recall`, `Only("kx")` for `kx`.
+    pub(crate) type_filter: TypeFilter,
+    /// Scope predicate (profile ownership).
+    pub(crate) scope: ScopeFilter,
+    /// Extra ` AND ...` predicate on the `m` alias (kx tag/date); "" for memory.
+    pub(crate) extra_sql: String,
+    /// Bound values for `extra_sql`'s `?` placeholders, in order.
+    pub(crate) extra_vals: Vec<Value>,
+    /// Cosine/score floor; hits below it are dropped (kx `min_score`). `None`
+    /// keeps all (memory recall returns the top `limit` regardless of score).
+    pub(crate) min_score: Option<f32>,
+    /// Max hits returned after ranking.
+    pub(crate) limit: usize,
+    /// v1 trust/freshness ranking (memory) vs raw-cosine (kx / `--rank legacy`).
+    pub(crate) rank_v1: bool,
+}
+
+/// Shared semantic-recall engine: embed the query (primary then fallback
+/// embedder), score every candidate memory of the requested type/scope/extra
+/// predicate by cosine, apply v1 trust/freshness ranking (memory) or a
+/// raw-cosine floor (kx), and return the ranked hits plus the model that
+/// produced the query vector. Returns `None` when NO embedder is available so
+/// the caller can degrade (memory → FTS lexical; kx → a structured note).
+/// `memory recall` and `kx recall` both route through this — the retrieval
+/// logic lives in exactly one place (punch-list #5 / clarification #9).
+pub(crate) fn semantic_recall(
+    conn: &Connection,
+    opts: &RecallOpts,
+) -> Result<Option<(String, Vec<Scored>)>> {
+    // `model` is whichever embedder produced the query vector, so the
+    // `e.model = ?` filter below always compares within a single vector space.
+    let (query_vec, model) = match embed::embed_query_with_fallback(opts.query) {
+        Some(pair) => pair,
+        None => return Ok(None),
+    };
+
+    let (type_sql, type_vals) = opts.type_filter.sql_and("m.type");
+    let (scope_sql, scope_vals) = opts.scope.sql_and("m.scope");
+    // gf2.6: v1 ranking pulls superseded rows too — their match strength is
+    // credited to their chain heads. Legacy/kx keep the exclusion.
+    let lifecycle_sql = if opts.rank_v1 {
+        ""
+    } else {
+        " AND m.lifecycle != 'superseded'"
+    };
+    let extra_sql = opts.extra_sql.as_str();
+    let sql = format!(
+        "SELECT m.id, m.type, m.name, m.description, m.content, m.tags, m.updated_at, e.vector,
+                m.created_at, m.verified_at, m.lifecycle, m.author, m.valid_from
+               FROM memory_embeddings e
+               JOIN memories m ON m.id = e.memory_id
+               WHERE m.is_active = 1 AND e.model = ?{lifecycle_sql}{type_sql}{scope_sql}{extra_sql}"
+    );
+    let mut p: Vec<Value> = vec![Value::Text(model.clone())];
+    p.extend(type_vals);
+    p.extend(scope_vals);
+    p.extend(opts.extra_vals.iter().cloned());
+
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params_from_iter(p.iter()), |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+            r.get::<_, String>(3)?,
+            r.get::<_, String>(4)?,
+            r.get::<_, String>(5)?,
+            r.get::<_, i64>(6)?,
+            r.get::<_, Vec<u8>>(7)?,
+            r.get::<_, i64>(8)?,
+            r.get::<_, Option<i64>>(9)?,
+            r.get::<_, String>(10)?,
+            r.get::<_, Option<String>>(11)?,
+            r.get::<_, Option<i64>>(12)?,
+        ))
+    })?;
+
+    let now_ts = now();
+    let mut scored: Vec<Scored> = Vec::new();
+    for row in rows {
+        let (
+            id,
+            type_,
+            name,
+            description,
+            content,
+            tags,
+            updated_at,
+            blob,
+            created_at,
+            verified_at,
+            lifecycle,
+            author,
+            valid_from,
+        ) = row?;
+        let v = embed::blob_to_f32(&blob);
+        let cosine = embed::cosine(&query_vec, &v);
+        let t_eff = rank_t_eff(created_at, updated_at, verified_at);
+        // v1 final scores are computed AFTER head-crediting (below); until then
+        // score carries the raw cosine (also the final score for kx/legacy).
+        scored.push(Scored {
+            id,
+            type_,
+            name,
+            description,
+            content,
+            tags,
+            updated_at,
+            created_at,
+            verified_at,
+            lifecycle,
+            author,
+            valid_from,
+            cosine,
+            score: cosine,
+            t_eff,
+            vector: v,
+            via: None,
+        });
+    }
+
+    if opts.rank_v1 {
+        scored = credit_heads(conn, scored, &model)?;
+        for s in &mut scored {
+            s.score = s.cosine * rank_trust(now_ts, s.verified_at) * rank_fresh(now_ts, s.t_eff);
+        }
+    }
+    // kx honors a cosine floor (min_score); memory passes None and keeps all.
+    if let Some(floor) = opts.min_score {
+        scored.retain(|s| s.score >= floor);
+    }
+    scored.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    scored.truncate(opts.limit);
+    if opts.rank_v1 {
+        rank_tie_break(&mut scored);
+    }
+    Ok(Some((model, scored)))
+}
+
 fn recall(conn: &Connection, args: RecallArgs) -> Result<()> {
-    // Try the primary embedder, then the configured fallback. `model` is
-    // whichever one produced the query vector, so the `e.model = ?` filter
-    // below always compares within a single vector space. If EVERY embedder is
-    // down (e.g. ollama busy AND OpenRouter unreachable), degrade to lexical
-    // FTS search rather than hanging or erroring — "return what it can." (at-7mp)
-    let (query_vec, model) = match embed::embed_query_with_fallback(&args.query) {
+    let rank_v1 = args.rank == "v1";
+    let opts = RecallOpts {
+        query: &args.query,
+        // memory recall never surfaces the kx corpus (deliverable #4).
+        type_filter: TypeFilter::ExcludeKx(args.r#type.clone()),
+        scope: ScopeFilter::for_explicit(args.scope.as_deref()),
+        extra_sql: String::new(),
+        extra_vals: Vec::new(),
+        min_score: None,
+        limit: args.k,
+        rank_v1,
+    };
+
+    // If EVERY embedder is down (e.g. ollama busy AND OpenRouter unreachable),
+    // degrade to lexical FTS search rather than hanging or erroring. (at-7mp)
+    let (model, scored) = match semantic_recall(conn, &opts)? {
         Some(pair) => pair,
         None => {
             eprintln!(
@@ -3181,94 +3421,6 @@ fn recall(conn: &Connection, args: RecallArgs) -> Result<()> {
         }
     };
 
-    let scope = ScopeFilter::for_explicit(args.scope.as_deref());
-    let (scope_sql, scope_vals) = scope.sql_and("m.scope");
-    // Pull content + tags too so --full / JSON can include them without a second query
-    // gf2.6: v1 ranking pulls superseded rows too — their match
-    // strength is credited to their chain heads (the structural fix for
-    // "stale text out-matches its correction"). Legacy keeps the
-    // exclusion for bit-identical behavior.
-    let rank_v1 = args.rank == "v1";
-    let lifecycle_sql = if rank_v1 {
-        ""
-    } else {
-        " AND m.lifecycle != 'superseded'"
-    };
-    let sql = format!(
-        "SELECT m.id, m.type, m.name, m.description, m.content, m.tags, m.updated_at, e.vector,
-                m.created_at, m.verified_at, m.lifecycle, m.author
-               FROM memory_embeddings e
-               JOIN memories m ON m.id = e.memory_id
-               WHERE m.is_active = 1 AND e.model = ?{lifecycle_sql}
-                 AND (? IS NULL OR m.type = ?){scope_sql}"
-    );
-    let mut p: Vec<Value> = vec![
-        Value::Text(model.clone()),
-        type_value(&args.r#type),
-        type_value(&args.r#type),
-    ];
-    p.extend(scope_vals);
-    let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(params_from_iter(p.iter()), |r| {
-        Ok((
-            r.get::<_, String>(0)?,
-            r.get::<_, String>(1)?,
-            r.get::<_, String>(2)?,
-            r.get::<_, String>(3)?,
-            r.get::<_, String>(4)?,
-            r.get::<_, String>(5)?,
-            r.get::<_, i64>(6)?,
-            r.get::<_, Vec<u8>>(7)?,
-            r.get::<_, i64>(8)?,
-            r.get::<_, Option<i64>>(9)?,
-            r.get::<_, String>(10)?,
-            r.get::<_, Option<String>>(11)?,
-        ))
-    })?;
-
-    let now_ts = now();
-    let mut scored: Vec<Scored> = Vec::new();
-    for row in rows {
-        let (
-            id,
-            type_,
-            name,
-            description,
-            content,
-            tags,
-            updated_at,
-            blob,
-            created_at,
-            verified_at,
-            lifecycle,
-            author,
-        ) = row?;
-        let v = embed::blob_to_f32(&blob);
-        let cosine = embed::cosine(&query_vec, &v);
-        let t_eff = rank_t_eff(created_at, updated_at, verified_at);
-        // v1 final scores are computed AFTER head-crediting (below);
-        // until then score carries the raw cosine.
-        let score = cosine;
-        scored.push(Scored {
-            id,
-            type_,
-            name,
-            description,
-            content,
-            tags,
-            updated_at,
-            created_at,
-            verified_at,
-            lifecycle,
-            author,
-            cosine,
-            score,
-            t_eff,
-            vector: v,
-            via: None,
-        });
-    }
-
     if scored.is_empty() {
         if args.json {
             println!(
@@ -3286,21 +3438,6 @@ fn recall(conn: &Connection, args: RecallArgs) -> Result<()> {
         return Ok(());
     }
 
-    if rank_v1 {
-        scored = credit_heads(conn, scored, &model)?;
-        for s in &mut scored {
-            s.score = s.cosine * rank_trust(now_ts, s.verified_at) * rank_fresh(now_ts, s.t_eff);
-        }
-    }
-    scored.sort_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    scored.truncate(args.k);
-    if rank_v1 {
-        rank_tie_break(&mut scored);
-    }
     // gf2.10: flag possible contradiction pairs among the returned set
     // (v1 only — legacy output stays bit-identical).
     let conflicts = if rank_v1 {
@@ -3778,6 +3915,7 @@ mod tests {
             verified_at: None,
             lifecycle: "active".into(),
             author: None,
+            valid_from: None,
             cosine,
             score,
             t_eff,

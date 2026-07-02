@@ -28,6 +28,11 @@ pub const READ_TOOLS: &[&str] = &[
     "task_resume",
     "metrics_report",
     "metrics_list",
+    // kx knowledge-index reads. `kx_ingest` is INTENTIONALLY absent — it writes
+    // (and so defaults to write via `is_write`).
+    "kx_recall",
+    "kx_search",
+    "kx_list",
     "db_path",
 ];
 
@@ -51,5 +56,10 @@ mod tests {
         assert!(is_write("task_create"));
         // Unknown → write (fail-closed).
         assert!(is_write("memory_brand_new_verb"));
+        // kx: the three query leaves read; ingest writes.
+        assert!(!is_write("kx_recall"));
+        assert!(!is_write("kx_search"));
+        assert!(!is_write("kx_list"));
+        assert!(is_write("kx_ingest"));
     }
 }

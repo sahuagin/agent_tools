@@ -3,6 +3,7 @@ mod db;
 mod dialogue;
 mod embed;
 mod forward;
+mod kx;
 mod mcp;
 mod memory;
 mod metrics;
@@ -32,6 +33,8 @@ enum Command {
     Metrics(metrics::MetricsCmd),
     /// Inter-agent dialogue over the mu-dialogue MCP: watch, poll, say, peers
     Dialogue(dialogue::DialogueCmd),
+    /// Knowledge index: ingest a document corpus, then recall/search/list it
+    Kx(kx::KxCmd),
     /// Print path to agent.sqlite
     DbPath,
 }
@@ -86,6 +89,7 @@ fn dispatch_local(cli: Cli) -> Result<()> {
         Command::Memory(cmd) => memory::run(db::open()?, cmd),
         Command::Task(cmd) => tasks::run(db::open()?, cmd),
         Command::Metrics(cmd) => metrics::run(db::open()?, cmd),
+        Command::Kx(cmd) => kx::run(db::open()?, cmd),
     }
 }
 
@@ -156,6 +160,7 @@ fn ai_text(group: &str, sub: &str) -> &'static str {
         ("metrics", "list") => METRICS_LIST_AI,
         ("metrics", _) => METRICS_OVERVIEW_AI,
         ("dialogue", _) => DIALOGUE_AI,
+        ("kx", _) => KX_AI,
         ("db-path", _) => DBPATH_AI,
         _ => ROOT_AI,
     }
@@ -186,6 +191,7 @@ GROUPS
   task     create/update/list/show/resume
   metrics  record-completion/record-usage/report/list
   dialogue watch/poll/say/peers — inter-agent mailbox (mu-dialogue MCP)
+  kx       ingest/recall/search/list — document knowledge index
   db-path  print path to agent.sqlite
 
 DETAIL
@@ -466,6 +472,33 @@ NOTES
   Endpoint: --url, else AGENT_DIALOGUE_URL, else the deployed server. A thin
   sync MCP client (ureq); no local DB. watch keeps a `since` watermark so each
   message surfaces once.";
+
+const KX_AI: &str = "\
+# agent kx — document knowledge index (agent-oriented help)
+
+WHAT IT IS
+  A kx entry is a POINTER (+ one-line summary + metadata + embedding) to one
+  document in a configured corpus; the files stay on disk. Stored as memories
+  with type='kx', kept OUT of personal-memory recall/context.
+
+ACTIONS
+  ingest  scan the configured [[kx.sources]] and index new/changed docs
+          (no args = all sources; --source, --dry-run, --force, --config)
+  recall  SEMANTIC recall over the corpus (embeddings + cosine, honors min_score)
+  search  FTS5 lexical search over the corpus
+  list    browse by tag / scope / recency
+
+FILTERS (recall/search/list)
+  --scope S   ownership scope (work/personal/shared)
+  --tag T     require tag (repeatable; ANDed)   --from/--to YYYY-MM-DD (by doc date)
+  --k / --limit / --min-score   caps and the recall cosine floor
+  --json      machine-readable output
+
+CONFIG
+  [kx] in ~/.config/agent/config.toml: global knobs + [[kx.sources]] corpora.
+  See config.toml.example. Never logs the file's API keys.
+
+DETAIL: agent kx <cmd> --help-ai [--json]";
 
 const DBPATH_AI: &str = "\
 # agent db-path — print the store path

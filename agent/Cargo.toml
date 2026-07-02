@@ -25,5 +25,9 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
+# kx knowledge-index config: the whole-file `[kx]` reader needs real TOML
+# (arrays-of-tables `[[kx.sources]]`); the hand-rolled flat reader in embed.rs
+# cannot parse those. Scoped to the kx config load; secrets are never logged.
+toml = "0.8"
 ureq = { version = "2", features = ["json", "tls"] }
 uuid = { version = "1", features = ["v4"] }
