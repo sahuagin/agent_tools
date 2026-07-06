@@ -890,24 +890,31 @@ fn log_context_call(
 
 /// Resolve a memory body from the three input modes. Precedence:
 ///   --content-file <path>  >  --content -  (stdin)  >  --content <inline>.
-/// Returns None only when none was supplied.
+/// Returns None only when none was supplied. A body that WAS supplied but
+/// resolves to empty/whitespace-only is an ERROR, never a silent blank write
+/// (at-efx: an agent-mcp backend runs with null stdin, so `--content -` from
+/// an old forwarding client resolves to "" here — fail loud, don't blank).
 fn resolve_content(
     content: Option<String>,
     content_file: Option<PathBuf>,
 ) -> Result<Option<String>> {
-    if let Some(path) = content_file {
+    let resolved = if let Some(path) = content_file {
         let body = std::fs::read_to_string(&path)
             .with_context(|| format!("reading --content-file {}", path.display()))?;
-        return Ok(Some(body));
-    }
-    if content.as_deref() == Some("-") {
+        Some(body)
+    } else if content.as_deref() == Some("-") {
         let mut buf = String::new();
         std::io::stdin()
             .read_to_string(&mut buf)
             .context("reading content from stdin")?;
-        return Ok(Some(buf));
+        Some(buf)
+    } else {
+        content
+    };
+    if resolved.as_deref().is_some_and(|c| c.trim().is_empty()) {
+        bail!("memory content resolved to empty/whitespace-only; refusing to store a blank body");
     }
-    Ok(content)
+    Ok(resolved)
 }
 
 fn add(conn: &Connection, args: AddArgs) -> Result<()> {
@@ -4926,5 +4933,85 @@ mod tests {
             vec!["f6"],
             "superseded identity rule must leave the kernel"
         );
+    }
+
+    // ── at-efx: a provided-but-blank body is an error, never a silent write ──
+
+    #[test]
+    fn resolve_content_rejects_blank_provided_bodies() {
+        assert!(resolve_content(Some(String::new()), None).is_err());
+        assert!(resolve_content(Some("  \n\t".into()), None).is_err());
+        // Absent is still fine (e.g. update that doesn't touch the body)…
+        assert!(matches!(resolve_content(None, None), Ok(None)));
+        // …and a real body passes through.
+        assert_eq!(
+            resolve_content(Some("x".into()), None).unwrap().as_deref(),
+            Some("x")
+        );
+    }
+
+    #[test]
+    fn resolve_content_rejects_blank_file_and_keeps_missing_file_error() {
+        let dir = std::env::temp_dir().join(format!("mem-atefx-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let blank = dir.join("blank.md");
+        std::fs::write(&blank, " \n\t\n").unwrap();
+        assert!(resolve_content(None, Some(blank)).is_err());
+        assert!(resolve_content(None, Some(dir.join("nope.md"))).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn add_rejects_blank_content_instead_of_inserting() {
+        let conn = crate::db::open_in_memory().unwrap();
+        let err = add(
+            &conn,
+            AddArgs {
+                r#type: "project".into(),
+                name: "n".into(),
+                description: "d".into(),
+                content: Some("   ".into()),
+                content_file: None,
+                tags: String::new(),
+                cwd: String::new(),
+                source: "test".into(),
+                scope: None,
+                source_ref: None,
+                author: None,
+                no_adjudicate: true,
+            },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("empty/whitespace-only"), "{err}");
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM memories", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 0, "no blank memory row may be inserted");
+    }
+
+    #[test]
+    fn update_rejects_blank_content_and_leaves_row_untouched() {
+        let conn = crate::db::open_in_memory().unwrap();
+        seed(&conn, "m1", "keep", "original body");
+        assert!(update(
+            &conn,
+            UpdateArgs {
+                id: "m1".into(),
+                name: None,
+                description: None,
+                content: Some(String::new()),
+                content_file: None,
+                tags: None,
+                active: None,
+                scope: None,
+            },
+        )
+        .is_err());
+        let body: String = conn
+            .query_row("SELECT content FROM memories WHERE id='m1'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(body, "original body");
     }
 }
