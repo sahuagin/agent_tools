@@ -10,8 +10,9 @@
 //! so the server-side backend always uses the local DB and never re-forwards.
 
 use std::collections::HashMap;
+use std::io::Read;
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use clap::CommandFactory;
 use serde_json::{Map, Value};
 
@@ -84,7 +85,8 @@ pub enum Outcome {
 /// unreachable endpoint falls back to the local DB; a WRITE fails loud. A
 /// *reachable* server error propagates as-is (never masked by a local read).
 pub fn run(url: &str, args: &[String]) -> Result<Outcome> {
-    let (tool, arguments) = map_invocation(args)?;
+    let (tool, mut arguments) = map_invocation(args)?;
+    inline_memory_body(&tool, &mut arguments, &mut std::io::stdin())?;
     match crate::mcp::call_tool(url, &tool, arguments, None) {
         Ok(text) => {
             println!("{text}");
@@ -251,6 +253,49 @@ fn map_invocation(args: &[String]) -> Result<(String, Value)> {
     Ok((tool, Value::Object(arguments)))
 }
 
+/// Client-side body resolution for forwarded memory writes (at-efx).
+/// `--content-file <path>` and `--content -` name CLIENT-side sources; shipped
+/// verbatim, the server resolves them against ITS OWN filesystem/stdin — and
+/// agent-mcp spawns the inner `agent` via `.output()` (null stdin), so `-`
+/// silently reads as "" there. Resolve both HERE, before the call crosses the
+/// wire, honoring the CLI precedence (content-file > stdin > inline); only
+/// inline `content` is ever forwarded. `stdin` is injected for tests.
+fn inline_memory_body(tool: &str, arguments: &mut Value, stdin: &mut dyn Read) -> Result<()> {
+    if !matches!(tool, "memory_add" | "memory_update") {
+        return Ok(());
+    }
+    let Some(map) = arguments.as_object_mut() else {
+        return Ok(());
+    };
+    let body = if let Some(path) = map.remove("content_file") {
+        let path = path
+            .as_str()
+            .map(str::to_owned)
+            .ok_or_else(|| anyhow!("--content-file expects a path"))?;
+        let body = std::fs::read_to_string(&path)
+            .with_context(|| format!("reading --content-file {path} on the client"))?;
+        Some(body)
+    } else if map.get("content").and_then(Value::as_str) == Some("-") {
+        let mut buf = String::new();
+        stdin
+            .read_to_string(&mut buf)
+            .context("reading content from stdin")?;
+        Some(buf)
+    } else {
+        None
+    };
+    if let Some(body) = body {
+        if body.trim().is_empty() {
+            bail!(
+                "memory body for `{tool}` resolved to empty/whitespace-only content on the \
+                 client; refusing to forward a blank memory"
+            );
+        }
+        map.insert("content".to_string(), Value::String(body));
+    }
+    Ok(())
+}
+
 fn put(arguments: &mut Map<String, Value>, name: &str, multiple: bool, val: Value) {
     if multiple {
         match arguments.get_mut(name) {
@@ -388,5 +433,93 @@ mod tests {
         assert!(host_port("http://127.0.0.1:7700/mcp").is_some());
         assert!(host_port("https://127.0.0.1/mcp").is_some());
         assert!(host_port("not-a-url").is_none());
+    }
+
+    // ── at-efx: memory bodies resolve on the CLIENT before forwarding ──
+
+    fn temp_dir() -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("fwd-atefx-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn content_file_is_read_client_side_and_inlined() {
+        let dir = temp_dir();
+        let path = dir.join("body.md");
+        std::fs::write(&path, "the real body\n").unwrap();
+        let (tool, mut args) = map_invocation(&sv(&[
+            "memory",
+            "add",
+            "--type",
+            "project",
+            "--name",
+            "n",
+            "--description",
+            "d",
+            "--content-file",
+            path.to_str().unwrap(),
+        ]))
+        .unwrap();
+        inline_memory_body(&tool, &mut args, &mut std::io::empty()).unwrap();
+        assert_eq!(args["content"], "the real body\n");
+        assert!(
+            args.get("content_file").is_none(),
+            "content_file must never cross the wire"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn content_dash_reads_client_stdin() {
+        let (tool, mut args) =
+            map_invocation(&sv(&["memory", "update", "m-1", "--content", "-"])).unwrap();
+        inline_memory_body(&tool, &mut args, &mut "piped body".as_bytes()).unwrap();
+        assert_eq!(args["content"], "piped body");
+    }
+
+    #[test]
+    fn missing_or_blank_client_bodies_fail_loud() {
+        let dir = temp_dir();
+        // Missing file: error on the client, never forwarded for the server to guess at.
+        let (tool, mut args) = map_invocation(&sv(&[
+            "memory",
+            "update",
+            "m-1",
+            "--content-file",
+            dir.join("nope.md").to_str().unwrap(),
+        ]))
+        .unwrap();
+        assert!(inline_memory_body(&tool, &mut args, &mut std::io::empty()).is_err());
+        // Whitespace-only file: a "successful" read that would blank the memory.
+        let blank = dir.join("blank.md");
+        std::fs::write(&blank, "  \n\t\n").unwrap();
+        let (tool, mut args) = map_invocation(&sv(&[
+            "memory",
+            "update",
+            "m-1",
+            "--content-file",
+            blank.to_str().unwrap(),
+        ]))
+        .unwrap();
+        assert!(inline_memory_body(&tool, &mut args, &mut std::io::empty()).is_err());
+        // Empty stdin on `--content -`: exactly the null-stdin blanking bug.
+        let (tool, mut args) = map_invocation(&sv(&["memory", "add", "--content", "-"])).unwrap();
+        assert!(inline_memory_body(&tool, &mut args, &mut std::io::empty()).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn inline_content_and_other_tools_pass_through_untouched() {
+        // Plain inline content is forwarded as-is (the server validates blanks).
+        let (tool, mut args) =
+            map_invocation(&sv(&["memory", "update", "m-1", "--content", "real"])).unwrap();
+        inline_memory_body(&tool, &mut args, &mut std::io::empty()).unwrap();
+        assert_eq!(args["content"], "real");
+        // Non-memory-write tools are never rewritten, even with a "-" value.
+        let (tool, mut args) = map_invocation(&sv(&["memory", "recall", "-", "--k", "2"])).unwrap();
+        let before = args.clone();
+        inline_memory_body(&tool, &mut args, &mut std::io::empty()).unwrap();
+        assert_eq!(args, before);
     }
 }
