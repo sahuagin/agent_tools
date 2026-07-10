@@ -1206,12 +1206,19 @@ fn set_lifecycle(conn: &Connection, args: LifecycleArgs, lifecycle: &str) -> Res
     let ts = now();
 
     let (action, changed) = match lifecycle {
+        // gf2.12: restore must also clear the supersession FK fields —
+        // an active row still pointing at a "successor" lies to raw
+        // readers, and a later supersession would silently overwrite the
+        // stale pointer. The supersessions edge row is deliberately KEPT
+        // (it records that a supersession happened); the reversal itself
+        // is auditable via this call's before/after memory_events json.
         "active" => (
             "restore",
             conn.execute(
                 "UPDATE memories
                  SET lifecycle='active', is_active=1, archived_at=NULL, trashed_at=NULL,
-                     purge_after=NULL, updated_at=?1
+                     purge_after=NULL, superseded_by=NULL, supersede_reason=NULL,
+                     updated_at=?1
                  WHERE id=?2",
                 params![ts, args.id],
             )?,
@@ -4651,6 +4658,64 @@ mod tests {
             )
             .unwrap();
         assert_eq!(n, 2);
+    }
+
+    #[test]
+    fn restore_clears_supersession_fields_but_keeps_edge_history() {
+        // gf2.12: restore sets lifecycle=active but used to leave
+        // superseded_by/supersede_reason pointing at the no-longer-
+        // superseding memory — latent (read paths key off lifecycle)
+        // but the FK lies to raw readers and a later supersession
+        // silently overwrites history.
+        let conn = crate::db::open_in_memory().unwrap();
+        seed(&conn, "g1", "flagged-fact", "superseded then reversed");
+        seed(&conn, "g2", "flagger", "the (wrong) successor");
+        apply_supersession(
+            &conn,
+            "g1",
+            "g2",
+            "updates",
+            "sweep flag",
+            0.9,
+            "adjudicator",
+        )
+        .unwrap();
+
+        set_lifecycle(
+            &conn,
+            LifecycleArgs {
+                id: "g1".into(),
+                reason: "sweep edge reversed by operator".into(),
+                source_report: String::new(),
+            },
+            "active",
+        )
+        .unwrap();
+
+        let (lifecycle, succ, reason): (String, Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT lifecycle, superseded_by, supersede_reason FROM memories WHERE id='g1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(lifecycle, "active");
+        assert_eq!(succ, None, "restore must clear the stale successor FK");
+        assert_eq!(
+            reason, None,
+            "restore must clear the stale supersede reason"
+        );
+
+        // The typed edge stays as history (the supersession DID happen);
+        // the reversal is auditable via the restore event's before/after.
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM supersessions WHERE old_id='g1' AND new_id='g2'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 1);
     }
 
     #[test]
