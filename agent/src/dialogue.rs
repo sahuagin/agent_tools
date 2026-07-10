@@ -34,6 +34,18 @@ enum Action {
     Say(Say),
     /// List peers currently on the channel (raw JSON).
     Peers(Peers),
+    /// PA system: announce to every active peer (sender excluded).
+    Broadcast(Broadcast),
+    /// Send to a team's current members (sender excluded).
+    Multicast(Multicast),
+    /// Register a peer's interest in a team (group mailbox).
+    TeamJoin(TeamJoin),
+    /// Withdraw a peer's interest in a team.
+    TeamLeave(TeamLeave),
+    /// List teams, one team's members, or a peer's teams (raw JSON).
+    Teams(Teams),
+    /// Remove stale peer registrations (server-side sweep).
+    Prune(Prune),
 }
 
 #[derive(Args)]
@@ -87,6 +99,81 @@ struct Peers {
     url: Option<String>,
 }
 
+#[derive(Args)]
+struct Broadcast {
+    #[arg(long)]
+    from: String,
+    #[arg(long)]
+    content: String,
+    /// Only address one kind of peer (e.g. cc, mu).
+    #[arg(long)]
+    role: Option<String>,
+    /// Recency window for recipients (ms). Server default: 24h.
+    #[arg(long)]
+    active_within_ms: Option<i64>,
+    /// Optional thread id to group the announcement and its replies.
+    #[arg(long)]
+    thread: Option<String>,
+    #[arg(long)]
+    url: Option<String>,
+}
+
+#[derive(Args)]
+struct Multicast {
+    #[arg(long)]
+    from: String,
+    /// Team (group mailbox) name.
+    #[arg(long)]
+    team: String,
+    #[arg(long)]
+    content: String,
+    /// Optional thread id to group the message and its replies.
+    #[arg(long)]
+    thread: Option<String>,
+    #[arg(long)]
+    url: Option<String>,
+}
+
+#[derive(Args)]
+struct TeamJoin {
+    /// Team (group mailbox) name.
+    team: String,
+    /// Peer id joining, e.g. cc:<session-id>.
+    id: String,
+    #[arg(long)]
+    url: Option<String>,
+}
+
+#[derive(Args)]
+struct TeamLeave {
+    /// Team (group mailbox) name.
+    team: String,
+    /// Peer id leaving.
+    id: String,
+    #[arg(long)]
+    url: Option<String>,
+}
+
+#[derive(Args)]
+struct Teams {
+    /// List this team's members. Omit for the all-teams overview.
+    team: Option<String>,
+    /// Overview mode: only teams this peer belongs to.
+    #[arg(long)]
+    id: Option<String>,
+    #[arg(long)]
+    url: Option<String>,
+}
+
+#[derive(Args)]
+struct Prune {
+    /// Staleness cutoff in ms (server default: its peer TTL, 24h).
+    #[arg(long)]
+    max_age_ms: Option<i64>,
+    #[arg(long)]
+    url: Option<String>,
+}
+
 fn endpoint(url: &Option<String>) -> String {
     url.clone()
         .or_else(|| crate::embed::resolve_setting("dialogue", "url", "AGENT_DIALOGUE_URL"))
@@ -121,6 +208,71 @@ pub fn run(cmd: DialogueCmd) -> Result<()> {
                 args["role"] = json!(r);
             }
             let text = mcp::call_tool(&endpoint(&p.url), "dialogue_peers", args, None)?;
+            println!("{text}");
+            Ok(())
+        }
+        Action::Broadcast(b) => {
+            let mut args = json!({"from": b.from, "content": b.content});
+            if let Some(r) = &b.role {
+                args["role"] = json!(r);
+            }
+            if let Some(w) = b.active_within_ms {
+                args["active_within_ms"] = json!(w);
+            }
+            if let Some(t) = &b.thread {
+                args["session_thread"] = json!(t);
+            }
+            let text = mcp::call_tool(&endpoint(&b.url), "dialogue_broadcast", args, None)?;
+            println!("{text}");
+            Ok(())
+        }
+        Action::Multicast(m) => {
+            let mut args = json!({"from": m.from, "team": m.team, "content": m.content});
+            if let Some(t) = &m.thread {
+                args["session_thread"] = json!(t);
+            }
+            let text = mcp::call_tool(&endpoint(&m.url), "dialogue_multicast", args, None)?;
+            println!("{text}");
+            Ok(())
+        }
+        Action::TeamJoin(t) => {
+            let text = mcp::call_tool(
+                &endpoint(&t.url),
+                "dialogue_team_join",
+                json!({"team": t.team, "peer_id": t.id}),
+                None,
+            )?;
+            println!("{text}");
+            Ok(())
+        }
+        Action::TeamLeave(t) => {
+            let text = mcp::call_tool(
+                &endpoint(&t.url),
+                "dialogue_team_leave",
+                json!({"team": t.team, "peer_id": t.id}),
+                None,
+            )?;
+            println!("{text}");
+            Ok(())
+        }
+        Action::Teams(t) => {
+            let mut args = json!({});
+            if let Some(team) = &t.team {
+                args["team"] = json!(team);
+            }
+            if let Some(id) = &t.id {
+                args["peer_id"] = json!(id);
+            }
+            let text = mcp::call_tool(&endpoint(&t.url), "dialogue_teams", args, None)?;
+            println!("{text}");
+            Ok(())
+        }
+        Action::Prune(p) => {
+            let mut args = json!({});
+            if let Some(a) = p.max_age_ms {
+                args["max_age_ms"] = json!(a);
+            }
+            let text = mcp::call_tool(&endpoint(&p.url), "dialogue_prune", args, None)?;
             println!("{text}");
             Ok(())
         }
