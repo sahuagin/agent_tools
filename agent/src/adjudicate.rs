@@ -416,6 +416,23 @@ const PROSE_MARKERS: &[&str] = &[
     "no longer true",
 ];
 
+/// SQL predicate: any prose marker appears in content or name.
+/// gf2.13: instr() is case-sensitive, so the first live sweep caught
+/// only 45 of ~123 prose-marked memories — mixed-case prose
+/// ("Superseded by …") slipped the exact-case match. lower() both
+/// sides; the markers are ASCII, so SQLite's ASCII-only lower() is
+/// sufficient.
+fn prose_marker_clause() -> String {
+    PROSE_MARKERS
+        .iter()
+        .map(|m| {
+            let m = m.to_ascii_lowercase();
+            format!("instr(lower(content), '{m}') > 0 OR instr(lower(name), '{m}') > 0")
+        })
+        .collect::<Vec<_>>()
+        .join(" OR ")
+}
+
 pub struct SweepOpts {
     pub prose_only: bool,
     pub dry_run: bool,
@@ -436,11 +453,7 @@ pub fn sweep(conn: &Connection, opts: &SweepOpts) -> Result<()> {
         bail!("sweep requires [adjudicate] config (see config.toml.example)");
     };
 
-    let marker_clause = PROSE_MARKERS
-        .iter()
-        .map(|m| format!("instr(content, '{m}') > 0 OR instr(name, '{m}') > 0"))
-        .collect::<Vec<_>>()
-        .join(" OR ");
+    let marker_clause = prose_marker_clause();
     let prose_filter = if opts.prose_only {
         format!(" AND ({marker_clause})")
     } else {
@@ -491,7 +504,7 @@ pub fn sweep(conn: &Connection, opts: &SweepOpts) -> Result<()> {
         match outcome {
             Ok(summary) => {
                 edges += summary.matches("-edge").count();
-                queued += summary.matches("queued").count();
+                queued += summary.matches(queue_label(opts.dry_run)).count();
                 if !summary.is_empty() {
                     println!("[{}/{}] {seed}: {summary}", i + 1, seeds.len());
                 }
@@ -534,6 +547,18 @@ fn sweep_one(conn: &Connection, seed: &str, cfg: &AdjudicateConfig) -> Result<St
     apply_verdicts(conn, seed, &candidates, &verdicts, cfg, true)
 }
 
+/// The queue-action label each sweep mode emits in its summary rows.
+/// gf2.13: dry-run rows say "would-queue", live rows say "queued" —
+/// the tally counted only "queued", so every dry run reported 0
+/// queued. Count the label the mode actually prints.
+fn queue_label(dry_run: bool) -> &'static str {
+    if dry_run {
+        "would-queue"
+    } else {
+        "queued"
+    }
+}
+
 /// Dry-run variant: same nominate → classify, but verdicts are PRINTED
 /// as proposals instead of applied, and nothing is recorded as swept.
 fn sweep_dry_run_one(conn: &Connection, seed: &str, cfg: &AdjudicateConfig) -> Result<String> {
@@ -544,8 +569,18 @@ fn sweep_dry_run_one(conn: &Connection, seed: &str, cfg: &AdjudicateConfig) -> R
     }
     let raw = call_llm(cfg, &build_prompt(&seed_mem, &candidates))?;
     let verdicts = parse_verdicts(&raw)?;
+    Ok(format_dry_run_proposals(&candidates, &verdicts, cfg))
+}
+
+/// Verdicts → proposal rows ("would-edge" / "would-queue"), mirroring
+/// apply_verdicts' thresholds without writing anything.
+fn format_dry_run_proposals(
+    candidates: &[Candidate],
+    verdicts: &[Verdict],
+    cfg: &AdjudicateConfig,
+) -> String {
     let mut out: Vec<String> = Vec::new();
-    for v in &verdicts {
+    for v in verdicts {
         if v.relation == "unrelated" {
             continue;
         }
@@ -563,7 +598,7 @@ fn sweep_dry_run_one(conn: &Connection, seed: &str, cfg: &AdjudicateConfig) -> R
             ));
         }
     }
-    Ok(out.join("; "))
+    out.join("; ")
 }
 
 #[cfg(test)]
@@ -776,6 +811,76 @@ mod tests {
             hist_lc, "active",
             "updates in sweep mode must not flip lifecycle"
         );
+    }
+
+    /// gf2.13: prose-marker seeding must be case-insensitive — the
+    /// first live sweep matched exact case only and caught 45 of ~123
+    /// prose-marked memories.
+    #[test]
+    fn prose_marker_seed_match_is_case_insensitive() {
+        let conn = crate::db::open_in_memory().unwrap();
+        // Case variants the exact-case match missed: lowercase where
+        // the marker is "OBSOLETE", title-case where it is
+        // "superseded", and a marker in the NAME column.
+        seed(
+            &conn,
+            "m-lower",
+            "note",
+            "this claim is obsolete since the migration",
+        );
+        seed(&conn, "m-mixed", "plan", "Superseded by the 2026 design");
+        seed(&conn, "m-name", "Corrected-path", "see the new layout");
+        seed(
+            &conn,
+            "m-plain",
+            "status",
+            "routine note, nothing corrective",
+        );
+        let sql = format!(
+            "SELECT id FROM memories WHERE {} ORDER BY id",
+            prose_marker_clause()
+        );
+        let mut stmt = conn.prepare(&sql).unwrap();
+        let ids: Vec<String> = stmt
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert_eq!(ids, ["m-lower", "m-mixed", "m-name"]);
+    }
+
+    /// gf2.13: the sweep tally must count the label the mode actually
+    /// emits — dry-run rows say "would-queue", and counting "queued"
+    /// made every dry run report 0 queued.
+    #[test]
+    fn dry_run_tally_counts_would_queue_rows() {
+        let conn = crate::db::open_in_memory().unwrap();
+        seed(&conn, "hist", "dated-status", "status as of april");
+        seed(&conn, "wrong", "false-claim", "the test passed");
+        let verdicts = vec![
+            Verdict {
+                candidate: 1,
+                relation: "updates".into(),
+                confidence: 0.6,
+                rationale: "newer status".into(),
+            },
+            Verdict {
+                candidate: 2,
+                relation: "corrects".into(),
+                confidence: 0.95,
+                rationale: "the test never passed".into(),
+            },
+        ];
+        let cands = [cand(&conn, "hist"), cand(&conn, "wrong")];
+        let summary = format_dry_run_proposals(&cands, &verdicts, &cfg());
+        assert!(summary.contains("would-queue hist (updates"), "{summary}");
+        assert!(summary.contains("would-edge wrong (corrects"), "{summary}");
+        // The tally counts the dry-run label: nonzero, and would-edge
+        // rows are not miscounted as queued.
+        assert_eq!(summary.matches(queue_label(true)).count(), 1);
+        // Dry-run rows never carry the live label — the two tallies
+        // cannot double-count each other.
+        assert_eq!(summary.matches(queue_label(false)).count(), 0);
     }
 
     #[test]
