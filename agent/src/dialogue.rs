@@ -283,6 +283,10 @@ pub fn run(cmd: DialogueCmd) -> Result<()> {
 /// (one Monitor notification). Read full content via `dialogue poll` when
 /// alerted. Resilient to transient errors (logs + retries); runs until killed.
 fn watch(w: Watch) -> Result<()> {
+    // Watch runs for the session's lifetime, so it is the peer's presence
+    // holder: if [dialogue] presence_etcd is configured, keep a lease-backed
+    // registration alive for as long as we watch (no config → no-op).
+    crate::dialogue_presence::hold(&w.id);
     let url = endpoint(&w.url);
     let read_timeout = Some(Duration::from_millis(w.timeout_ms + 10_000));
     let mut since = w.since;
