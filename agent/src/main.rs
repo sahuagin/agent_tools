@@ -1,6 +1,7 @@
 mod adjudicate;
 mod db;
 mod dialogue;
+mod dialogue_presence;
 mod embed;
 mod forward;
 mod kx;

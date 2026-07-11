@@ -11,6 +11,8 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"
+# etcd v3 JSON-gateway keys/values are base64 (dialogue_presence.rs).
+base64 = "0.22"
 chrono = "0.4"
 clap = { version = "4", features = ["derive"] }
 clap-catalog = { path = "../clap-catalog" }
