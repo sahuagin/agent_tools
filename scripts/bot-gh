@@ -1,0 +1,57 @@
+#!/bin/sh
+# bot-gh — wrap gh with App-token auth via $BOT_IDENTITY.
+#
+# Usage:
+#   BOT_IDENTITY=<slug> bot-gh <gh-subcommand> [args...]
+#
+# Mints a fresh installation token via mint-app-token, exports it as
+# GH_TOKEN, then execs gh. The token grants whatever permissions the App
+# was configured with (Contents R/W, Pull requests R/W, Metadata R for
+# tcovert-c137); gh will refuse operations the token doesn't have rights
+# for and report the GitHub error directly — no extra preflight needed
+# here because the API gives clear feedback.
+#
+# BOT_IDENTITY-unset behavior:
+#   Always error out. If you don't want bot identity, use raw gh.
+
+set -u
+
+# --- default BOT_IDENTITY to the sole configured slug, if exactly one ---
+default_bot_identity() {
+    set -- "$HOME/.claude/secrets/github-apps/"*.json
+    [ -e "$1" ] || return 1
+    [ "$#" -eq 1 ] || return 1
+    slug=${1##*/}
+    slug=${slug%.json}
+    echo "$slug"
+}
+
+if [ -z "${BOT_IDENTITY:-}" ]; then
+    BOT_IDENTITY=$(default_bot_identity || true)
+fi
+
+if [ -z "${BOT_IDENTITY:-}" ]; then
+    echo "bot-gh: BOT_IDENTITY env var is required." >&2
+    echo "  Set it to a bot identity slug, e.g.: BOT_IDENTITY=tcovert-c137" >&2
+    echo "  Use raw 'gh' if you don't need bot identity auth." >&2
+    echo "  Available slugs:" >&2
+    ls -1 "$HOME/.claude/secrets/github-apps/"*.json 2>/dev/null \
+        | sed 's|.*/||;s|\.json$||;s|^|    |' >&2
+    exit 1
+fi
+
+CONFIG="$HOME/.claude/secrets/github-apps/$BOT_IDENTITY.json"
+if [ ! -f "$CONFIG" ]; then
+    echo "bot-gh: no config at $CONFIG" >&2
+    echo "  Available slugs:" >&2
+    ls -1 "$HOME/.claude/secrets/github-apps/"*.json 2>/dev/null \
+        | sed 's|.*/||;s|\.json$||;s|^|    |' >&2
+    exit 1
+fi
+
+TOK=$(mint-app-token "$BOT_IDENTITY" 2>/dev/null) || {
+    echo "bot-gh: failed to mint App token for $BOT_IDENTITY" >&2
+    exit 1
+}
+
+GH_TOKEN="$TOK" exec gh "$@"

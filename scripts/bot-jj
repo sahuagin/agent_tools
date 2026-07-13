@@ -1,0 +1,198 @@
+#!/bin/sh
+# bot-jj — wrap jj with bot identity for the duration of one invocation.
+#
+# Usage:
+#   BOT_IDENTITY=<slug> bot-jj <jj-subcommand> [args...]
+#
+# Reads bot_login/bot_email from
+#   ~/.claude/secrets/github-apps/<slug>.json
+# Stores the repo's current user.name/user.email, applies the bot
+# identity, runs jj, and restores the prior identity on exit (including
+# via EXIT/INT/TERM trap). A sidecar at
+#   <jj-root>/.jj/repo/.bot-jj.restore
+# captures the prior identity so a hard crash can be recovered next run.
+#
+# Subcommand routing:
+#   describe | new | commit | squash         identity applied
+#   git push                                  identity applied + preflight
+#                                             (verifies App is installed on
+#                                              the current repo's origin)
+#   anything else                             identity NOT applied; pass-through
+#
+# BOT_IDENTITY-unset behavior:
+#   identity-requiring subcommands → error out with hint
+#   anything else → pass through to raw jj (read-only ops work as sahuagin)
+
+set -u
+
+# --- subcommand classification ---
+needs_identity() {
+    case "$1" in
+        describe|new|commit|squash) return 0 ;;
+    esac
+    return 1
+}
+
+is_push() {
+    [ "${1:-}" = "git" ] && [ "${2:-}" = "push" ]
+}
+
+# --- default BOT_IDENTITY to the sole configured slug, if exactly one ---
+default_bot_identity() {
+    set -- "$HOME/.claude/secrets/github-apps/"*.json
+    [ -e "$1" ] || return 1
+    [ "$#" -eq 1 ] || return 1
+    slug=${1##*/}
+    slug=${slug%.json}
+    echo "$slug"
+}
+
+sub="${1:-}"
+
+# --- BOT_IDENTITY-unset: try single-slug default, else error/passthrough ---
+if [ -z "${BOT_IDENTITY:-}" ]; then
+    DEFAULT_SLUG=$(default_bot_identity || true)
+    if [ -n "$DEFAULT_SLUG" ]; then
+        BOT_IDENTITY="$DEFAULT_SLUG"
+    elif needs_identity "$sub" || is_push "$sub" "${2:-}"; then
+        echo "bot-jj: BOT_IDENTITY env var is required for '$sub'." >&2
+        echo "  Set it to a bot identity slug, e.g.: BOT_IDENTITY=tcovert-c137" >&2
+        echo "  Available slugs:" >&2
+        ls -1 "$HOME/.claude/secrets/github-apps/"*.json 2>/dev/null \
+            | sed 's|.*/||;s|\.json$||;s|^|    |' >&2
+        exit 1
+    else
+        exec jj "$@"
+    fi
+fi
+
+# --- load bot identity from config ---
+CONFIG="$HOME/.claude/secrets/github-apps/$BOT_IDENTITY.json"
+if [ ! -f "$CONFIG" ]; then
+    echo "bot-jj: no config at $CONFIG" >&2
+    echo "  Available slugs:" >&2
+    ls -1 "$HOME/.claude/secrets/github-apps/"*.json 2>/dev/null \
+        | sed 's|.*/||;s|\.json$||;s|^|    |' >&2
+    exit 1
+fi
+
+BOT_LOGIN=$(jq -r '.bot_login // empty' "$CONFIG")
+BOT_EMAIL=$(jq -r '.bot_email // empty' "$CONFIG")
+if [ -z "$BOT_LOGIN" ] || [ -z "$BOT_EMAIL" ]; then
+    echo "bot-jj: $CONFIG missing bot_login or bot_email field" >&2
+    exit 1
+fi
+
+# --- if subcommand doesn't need identity, pass through w/o config changes ---
+if ! needs_identity "$sub" && ! is_push "$sub" "${2:-}"; then
+    exec jj "$@"
+fi
+
+# --- must be in a jj repo from here on ---
+JJ_ROOT=$(jj root 2>/dev/null) || {
+    echo "bot-jj: not inside a jj repository" >&2
+    exit 1
+}
+SIDECAR="$JJ_ROOT/.jj/repo/.bot-jj.restore"
+
+# --- preflight for git push (run BEFORE mutating jj config; if this fails
+#     we exit cleanly without ever touching repo identity) ---
+if is_push "$sub" "${2:-}"; then
+    ORIGIN=$(git -C "$JJ_ROOT" config --get remote.origin.url 2>/dev/null || true)
+    if [ -z "$ORIGIN" ]; then
+        echo "bot-jj: cannot determine origin URL for preflight" >&2
+        exit 1
+    fi
+
+    case "$ORIGIN" in
+        git@github.com:*)
+            OWNER_REPO=${ORIGIN#git@github.com:}
+            OWNER_REPO=${OWNER_REPO%.git}
+            ;;
+        https://github.com/*)
+            OWNER_REPO=${ORIGIN#https://github.com/}
+            OWNER_REPO=${OWNER_REPO%.git}
+            ;;
+        git@*.github.com:*)
+            # per-repo deploy-key ssh alias (Host <repo>.github.com in ~/.ssh/config)
+            # — still github.com underneath, so App identity + preflight apply.
+            OWNER_REPO=${ORIGIN#git@*.github.com:}
+            OWNER_REPO=${OWNER_REPO%.git}
+            ;;
+        *)
+            echo "bot-jj: origin '$ORIGIN' is not github.com — App identity does not apply" >&2
+            exit 1
+            ;;
+    esac
+
+    TOK=$(mint-app-token "$BOT_IDENTITY" 2>/dev/null) || {
+        echo "bot-jj: failed to mint App token for preflight" >&2
+        exit 1
+    }
+
+    STATUS=$(curl -sS -o /dev/null -w '%{http_code}' \
+        -H "Authorization: token $TOK" \
+        -H "Accept: application/vnd.github+json" \
+        "https://api.github.com/repos/$OWNER_REPO")
+
+    if [ "$STATUS" != "200" ]; then
+        echo "bot-jj: App $BOT_IDENTITY is not installed on $OWNER_REPO (API returned $STATUS)" >&2
+        echo "  Install at: https://github.com/settings/installations/" >&2
+        exit 1
+    fi
+fi
+
+# --- save current identity (sidecar wins if present from a prior crash) ---
+if [ -f "$SIDECAR" ]; then
+    PREV_NAME=$(jq -r '.user_name // ""' "$SIDECAR")
+    PREV_EMAIL=$(jq -r '.user_email // ""' "$SIDECAR")
+    echo "bot-jj: recovered prior identity from $SIDECAR" >&2
+else
+    PREV_NAME=$(jj config get user.name 2>/dev/null || true)
+    PREV_EMAIL=$(jj config get user.email 2>/dev/null || true)
+    cat > "$SIDECAR" <<EOF
+{
+  "user_name": $(printf '%s' "$PREV_NAME" | jq -R .),
+  "user_email": $(printf '%s' "$PREV_EMAIL" | jq -R .),
+  "applied_bot": $(printf '%s' "$BOT_LOGIN" | jq -R .),
+  "applied_at": $(date +%s)
+}
+EOF
+fi
+
+# jj config set parses values as TOML — brackets in bare strings
+# (e.g. tcovert-c137[bot]) are invalid. Wrap in TOML double-quotes.
+toml_quote() { printf '"%s"' "$1"; }
+
+restore_identity() {
+    if [ -n "$PREV_NAME" ]; then
+        jj config set --repo user.name "$(toml_quote "$PREV_NAME")" >/dev/null 2>&1 || true
+    else
+        jj config unset --repo user.name >/dev/null 2>&1 || true
+    fi
+    if [ -n "$PREV_EMAIL" ]; then
+        jj config set --repo user.email "$(toml_quote "$PREV_EMAIL")" >/dev/null 2>&1 || true
+    else
+        jj config unset --repo user.email >/dev/null 2>&1 || true
+    fi
+    rm -f "$SIDECAR"
+}
+trap restore_identity EXIT INT TERM
+
+# --- apply bot identity ---
+jj config set --repo user.name "$(toml_quote "$BOT_LOGIN")"
+jj config set --repo user.email "$(toml_quote "$BOT_EMAIL")"
+
+# --- run jj; trap will restore on exit ---
+jj "$@"
+jj_status=$?
+
+# --- jj's config-set semantics: setting user.name/user.email applies to
+#     NEW commits only, not the existing working copy. For identity-
+#     touching ops, also metaedit @ so the current working copy's author
+#     reflects the bot identity. Idempotent.
+if [ "$jj_status" -eq 0 ] && needs_identity "$sub"; then
+    jj metaedit --update-author -r @ >/dev/null 2>&1 || true
+fi
+
+exit $jj_status
