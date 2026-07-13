@@ -1,0 +1,71 @@
+#!/bin/sh
+# mint-app-token — mint a short-lived GitHub App installation token.
+#
+# No Python, no venv: signs the JWT with `openssl` and exchanges it with
+# `curl`. Deps are system tools only — openssl, curl, jq.
+#
+# Reads, from ${BOT_SECRETS_DIR:-$HOME/.claude/secrets/github-apps}:
+#   <slug>.json   { "app_id": <int>, "installation_id": <int>, ... }
+#   <slug>.pem    PEM-encoded RSA private key for the GitHub App
+#
+# Signs a 9-minute App JWT, exchanges it at GitHub for a 1-hour
+# installation token, prints ONLY the token to stdout (safe for command
+# substitution):
+#
+#   GH_TOKEN=$(mint-app-token tcovert-c137) gh pr create ...
+#
+# Exit codes:
+#   0  token printed
+#   1  config/key missing, GitHub returned an error, or transport failed
+
+set -eu
+
+SLUG="${1:-}"
+if [ -z "$SLUG" ]; then
+    echo "usage: mint-app-token <slug>" >&2
+    exit 1
+fi
+
+DIR="${BOT_SECRETS_DIR:-$HOME/.claude/secrets/github-apps}"
+CFG="$DIR/$SLUG.json"
+PEM="$DIR/$SLUG.pem"
+
+[ -f "$CFG" ] || { echo "mint-app-token: no config at $CFG" >&2; exit 1; }
+[ -f "$PEM" ] || { echo "mint-app-token: no private key at $PEM" >&2; exit 1; }
+
+APP_ID=$(jq -r '.app_id // empty' "$CFG")
+INSTALL_ID=$(jq -r '.installation_id // empty' "$CFG")
+if [ -z "$APP_ID" ] || [ -z "$INSTALL_ID" ]; then
+    echo "mint-app-token: $CFG missing app_id or installation_id" >&2
+    exit 1
+fi
+
+# base64url with no padding and no line wrap — JWT segment encoding.
+b64url() { openssl base64 -A | tr '+/' '-_' | tr -d '='; }
+
+now=$(date +%s)
+iat=$((now - 60))   # backdate to tolerate minor clock skew
+exp=$((now + 540))  # 9 minutes; GitHub caps App JWTs at 10
+
+header=$(printf '{"alg":"RS256","typ":"JWT"}' | b64url)
+# app_id/iat/exp are integers — emit unquoted so iss is a JSON number.
+payload=$(printf '{"iat":%d,"exp":%d,"iss":%d}' "$iat" "$exp" "$APP_ID" | b64url)
+unsigned="$header.$payload"
+sig=$(printf '%s' "$unsigned" | openssl dgst -sha256 -sign "$PEM" -binary | b64url)
+jwt="$unsigned.$sig"
+
+resp=$(curl -fsS -X POST \
+    -H "Authorization: Bearer $jwt" \
+    -H "Accept: application/vnd.github+json" \
+    -H "X-GitHub-Api-Version: 2022-11-28" \
+    "https://api.github.com/app/installations/$INSTALL_ID/access_tokens") || {
+    echo "mint-app-token: token exchange failed for $SLUG (app_id=$APP_ID installation_id=$INSTALL_ID)" >&2
+    exit 1
+}
+
+token=$(printf '%s' "$resp" | jq -r '.token // empty')
+if [ -z "$token" ]; then
+    echo "mint-app-token: no token in GitHub response" >&2
+    exit 1
+fi
+printf '%s' "$token"

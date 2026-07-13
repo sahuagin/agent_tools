@@ -1,0 +1,396 @@
+#!/bin/sh
+# agent-slot — etcd-backed atomic slot allocator for pot-based agent spawns.
+#
+# Subcommands:
+#   init          — populate /agents/slots/* pool definitions (one-time setup)
+#   list          — show pool, leased status
+#   acquire [task_id]  — atomic-CAS a free slot, output eval-able env vars
+#   release <slot>     — release a slot (revoke its lease)
+#   reap          — list leased slots whose pots are no longer running (debug)
+#
+# Session identity (claudecode + any long-lived agent session):
+#   register <name>    — CAS-register a unique session name backed by an etcd
+#                        lease. REFUSES if another LIVE session holds the name;
+#                        idempotent for the owning session (refreshes its lease).
+#                        Output is eval-able (AGENT_SESSION_NAME/LEASE/TTL).
+#   renew <name>       — extend the lease on a name this session owns (heartbeat).
+#   unregister <name>  — drop the name (free it immediately).
+#   sessions           — list registered sessions + remaining TTL.
+#
+# Unlike the fixed 10-slot compute pool, session names are an UNBOUNDED
+# namespace: each session registers ITS chosen name (the operator's /name), CAS
+# guarantees uniqueness, and the lease gives crash-safety — a dead session's
+# name self-clears at TTL so nothing leaks. Reused by `sprint-start` as the
+# br-claim actor, unifying claudecode sessions and pot agents under one registry.
+#
+# Usage idiom (from agent-spawn-v2):
+#   eval "$(agent-slot acquire my-task)"
+#   # now $AGENT_SLOT_NAME, $AGENT_SLOT_IP, $AGENT_SLOT_LEASE are set
+#   trap 'agent-slot release "$AGENT_SLOT_NAME"' EXIT
+#   agent-spawn "$AGENT_SLOT_NAME" "$AGENT_SLOT_IP" "$prompt"
+#
+# etcd schema:
+#   /agents/slots/<name>     static config: ip, hostname, pot_template
+#   /agents/leases/<name>    ephemeral lease (TTL-bound): holder_pid, task_id, ...
+#
+# Design notes:
+#   - Uses etcdctl txn with mod("/agents/leases/<slot>") = "0" for atomic
+#     create-if-absent. Whichever of N concurrent racers wins the txn owns
+#     the slot; the rest see FAILURE and try the next slot.
+#   - Lease TTL acts as a heartbeat: if the holder dies without releasing,
+#     the lease expires and the slot becomes available again. Default TTL
+#     of 600s covers a long-running pi invocation; bump with --ttl as needed.
+#   - acquire prints shell-eval-able output (KEY=VALUE lines), not JSON,
+#     so callers don't need jq.
+
+set -e
+
+# Central infra etcd (10.1.1.172). The old 127.0.0.1 default was wrong on every
+# host that isn't the etcd box itself; override per-host with AGENT_SLOT_ETCD.
+ETCD_ENDPOINTS="${AGENT_SLOT_ETCD:-http://10.1.1.172:2379}"
+ETCDCTL="etcdctl --endpoints=$ETCD_ENDPOINTS"
+
+usage() {
+    sed -n '/^# agent-slot/,/^$/p' "$0" | sed 's/^# \?//'
+    exit "${1:-1}"
+}
+
+# Default static pool: agent-1..agent-10 at 10.1.1.220..229.
+# Avoids known LAN infra:
+#   .1   = router
+#   .15  = ?
+#   .172 = permanent ARP entry
+#   .190 = ?
+#   .206 = NAS (DSM)
+#   .249 = warden
+init_pool() {
+    # Slot names are zero-padded so etcd's lexical key order matches
+    # numeric order. Without padding, "agent-10" sorts between "agent-1"
+    # and "agent-2", which makes the acquire iteration order surprising.
+    for i in 01 02 03 04 05 06 07 08 09 10; do
+        slot="agent-$i"
+        ip="10.1.1.$((219 + ${i#0}))"  # strip leading zero for arithmetic
+        hostname="${slot}.threadripper.sahuagin.net"
+        json='{"ip":"'$ip'","hostname":"'$hostname'","pot_template":"agent-runtime"}'
+        $ETCDCTL put "/agents/slots/$slot" "$json" >/dev/null
+        echo "registered $slot @ $ip"
+    done
+}
+
+list_pool() {
+    printf '%-12s %-15s %-12s %s\n' SLOT IP STATUS LEASE
+    printf '%-12s %-15s %-12s %s\n' ---- -- ------ -----
+    for kv in $($ETCDCTL get --prefix /agents/slots/ -w simple 2>/dev/null | paste -d'|' - -); do
+        key=$(echo "$kv" | cut -d'|' -f1)
+        val=$(echo "$kv" | cut -d'|' -f2)
+        slot=$(echo "$key" | sed 's|.*/||')
+        ip=$(echo "$val" | sed -n 's/.*"ip":"\([^"]*\)".*/\1/p')
+        lease_val=$($ETCDCTL get "/agents/leases/$slot" --print-value-only 2>/dev/null)
+        if [ -n "$lease_val" ]; then
+            status="leased"
+            holder=$(echo "$lease_val" | sed -n 's/.*"task_id":"\([^"]*\)".*/\1/p')
+        else
+            status="free"
+            holder="-"
+        fi
+        printf '%-12s %-15s %-12s %s\n' "$slot" "$ip" "$status" "$holder"
+    done
+}
+
+acquire_slot() {
+    task_id="${1:-unknown}"
+    ttl="${AGENT_SLOT_TTL:-600}"
+    holder_host="$(hostname -s)"
+    holder_pid="$$"
+    acquired_at="$(date -u +%FT%TZ)"
+
+    # 1. Grant a lease for the slot we'll claim
+    lease_grant_out=$($ETCDCTL lease grant "$ttl" 2>&1)
+    lease_id=$(echo "$lease_grant_out" | awk '/granted with TTL/ {print $2}')
+    if [ -z "$lease_id" ]; then
+        echo "agent-slot: failed to grant lease: $lease_grant_out" >&2
+        return 2
+    fi
+
+    # 2. Iterate slots in /agents/slots/ and try atomic-CAS until one succeeds
+    for slot_kv in $($ETCDCTL get --prefix /agents/slots/ -w simple 2>/dev/null | paste -d'|' - -); do
+        key=$(echo "$slot_kv" | cut -d'|' -f1)
+        val=$(echo "$slot_kv" | cut -d'|' -f2)
+        slot=$(echo "$key" | sed 's|.*/||')
+        ip=$(echo "$val" | sed -n 's/.*"ip":"\([^"]*\)".*/\1/p')
+
+        lease_value='{"holder_host":"'$holder_host'","holder_pid":'$holder_pid',"task_id":"'$task_id'","acquired_at":"'$acquired_at'"}'
+        # etcdctl txn parses `put key "value"` — embedded `"` chars in
+        # `value` confuse the lexer (only the first char survives). Escape
+        # them so the stored value is the original JSON.
+        lease_value_esc=$(echo "$lease_value" | sed 's/"/\\"/g')
+
+        # CAS: set /agents/leases/<slot> only if it doesn't exist.
+        # mod() = "0" means the key has never been modified (i.e., absent).
+        result=$(printf 'mod("/agents/leases/%s") = "0"\n\nput /agents/leases/%s "%s" --lease=%s\n\n\n' \
+                    "$slot" "$slot" "$lease_value_esc" "$lease_id" \
+                  | $ETCDCTL txn 2>&1)
+        if echo "$result" | grep -q "^SUCCESS"; then
+            # Won the slot
+            echo "AGENT_SLOT_NAME=$slot"
+            echo "AGENT_SLOT_IP=$ip"
+            echo "AGENT_SLOT_LEASE=$lease_id"
+            echo "AGENT_SLOT_TTL=$ttl"
+            return 0
+        fi
+    done
+
+    # No slot claimed — revoke our lease
+    $ETCDCTL lease revoke "$lease_id" >/dev/null 2>&1 || true
+    echo "agent-slot: no slots available (all $($ETCDCTL get --prefix /agents/slots/ --keys-only 2>/dev/null | grep -c /agents/slots/) slots leased)" >&2
+    return 1
+}
+
+release_slot() {
+    slot="$1"
+    if [ -z "$slot" ]; then
+        echo "Usage: agent-slot release <slot-name>" >&2
+        return 2
+    fi
+    # Read the lease ID currently holding this slot, if any
+    lease_value=$($ETCDCTL get "/agents/leases/$slot" --print-value-only 2>/dev/null)
+    if [ -z "$lease_value" ]; then
+        echo "agent-slot: no lease found for $slot (already released?)" >&2
+        return 0
+    fi
+    # Find the etcd lease ID by querying the key's metadata
+    lease_id=$($ETCDCTL get "/agents/leases/$slot" -w fields 2>/dev/null | awk -F'"' '/"Lease":/ {print $2}')
+    if [ -n "$lease_id" ] && [ "$lease_id" != "0" ]; then
+        # Convert decimal lease ID to hex for revoke
+        lease_hex=$(printf '%x' "$lease_id" 2>/dev/null || echo "$lease_id")
+        $ETCDCTL lease revoke "$lease_hex" >/dev/null 2>&1 || \
+            $ETCDCTL del "/agents/leases/$slot" >/dev/null
+    else
+        $ETCDCTL del "/agents/leases/$slot" >/dev/null
+    fi
+    echo "released $slot"
+}
+
+# --- session identity ---------------------------------------------------------
+# A separate, UNBOUNDED namespace from the fixed compute-slot pool above. Keys
+# live under /claude/sessions/<name>, each bound to an etcd lease (TTL). The
+# lease gives crash-safety: a dead session's name self-clears at TTL.
+#
+# Design choice that keeps this robust: the MUTATING verbs never read back an
+# existing lease id. register creates via CAS, refresh/renew REBIND with a
+# freshly granted lease (the old lease is orphaned and self-expires harmlessly),
+# and unregister just `del`s the key. The reason this matters: lease ids are
+# int64 and `-w fields` prints them as SIGNED decimal, so a high-bit id (hex
+# 8..-f..) prints negative and `printf '%x'` would misconvert it. By only ever
+# using the HEX id that `lease grant` hands us directly, the write path sidesteps
+# that hazard entirely. Only the read-only `sessions` listing parses a lease id
+# back (for TTL display), where a misparse is cosmetic, not load-bearing.
+SESSION_PREFIX="/claude/sessions"
+
+# Identity token proving "same session" across invocations. Real claudecode
+# sessions export CLAUDE_CODE_SESSION_ID; AGENT_SESSION_OWNER overrides it for
+# tests and non-claudecode agents.
+session_owner() {
+    printf '%s' "${AGENT_SESSION_OWNER:-$CLAUDE_CODE_SESSION_ID}"
+}
+
+session_key() {
+    printf '%s/%s' "$SESSION_PREFIX" "$1"
+}
+
+# Pull a string field out of a stored session JSON value: session_field "$val" owner
+session_field() {
+    echo "$1" | sed -n 's/.*"'"$2"'":"\([^"]*\)".*/\1/p'
+}
+
+# Grant a fresh lease and (over)write the session key bound to it. Shared by
+# register's owner-refresh path and renew. Deliberately does NOT touch the old
+# lease — it is left to expire on its own TTL (an empty lease is harmless).
+# Echoes eval-able output. Returns 2 if the lease grant fails.
+session_bind() {
+    name="$1"; owner="$2"; ttl="$3"
+    lid=$($ETCDCTL lease grant "$ttl" 2>&1 | awk '/granted with TTL/ {print $2}')
+    if [ -z "$lid" ]; then
+        echo "agent-slot: failed to grant session lease" >&2
+        return 2
+    fi
+    now=$(date -u +%FT%TZ)
+    val='{"owner":"'$owner'","host":"'$(hostname -s)'","pid":'$$',"registered_at":"'$now'"}'
+    $ETCDCTL put "$(session_key "$name")" "$val" --lease="$lid" >/dev/null
+    echo "AGENT_SESSION_NAME=$name"
+    echo "AGENT_SESSION_LEASE=$lid"
+    echo "AGENT_SESSION_TTL=$ttl"
+}
+
+register_session() {
+    name="$1"
+    if [ -z "$name" ]; then
+        echo "Usage: agent-slot register <name>" >&2
+        return 2
+    fi
+    owner=$(session_owner)
+    if [ -z "$owner" ]; then
+        echo "agent-slot: no session identity — set CLAUDE_CODE_SESSION_ID or AGENT_SESSION_OWNER" >&2
+        return 2
+    fi
+    ttl="${AGENT_SESSION_TTL:-14400}"   # 4h default — sessions are long-lived
+    key=$(session_key "$name")
+
+    # Atomic create-if-absent. mod()=="0" means the key has never existed.
+    lid=$($ETCDCTL lease grant "$ttl" 2>&1 | awk '/granted with TTL/ {print $2}')
+    if [ -z "$lid" ]; then
+        echo "agent-slot: failed to grant session lease" >&2
+        return 2
+    fi
+    now=$(date -u +%FT%TZ)
+    val='{"owner":"'$owner'","host":"'$(hostname -s)'","pid":'$$',"registered_at":"'$now'"}'
+    # etcdctl txn's lexer mangles embedded quotes — escape them (cf. acquire_slot).
+    val_esc=$(echo "$val" | sed 's/"/\\"/g')
+    result=$(printf 'mod("%s") = "0"\n\nput %s "%s" --lease=%s\n\n\n' \
+                "$key" "$key" "$val_esc" "$lid" | $ETCDCTL txn 2>&1)
+    if echo "$result" | grep -q "^SUCCESS"; then
+        echo "AGENT_SESSION_NAME=$name"
+        echo "AGENT_SESSION_LEASE=$lid"
+        echo "AGENT_SESSION_TTL=$ttl"
+        return 0
+    fi
+
+    # Key already exists. Drop the lease we speculatively granted, then decide
+    # by ownership: ours -> idempotent refresh; someone else's -> refuse.
+    $ETCDCTL lease revoke "$lid" >/dev/null 2>&1 || true
+    cur=$($ETCDCTL get "$key" --print-value-only 2>/dev/null)
+    cur_owner=$(session_field "$cur" owner)
+    if [ "$cur_owner" = "$owner" ]; then
+        session_bind "$name" "$owner" "$ttl"
+        return 0
+    fi
+    echo "agent-slot: session name '$name' is held by a live session (owner=$cur_owner)" >&2
+    return 1
+}
+
+renew_session() {
+    name="$1"
+    if [ -z "$name" ]; then echo "Usage: agent-slot renew <name>" >&2; return 2; fi
+    owner=$(session_owner)
+    key=$(session_key "$name")
+    cur=$($ETCDCTL get "$key" --print-value-only 2>/dev/null)
+    if [ -z "$cur" ]; then
+        echo "agent-slot: session '$name' is not registered (nothing to renew)" >&2
+        return 1
+    fi
+    cur_owner=$(session_field "$cur" owner)
+    if [ "$cur_owner" != "$owner" ]; then
+        echo "agent-slot: refusing to renew '$name' owned by another session (owner=$cur_owner)" >&2
+        return 1
+    fi
+    session_bind "$name" "$owner" "${AGENT_SESSION_TTL:-14400}"
+}
+
+unregister_session() {
+    force=0
+    if [ "$1" = "--force" ]; then force=1; name="$2"; else name="$1"; [ "$2" = "--force" ] && force=1; fi
+    if [ -z "$name" ]; then echo "Usage: agent-slot unregister <name> [--force]" >&2; return 2; fi
+    owner=$(session_owner)
+    key=$(session_key "$name")
+    cur=$($ETCDCTL get "$key" --print-value-only 2>/dev/null)
+    if [ -z "$cur" ]; then
+        echo "agent-slot: session '$name' not registered (already free)" >&2
+        return 0
+    fi
+    cur_owner=$(session_field "$cur" owner)
+    if [ "$cur_owner" != "$owner" ] && [ "$force" -ne 1 ]; then
+        echo "agent-slot: refusing to unregister '$name' owned by another session (owner=$cur_owner); use --force" >&2
+        return 1
+    fi
+    # `del` frees the name now; the orphaned lease self-expires harmlessly.
+    $ETCDCTL del "$key" >/dev/null
+    echo "unregistered $name"
+}
+
+list_sessions() {
+    printf '%-24s %-40s %s\n' SESSION OWNER TTL
+    printf '%-24s %-40s %s\n' ------- ----- ---
+    for key in $($ETCDCTL get --prefix "$SESSION_PREFIX/" --keys-only 2>/dev/null | grep .); do
+        name=$(echo "$key" | sed 's|.*/||')
+        val=$($ETCDCTL get "$key" --print-value-only 2>/dev/null)
+        owner=$(session_field "$val" owner)
+        # Lease id comes back as SIGNED decimal in `-w fields`; lease commands
+        # want HEX. Only convert a plain positive integer — a negative (high-bit
+        # int64) or empty value just yields "?" rather than a wrong number.
+        declease=$($ETCDCTL get "$key" -w fields 2>/dev/null | awk -F' : ' '/"Lease"/ {print $2; exit}')
+        ttl="?"
+        case "$declease" in
+            ''|0|*[!0-9]*) ;;  # empty, none, or non-positive-int -> leave "?"
+            *)
+                hexlease=$(printf '%x' "$declease" 2>/dev/null || echo "")
+                if [ -n "$hexlease" ]; then
+                    ttl=$($ETCDCTL lease timetolive "$hexlease" 2>/dev/null | sed -n 's/.*remaining(\([0-9]*\)s).*/\1s/p')
+                    [ -z "$ttl" ] && ttl="expired?"
+                fi
+                ;;
+        esac
+        printf '%-24s %-40s %s\n' "$name" "$owner" "$ttl"
+    done
+}
+
+reap_dead_pots() {
+    # Reconciliation: find drift between etcd lease state and live pot state.
+    #
+    # Two kinds of drift:
+    #   1. ghost lease — etcd lease exists, but no pot is running for the slot.
+    #      Cause: agent-spawn died after lease grant but before pot start, or
+    #      pot was killed externally. Action: revoke the lease.
+    #   2. zombie pot — pot is running, but no etcd lease covers it.
+    #      Cause: agent-spawn was killed mid-flight after pot start but before
+    #      release; OR a manual `pot start` outside the v2 flow.
+    #      Action: report only — destroying someone else's manual pot would
+    #      be presumptuous.
+    #
+    # Naming convention: slot agent-NN → pot name agent-NN.
+    # Use --dry-run flag to report without revoking.
+    dry_run=0
+    [ "$1" = "--dry-run" ] && dry_run=1
+
+    pot_names=$(doas /bin/sh -c "pot ls -q 2>/dev/null" || true)
+
+    # Ghost leases
+    for kv in $($ETCDCTL get --prefix /agents/leases/ -w simple 2>/dev/null | paste -d'|' - -); do
+        key=$(echo "$kv" | cut -d'|' -f1)
+        slot=$(echo "$key" | sed 's|.*/||')
+        if ! echo "$pot_names" | grep -qx "$slot"; then
+            if [ "$dry_run" -eq 1 ]; then
+                echo "ghost lease: $slot (no running pot)"
+            else
+                echo "ghost lease: $slot — revoking"
+                release_slot "$slot"
+            fi
+        fi
+    done
+
+    # Zombie pots (report-only)
+    for pot in $pot_names; do
+        case "$pot" in
+            agent-[0-9]*)
+                lease=$($ETCDCTL get "/agents/leases/$pot" --print-value-only 2>/dev/null)
+                if [ -z "$lease" ]; then
+                    echo "zombie pot: $pot (running, no lease) — destroy with: doas pot stop $pot && doas pot destroy -p $pot"
+                fi
+                ;;
+            *) ;; # not a v2-managed pot, ignore
+        esac
+    done
+}
+
+case "${1:-}" in
+    init) init_pool ;;
+    list|ls) list_pool ;;
+    acquire) shift; acquire_slot "$@" ;;
+    release) shift; release_slot "$@" ;;
+    register) shift; register_session "$@" ;;
+    renew) shift; renew_session "$@" ;;
+    unregister) shift; unregister_session "$@" ;;
+    sessions) shift; list_sessions "$@" ;;
+    reap) shift; reap_dead_pots "$@" ;;
+    -h|--help|help) usage 0 ;;
+    *) usage 1 ;;
+esac
