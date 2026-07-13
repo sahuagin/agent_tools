@@ -82,7 +82,9 @@ fi
 
 # Release the bead, only if it's actually ours.
 if [ -n "$BEAD" ]; then
-    ENDPOINT=$(beads_endpoint "$REPO")
+    # Soft-fail like sprint-start: a repo with no remotes.env entry releases
+    # against its LOCAL beads DB via the branch below (fixed with at-0up).
+    ENDPOINT=$(beads_endpoint "$REPO" 2>/dev/null) || ENDPOINT=""
     if [ -n "$ENDPOINT" ]; then
         # Centralized: release through the beadsd service.
         held=$(beads --url "$ENDPOINT" show "$BEAD" 2>/dev/null | \
@@ -95,6 +97,22 @@ if [ -n "$BEAD" ]; then
                 && printf 'sprint-end: closed %s\n' "$BEAD"
         else
             beads --url "$ENDPOINT" unclaim "$BEAD" --actor "$ACTOR" >/dev/null 2>&1 \
+                && printf 'sprint-end: unclaimed %s (back to open)\n' "$BEAD"
+        fi
+    elif [ -f "$ROOT/.beads/beads.db" ]; then
+        # Local-DB path (repo not centralized into beadsd) — mirrors the
+        # sprint-start local claim branch; restored with at-0up.
+        DB="$ROOT/.beads/beads.db"
+        held=$(br show "$BEAD" --db "$DB" --json 2>/dev/null | \
+            python3 -c "import json,sys;i=json.load(sys.stdin);i=i if isinstance(i,dict) else i[0];print(i.get('assignee') or '')" 2>/dev/null || true)
+        if [ -n "$held" ] && [ "$held" != "$ACTOR" ]; then
+            die "bead $BEAD is held by '$held', not this session — refusing to release it"
+        fi
+        if [ "$MODE" = "close" ]; then
+            br close "$BEAD" --db "$DB" --session "${CLAUDE_CODE_SESSION_ID:-}" >/dev/null 2>&1 \
+                && printf 'sprint-end: closed %s\n' "$BEAD"
+        else
+            br update "$BEAD" --assignee "" -s open --db "$DB" >/dev/null 2>&1 \
                 && printf 'sprint-end: unclaimed %s (back to open)\n' "$BEAD"
         fi
     fi

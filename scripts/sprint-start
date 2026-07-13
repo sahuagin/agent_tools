@@ -66,7 +66,10 @@ WS="$(dirname "$ROOT")/${REPO}-${TOKEN}"
 
 # --- claim (bead mode only) ---
 if [ -n "$BEAD" ]; then
-    ENDPOINT=$(beads_endpoint "$REPO")
+    # Soft-fail the lookup: a repo with no remotes.env entry is a LOCAL-beads
+    # repo (e.g. spline-connect) and must reach the legacy local-DB branch
+    # below; a hard error here made that branch unreachable (fixed 2026-07-13).
+    ENDPOINT=$(beads_endpoint "$REPO" 2>/dev/null) || ENDPOINT=""
     if [ -n "$ENDPOINT" ]; then
         # Centralized: claim through the single-writer beadsd service. `beads`
         # exits non-zero on a claim conflict (already held by another actor).
@@ -81,11 +84,29 @@ if [ -n "$BEAD" ]; then
             fi
         fi
     else
-        # `beads` is the beadsd service client — it has no local-DB mode. A repo
-        # with no beadsd endpoint can't be bead-claimed here: centralize it into
-        # beadsd (add it to ~/.config/beads/remotes.env) or run no-claim work
-        # with --no-bead.
-        die "repo $REPO is not centralized into beadsd (no endpoint in ~/.config/beads/remotes.env) — centralize it, or use: sprint-start --no-bead <label>"
+        # Local-DB path (repo not centralized into beadsd — e.g. spline-connect,
+        # whose centralization is deliberately on hold). Claim via br against the
+        # repo's canonical .beads DB (never a workspace-local one). Restored with
+        # at-0up: an earlier revision dropped this in favor of die-unless-
+        # centralized, but local-beads repos are a supported steady state.
+        DB="$ROOT/.beads/beads.db"
+        [ -f "$DB" ] || die "repo $REPO has no beadsd endpoint and no .beads DB ($DB); centralize it (remotes.env) or use: sprint-start --no-bead <label>"
+        br show "$BEAD" --db "$DB" >/dev/null 2>&1 || die "bead $BEAD not found in canonical DB"
+
+        held=$(br show "$BEAD" --db "$DB" --json 2>/dev/null | \
+            python3 -c "import json,sys;i=json.load(sys.stdin);i=i if isinstance(i,dict) else i[0];print(i.get('assignee') or '')" 2>/dev/null || true)
+        if [ -n "$held" ] && [ "$held" != "$ACTOR" ]; then
+            die "bead $BEAD already claimed by '$held' — pick another (br ready --db $DB)"
+        fi
+        if [ "$held" = "$ACTOR" ]; then
+            printf 'sprint-start: %s already claimed by this session — resuming.\n' "$BEAD" >&2
+        else
+            # Atomic claim. br exits non-zero + prints to stderr if assigned
+            # elsewhere (race with a concurrent session since the check above).
+            if ! out=$(br update "$BEAD" --claim --actor "$ACTOR" --db "$DB" 2>&1); then
+                die "claim failed: $out"
+            fi
+        fi
     fi
 fi
 
