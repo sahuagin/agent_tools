@@ -132,6 +132,73 @@ sprint_write_actor "$WS" "$ACTOR" "$REGISTERED"
 agent task create --cwd "$WS" \
     --objective "sprint-start ${BEAD:-$LABEL} ($REPO) [sprint,$REPO,${TOKEN}] claimed=${BEAD:-none} actor=$ACTOR ws=$WS" >/dev/null 2>&1 || true
 
+# --- task-start recall (at-x3s): push relevant memory/kx into the session ---
+# The mu-rkhj lesson: the settled design for the exact subsystem being claimed
+# sat in memory (TOP hit for the bead title) and nothing surfaced it — the
+# prompt-keyed recall hook never fired and manual search depends on model
+# discipline. So push it HERE, at the moment work begins: search memory and
+# the kx doc index for the bead's title and print the hit lines for the agent
+# to follow up with `agent memory show <id>`. Best-effort by construction —
+# any failure or empty result is silent, and everything goes to stderr
+# (stdout's trailing `cd` line is consumed by scripts and operators).
+task_start_recall() {
+    _query="$1"
+    [ -n "$_query" ] || return 0
+    command -v agent >/dev/null 2>&1 || return 0
+    command -v python3 >/dev/null 2>&1 || return 0
+    # SEMANTIC recall, not FTS search: `search` is AND-semantics FTS5, so a
+    # single title word with no match ("rip") empties the result; recall's
+    # embedding+cosine tolerates raw bead titles. Verified on the motivating
+    # case: the mu-rkhj title recalls the operator's messaging design + the
+    # event-driven standard as the top hits.
+    # Selective by design: pointers only (id + name + one-line hook), never
+    # bodies — follow-up is `agent memory show <id>`. A score floor keeps a
+    # bead title that matches nothing from printing its least-bad cosine
+    # neighbors; both knobs are env-tunable.
+    _min="${SPRINT_RECALL_MIN_SCORE:-0.56}"
+    _lim="${SPRINT_RECALL_LIMIT:-3}"
+    _fmt='
+import json, os, sys
+try:
+    floor = float(os.environ.get("SPRINT_RECALL_MIN_SCORE", "0.56"))
+    limit = int(os.environ.get("SPRINT_RECALL_LIMIT", "3"))
+    d = json.load(sys.stdin)
+    hits = [r for r in (d.get("results") or [])
+            if float(r.get("score") or r.get("cosine") or 0.0) >= floor]
+    for r in hits[:limit]:
+        desc = (r.get("description") or "").replace("\n", " ")[:200]
+        print("[{}] ({}) {} -- {}".format(
+            r.get("id", ""), r.get("type", "kx"), r.get("name", ""), desc))
+except Exception:
+    pass
+'
+    export SPRINT_RECALL_MIN_SCORE="$_min" SPRINT_RECALL_LIMIT="$_lim"
+    _mem=$(agent memory recall "$_query" 2>/dev/null | python3 -c "$_fmt" 2>/dev/null) || _mem=""
+    _kx=$(agent kx recall "$_query" 2>/dev/null | python3 -c "$_fmt" 2>/dev/null) || _kx=""
+    [ -n "$_mem" ] || [ -n "$_kx" ] || return 0
+    {
+        printf -- '-- recalled for %s -- READ BEFORE IMPLEMENTING (agent memory show <id>):\n' \
+            "${BEAD:-$LABEL}"
+        [ -z "$_mem" ] || printf '%s\n' "$_mem"
+        [ -z "$_kx" ] || printf '%s\n' "$_kx"
+    } >&2
+}
+
+# Query = the bead's title (the label in --no-bead mode). A bare bead id
+# embeds nothing, so when the title can't be fetched, skip rather than
+# search garbage.
+RECALL_QUERY="$LABEL"
+if [ -n "$BEAD" ]; then
+    if [ -n "${ENDPOINT:-}" ]; then
+        RECALL_QUERY=$(beads --url "$ENDPOINT" show "$BEAD" 2>/dev/null | \
+            python3 -c "import json,sys;i=json.load(sys.stdin);i=i if isinstance(i,dict) else i[0];print(i.get('title') or '')" 2>/dev/null || true)
+    else
+        RECALL_QUERY=$(br show "$BEAD" --db "$ROOT/.beads/beads.db" --json 2>/dev/null | \
+            python3 -c "import json,sys;i=json.load(sys.stdin);i=i if isinstance(i,dict) else i[0];print(i.get('title') or '')" 2>/dev/null || true)
+    fi
+fi
+task_start_recall "$RECALL_QUERY" || true
+
 printf '\n  repo:      %s\n  bead:      %s\n  actor:     %s\n  workspace: %s\n\n' \
     "$REPO" "${BEAD:-<none, label=$LABEL>}" "$ACTOR" "$WS"
 printf 'cd %s\n' "$WS"
