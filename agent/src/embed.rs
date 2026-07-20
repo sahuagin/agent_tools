@@ -140,6 +140,12 @@ pub struct OpenRouterEmbedder {
     base_url: String,
     dims: usize,
     timeout_ms: u64,
+    /// OpenRouter provider routing preference (`provider_order` /
+    /// `*_PROVIDER_ORDER`, comma-separated). Measured 2026-07-20: the same
+    /// embed on qwen3-embedding-8b is ~0.5s on Nebius vs 7-18s on
+    /// DeepInfra/SiliconFlow cold — pinning the order kills that tail while
+    /// fallbacks still cover an outage. Empty = OpenRouter's own routing.
+    provider_order: Vec<String>,
 }
 
 impl OpenRouterEmbedder {
@@ -213,6 +219,18 @@ impl OpenRouterEmbedder {
             resolve_setting(section, "timeout_ms", &format!("{env_prefix}_TIMEOUT_MS"))
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(DEFAULT_EMBED_TIMEOUT_MS);
+        let provider_order: Vec<String> = resolve_setting(
+            section,
+            "provider_order",
+            &format!("{env_prefix}_PROVIDER_ORDER"),
+        )
+        .map(|s| {
+            s.split(',')
+                .map(|p| p.trim().to_string())
+                .filter(|p| !p.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
         let api_key = std::env::var("OPENROUTER_API_KEY")
             .ok()
             .filter(|s| !s.is_empty())
@@ -228,6 +246,7 @@ impl OpenRouterEmbedder {
             base_url,
             dims,
             timeout_ms,
+            provider_order,
         })
     }
 }
@@ -305,6 +324,15 @@ fn read_toml_value_from_str(content: &str, section: &str, key: &str) -> Option<S
 struct EmbeddingRequest<'a> {
     model: &'a str,
     input: &'a [String],
+    /// OpenRouter routing preference; omitted entirely when unset so
+    /// non-OpenRouter (OpenAI-compatible) endpoints never see it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provider: Option<ProviderPrefs<'a>>,
+}
+
+#[derive(Serialize)]
+struct ProviderPrefs<'a> {
+    order: &'a [String],
 }
 
 #[derive(Deserialize)]
@@ -355,6 +383,9 @@ impl OpenRouterEmbedder {
         let body = EmbeddingRequest {
             model: &self.model,
             input: texts,
+            provider: (!self.provider_order.is_empty()).then(|| ProviderPrefs {
+                order: &self.provider_order,
+            }),
         };
         let json = serde_json::to_value(&body)?;
 

@@ -29,8 +29,19 @@ BIN="$HOME/src/agent_tools/target/release/code-index-mcp"
 # MockEmbedder (semantically meaningless). Best-effort: a failed lookup still
 # lets the server start — lexical-mode recall keeps working.
 if [ -x "$TQ" ] && [ -r "$CFG" ]; then
+    # NB: `[ -n ... ] && export ...` as a statement is a set -e landmine (an
+    # empty value makes the list fail and kills the wrapper); use if/fi.
     OPENROUTER_API_KEY="$("$TQ" -f "$CFG" -r openrouter.api_key 2>/dev/null || true)"
-    [ -n "${OPENROUTER_API_KEY:-}" ] && export OPENROUTER_API_KEY
+    if [ -n "${OPENROUTER_API_KEY:-}" ]; then export OPENROUTER_API_KEY; fi
+
+    # Per-service embedder endpoint override: `[code_index] embed_base_url`
+    # in config.toml (e.g. the LAN ollama serving qwen/qwen3-embedding-8b —
+    # same model id + weights as the index, so no re-embed is needed; the
+    # deploy README's re-embed note predates the model alias). Deliberately
+    # NOT the shared [embed] section: that would also repoint the agent/kx
+    # embedder, whose bge-large corpus is not served locally.
+    CODE_INDEX_EMBED_BASE_URL="$("$TQ" -f "$CFG" -r code_index.embed_base_url 2>/dev/null || true)"
+    if [ -n "${CODE_INDEX_EMBED_BASE_URL:-}" ]; then export CODE_INDEX_EMBED_BASE_URL; fi
 fi
 
 # exec so daemon(8)'s pidfile/-r supervision tracks the binary itself, not a
