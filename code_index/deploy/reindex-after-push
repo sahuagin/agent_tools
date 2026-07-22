@@ -1,0 +1,20 @@
+#!/bin/sh
+# Re-index the current repo's code-index after a successful push.
+# Called manually or wired as a post-push step.
+#
+# Uses the global cache (~/.cache/code_index/<basename>.db) so
+# the LSP server and all workers see the same index.
+
+set -e
+
+REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+BASENAME="$(basename "$REPO_ROOT")"
+DB="$HOME/.cache/code_index/${BASENAME}.db"
+
+OPENROUTER_API_KEY="${OPENROUTER_API_KEY:-$(tq -f ~/.config/agent/config.toml -r openrouter.api_key 2>/dev/null || true)}"
+export OPENROUTER_API_KEY
+
+echo "reindex: ${BASENAME} → ${DB}"
+cd "$REPO_ROOT"
+code-index ingest . --db "$DB" 2>&1
+echo "reindex: done"

@@ -1,0 +1,57 @@
+#!/bin/sh
+# Cron-friendly: re-index only if main's commit hash changed since last run.
+# Stores the last-indexed hash in the cache dir alongside the db.
+#
+# 2026-06-05 fixes (the index had been silently stale since May 25):
+#  - cron's PATH lacks ~/.local/bin and ~/.cargo/bin, so bare `code-index`
+#    and `tq` were "not found" under cron — absolute paths now.
+#  - `ingest | logger` reported logger's exit status, so a failed ingest
+#    still wrote the hash and logged "done". The hash is now written only
+#    when ingest actually succeeds; failures log loudly and exit 1.
+
+set -e
+
+CODE_INDEX="$HOME/.local/bin/code-index"
+TQ="$HOME/.cargo/bin/tq"
+
+REPO="${1:-$HOME/src/public_github/mu}"
+BASENAME="$(basename "$REPO")"
+HASH_FILE="$HOME/.cache/code_index/.${BASENAME}.last-hash"
+
+# Per-repo .code_index/ wins over global cache
+if [ -d "$REPO/.code_index" ]; then
+    DB_FLAG=""
+else
+    DB_FLAG="--db $HOME/.cache/code_index/${BASENAME}.db"
+fi
+
+cd "$REPO"
+CURRENT="$(jj log -r main --no-graph -T 'commit_id' --limit 1 2>/dev/null || git rev-parse main 2>/dev/null)"
+
+if [ -z "$CURRENT" ]; then
+    exit 0
+fi
+
+LAST="$(cat "$HASH_FILE" 2>/dev/null || true)"
+
+if [ "$CURRENT" = "$LAST" ]; then
+    exit 0
+fi
+
+OPENROUTER_API_KEY="${OPENROUTER_API_KEY:-$("$TQ" -f "$HOME/.config/agent/config.toml" -r openrouter.api_key 2>/dev/null || true)}"
+export OPENROUTER_API_KEY
+
+LOGTMP="$(mktemp -t code-index-ingest)"
+trap 'rm -f "$LOGTMP"' EXIT
+
+logger -t code-index "reindexing ${BASENAME} (${LAST:-none} -> ${CURRENT})"
+if "$CODE_INDEX" ingest . $DB_FLAG >"$LOGTMP" 2>&1; then
+    logger -t code-index <"$LOGTMP"
+    echo "$CURRENT" > "$HASH_FILE"
+    logger -t code-index "done: ${BASENAME}"
+else
+    RC=$?
+    logger -t code-index <"$LOGTMP"
+    logger -t code-index "FAILED: ${BASENAME} ingest exit ${RC} - hash NOT updated, will retry next cron"
+    exit 1
+fi
