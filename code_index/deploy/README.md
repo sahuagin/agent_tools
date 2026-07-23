@@ -24,10 +24,22 @@ Deployed on threadripper 2026-06-03: `http://10.1.1.172:7622/mcp`.
 ```sh
 sudo install -m 0555 code_index_mcp.rc /usr/local/etc/rc.d/code_index_mcp
 install -m 0755 code-index-mcp-serve ~/.local/bin/code-index-mcp-serve
+install -m 0755 reindex-if-changed reindex-after-push ~/.local/bin/
 sudo sysrc code_index_mcp_enable="YES"
 sudo sysrc code_index_mcp_listen="10.1.1.172:7622"   # match the MCP client config URL
+sudo sysrc code_index_mcp_db="/home/tcovert/.cache/code_index/mu.db"  # serve from the cache family
 sudo service code_index_mcp start
 ```
+
+Reindex cron (one line per repo; `reindex-if-changed` no-ops unless the repo's
+main moved since the last successful ingest):
+
+```crontab
+*/15 * * * * /home/tcovert/.local/bin/reindex-if-changed /home/tcovert/src/public_github/mu >/dev/null 2>&1
+```
+
+`reindex-after-push` is the manual one-shot form of the same ingest (first
+index of a new repo, or force-refresh outside the cron cadence).
 
 `rc.conf` knobs (all `code_index_mcp_`-prefixed): `enable`, `listen`, `user`
 (default `tcovert` — a script default is sufficient; rc.subr picks it up),
@@ -39,9 +51,14 @@ sudo service code_index_mcp start
 - **DB selection is per-call.** `code_recall`'s `db` argument picks the
   database: an absolute path, or a bare name resolving to
   `~/.cache/code_index/<name>.db`. `CODE_INDEX_DB` is only the no-arg default.
-  Beware: a repo with a per-repo `.code_index/index.db` (what the reindex cron
-  refreshes) is NOT what its bare cache name resolves to — pass the absolute
-  per-repo path for fresh data.
+- **One index family (2026-07-22): the cache.** Ingest (cron + manual) writes
+  `~/.cache/code_index/<name>.db` and the service serves from it (the
+  `code_index_mcp_db` rc knob). Per-repo `.code_index/` dirs are RETIRED — if
+  one exists, `reindex-if-changed` still prefers it (legacy branch), so don't
+  recreate them. The cache is rebuildable by definition: deleting a db and
+  re-running ingest is the supported recovery path. Names key by checkout
+  basename today; origin-URL keys are at-lcn. Recall must never create dbs
+  (at-jjw — query-side open-create is a bug).
 - **Do not add `daemon -u`.** rc.subr's `${name}_user` already drops privilege
   via `su -m` (`/etc/rc.subr` line ~1513); stacking `daemon -u` on top calls
   `setusercontext()` from an already-dropped process and crash-loops under
