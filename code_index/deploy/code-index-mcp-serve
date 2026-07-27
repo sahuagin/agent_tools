@@ -8,18 +8,23 @@
 #
 # Env (with defaults):
 #   LISTEN         host:port to bind                       (default 0.0.0.0:7622)
-#   CODE_INDEX_DB  default DB used when a code_recall call  (default: mu's fresh
-#                  passes no `db` argument                   per-repo index)
+#   CODE_INDEX_DB  default DB used when a code_recall call  (default:
+#                  passes no `db` argument                   ~/.cache/code_index/mu.db)
 #
 # Multi-repo is by the per-call `db` argument; CODE_INDEX_DB is only the default.
+# No home directory is spelled out here: this script ships in the repo and runs
+# on hosts that disagree about where homes live. HOME comes from the caller (the
+# rc.d service injects it); every path below derives from it.
 set -eu
 
 : "${LISTEN:=0.0.0.0:7622}"
-: "${CODE_INDEX_DB:=/home/tcovert/src/public_github/mu/.code_index/index.db}"
-export CODE_INDEX_DB
-
-: "${HOME:=/home/tcovert}"
+: "${HOME:=$(cd ~ && pwd)}"
 export HOME
+
+# Default index: the cache family reindex-if-changed maintains, NOT a per-repo
+# .code_index/, which is a per-checkout artifact that may not exist here.
+: "${CODE_INDEX_DB:=$HOME/.cache/code_index/mu.db}"
+export CODE_INDEX_DB
 
 TQ="$HOME/.cargo/bin/tq"
 CFG="$HOME/.config/agent/config.toml"

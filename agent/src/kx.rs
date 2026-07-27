@@ -652,13 +652,42 @@ fn select_sources<'a>(sources: &'a [KxSource], want: Option<&str>) -> Result<Vec
     Ok(matched)
 }
 
+/// Resolve a configured corpus path against the user's home: `~`, `~/x`, and
+/// `$HOME/x` expand; anything else is taken literally.
+///
+/// Config must stay portable — a shipped example or a synced config that
+/// names `/home/<someone>` is wrong on every other machine. Mirrors
+/// `code_index::sources::expand_home`; the two crates are independent, so the
+/// helper is duplicated rather than dragging in a dependency for 12 lines.
+fn expand_home(raw: &str) -> PathBuf {
+    let raw = raw.trim();
+    let home = || std::env::var_os("HOME").map(PathBuf::from);
+    if raw == "~" {
+        if let Some(h) = home() {
+            return h;
+        }
+    }
+    for prefix in ["~/", "$HOME/"] {
+        if let Some(rest) = raw.strip_prefix(prefix) {
+            if let Some(h) = home() {
+                return h.join(rest);
+            }
+        }
+    }
+    PathBuf::from(raw)
+}
+
 fn ingest_source(
     conn: &Connection,
     cfg: &KxSection,
     src: &KxSource,
     args: &IngestArgs,
 ) -> Result<SourceReport> {
-    let root = std::fs::canonicalize(&src.path)
+    // `~`/`$HOME` first: canonicalize does NOT expand them, so a config
+    // written `~/notes` would fail as "no such file" instead of resolving.
+    // Strictly additive — a path that resolves today is passed through
+    // untouched, only previously-broken tilde paths start working.
+    let root = std::fs::canonicalize(expand_home(&src.path))
         .with_context(|| format!("resolving source path {}", src.path))?;
     let root_str = root.to_string_lossy().to_string();
 

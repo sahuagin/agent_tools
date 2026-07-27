@@ -19,8 +19,9 @@
 #   user     — user to run as (rc.subr su -m switch). Default tcovert.
 #   group    — primary group. Default = user.
 #   listen   — host:port to bind. Default 0.0.0.0:7622.
-#   db       — default DB path when a call passes no `db`. Default: mu's index.
-#   serve    — wrapper path. Default /home/tcovert/.local/bin/code-index-mcp-serve
+#   db       — default DB path when a call passes no `db`.
+#              Default <run-user home>/.cache/code_index/mu.db
+#   serve    — wrapper path. Default <run-user home>/.local/bin/code-index-mcp-serve
 #   logfile  — Default /var/log/code_index_mcp.log
 #
 # PROVIDE: code_index_mcp
@@ -37,15 +38,22 @@ load_rc_config "$name"
 : ${code_index_mcp_enable:="NO"}
 : ${code_index_mcp_user:="tcovert"}
 : ${code_index_mcp_listen:="0.0.0.0:7622"}
-: ${code_index_mcp_db:="/home/tcovert/src/public_github/mu/.code_index/index.db"}
-: ${code_index_mcp_serve:="/home/tcovert/.local/bin/code-index-mcp-serve"}
 : ${code_index_mcp_logfile:="/var/log/${name}.log"}
 
-# Resolve the run-user's home for HOME and chdir.
+# Resolve the run-user's home from passwd — never spell a home directory out
+# here. This script ships in the repo and runs on hosts that disagree about
+# where homes live; the path defaults below are all derived from it.
 code_index_mcp_home="$(getent passwd ${code_index_mcp_user} 2>/dev/null | cut -d: -f6)"
-: ${code_index_mcp_home:="/home/${code_index_mcp_user}"}
+: ${code_index_mcp_home:="$(eval echo ~${code_index_mcp_user})"}
 : ${code_index_mcp_group:="${code_index_mcp_user}"}
 : ${code_index_mcp_chdir:="${code_index_mcp_home}"}
+
+# Default index when a call passes no `db`. Points into the cache family that
+# reindex-if-changed maintains — NOT a per-repo .code_index/, which is a
+# per-checkout artifact that may not exist on this host. Set
+# code_index_mcp_db in rc.conf to serve a different default.
+: ${code_index_mcp_db:="${code_index_mcp_home}/.cache/code_index/mu.db"}
+: ${code_index_mcp_serve:="${code_index_mcp_home}/.local/bin/code-index-mcp-serve"}
 
 # We set ${name}_user/_group (rc.subr does the su -m switch) and deliberately do
 # NOT pass `daemon -u`: on this box that combination + `-r` loops in

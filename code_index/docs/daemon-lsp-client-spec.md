@@ -72,8 +72,8 @@ When `--listen` is active, optionally write a registration file:
 ```toml
 # ~/.local/share/code-index/server.toml
 pid = 12345
-socket = "/home/tcovert/.local/share/code-index/lsp.sock"
-db = "/home/tcovert/.cache/code_index/mu.db"
+socket = "~/.local/share/code-index/lsp.sock"
+db = "~/.cache/code_index/mu.db"
 started_at = "2026-05-25T20:00:00Z"
 capabilities = ["workspace/symbol", "codeIndex.reindex"]
 ```

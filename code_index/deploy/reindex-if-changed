@@ -1,6 +1,19 @@
 #!/bin/sh
-# Cron-friendly: re-index only if main's commit hash changed since last run.
+# Cron-friendly: re-index only if the source changed since the last run.
 # Stores the last-indexed hash in the cache dir alongside the db.
+#
+# Two modes:
+#   reindex-if-changed             every [[code_index.sources]] in the config
+#   reindex-if-changed <path>      just that path (manual / legacy crontab line)
+#
+# The no-arg mode is the one for cron — ONE line covers every configured
+# source, so adding a repo is a config edit, not a crontab edit:
+#
+#   */15 * * * * $HOME/.local/bin/reindex-if-changed >/dev/null 2>&1
+#
+# The source list comes from `code-index sources --porcelain`, NOT from a
+# second TOML parser here: the cron and the MCP service must never disagree
+# about what is indexed (at-o3t).
 #
 # 2026-06-05 fixes (the index had been silently stale since May 25):
 #  - cron's PATH lacks ~/.local/bin and ~/.cargo/bin, so bare `code-index`
@@ -14,44 +27,105 @@ set -e
 CODE_INDEX="$HOME/.local/bin/code-index"
 TQ="$HOME/.cargo/bin/tq"
 
-REPO="${1:-$HOME/src/public_github/mu}"
-BASENAME="$(basename "$REPO")"
-HASH_FILE="$HOME/.cache/code_index/.${BASENAME}.last-hash"
-
-# Per-repo .code_index/ wins over global cache
-if [ -d "$REPO/.code_index" ]; then
-    DB_FLAG=""
-else
-    DB_FLAG="--db $HOME/.cache/code_index/${BASENAME}.db"
-fi
-
-cd "$REPO"
-CURRENT="$(jj log -r main --no-graph -T 'commit_id' --limit 1 2>/dev/null || git rev-parse main 2>/dev/null)"
-
-if [ -z "$CURRENT" ]; then
-    exit 0
-fi
-
-LAST="$(cat "$HASH_FILE" 2>/dev/null || true)"
-
-if [ "$CURRENT" = "$LAST" ]; then
-    exit 0
-fi
-
 OPENROUTER_API_KEY="${OPENROUTER_API_KEY:-$("$TQ" -f "$HOME/.config/agent/config.toml" -r openrouter.api_key 2>/dev/null || true)}"
 export OPENROUTER_API_KEY
 
-LOGTMP="$(mktemp -t code-index-ingest)"
-trap 'rm -f "$LOGTMP"' EXIT
+# Change detector for a source root.
+#   repo    -> VCS head (jj, then git)
+#   content -> hash of the file tree, for locations that are not repositories
+current_hash() {
+    _root="$1"
+    _kind="$2"
+    if [ "$_kind" = "content" ]; then
+        find "$_root" -type f ! -path '*/.git/*' ! -path '*/.jj/*' -print0 2>/dev/null |
+            sort -z |
+            xargs -0 ls -ln 2>/dev/null |
+            awk '{print $5, $9}' |
+            sha256sum 2>/dev/null | cut -d' ' -f1
+        return 0
+    fi
+    (
+        cd "$_root" 2>/dev/null || exit 0
+        jj log -r main --no-graph -T 'commit_id' --limit 1 2>/dev/null ||
+            git rev-parse main 2>/dev/null ||
+            true
+    )
+}
 
-logger -t code-index "reindexing ${BASENAME} (${LAST:-none} -> ${CURRENT})"
-if "$CODE_INDEX" ingest . $DB_FLAG >"$LOGTMP" 2>&1; then
-    logger -t code-index <"$LOGTMP"
-    echo "$CURRENT" > "$HASH_FILE"
-    logger -t code-index "done: ${BASENAME}"
-else
+# Index one source. Args: name, root, kind (repo|content), db path ("" = default).
+reindex_one() {
+    NAME="$1"
+    ROOT="$2"
+    KIND="$3"
+    DB="$4"
+
+    if [ ! -d "$ROOT" ]; then
+        logger -t code-index "skip ${NAME}: ${ROOT} not present on this host"
+        return 0
+    fi
+
+    HASH_FILE="$HOME/.cache/code_index/.${NAME}.last-hash"
+
+    # A per-repo .code_index/ still wins over the global cache.
+    if [ -d "$ROOT/.code_index" ]; then
+        DB_FLAG=""
+    elif [ -n "$DB" ]; then
+        DB_FLAG="--db $DB"
+    else
+        DB_FLAG="--db $HOME/.cache/code_index/${NAME}.db"
+    fi
+
+    CURRENT="$(current_hash "$ROOT" "$KIND")"
+    [ -n "$CURRENT" ] || return 0
+
+    LAST="$(cat "$HASH_FILE" 2>/dev/null || true)"
+    [ "$CURRENT" != "$LAST" ] || return 0
+
+    LOGTMP="$(mktemp -t code-index-ingest)"
+
+    logger -t code-index "reindexing ${NAME} (${LAST:-none} -> ${CURRENT})"
+    if ( cd "$ROOT" && "$CODE_INDEX" ingest . $DB_FLAG ) >"$LOGTMP" 2>&1; then
+        logger -t code-index <"$LOGTMP"
+        echo "$CURRENT" >"$HASH_FILE"
+        logger -t code-index "done: ${NAME}"
+        rm -f "$LOGTMP"
+        return 0
+    fi
+
     RC=$?
     logger -t code-index <"$LOGTMP"
-    logger -t code-index "FAILED: ${BASENAME} ingest exit ${RC} - hash NOT updated, will retry next cron"
+    logger -t code-index "FAILED: ${NAME} ingest exit ${RC} - hash NOT updated, will retry next cron"
+    rm -f "$LOGTMP"
+    return 1
+}
+
+if [ $# -gt 0 ]; then
+    # Explicit path: the historical single-repo behavior, unchanged.
+    reindex_one "$(basename "$1")" "$1" repo ""
+    exit $?
+fi
+
+# No-arg: every configured source. Written to a temp file rather than piped
+# into the loop, so the loop body runs in THIS shell and a failure count
+# actually survives it (a `... | while read` body is a subshell in POSIX sh).
+LIST="$(mktemp -t code-index-sources)"
+trap 'rm -f "$LIST"' EXIT
+
+"$CODE_INDEX" sources --porcelain >"$LIST" 2>/dev/null || true
+
+if [ ! -s "$LIST" ]; then
+    logger -t code-index "no [[code_index.sources]] configured — nothing to reindex"
+    exit 0
+fi
+
+FAILURES=0
+while IFS="$(printf '\t')" read -r NAME ROOT KIND DB; do
+    [ -n "$NAME" ] || continue
+    # One bad source must not skip the others.
+    reindex_one "$NAME" "$ROOT" "$KIND" "$DB" || FAILURES=$((FAILURES + 1))
+done <"$LIST"
+
+if [ "$FAILURES" -gt 0 ]; then
+    logger -t code-index "reindex sweep: ${FAILURES} source(s) failed"
     exit 1
 fi

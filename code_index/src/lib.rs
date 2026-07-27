@@ -17,6 +17,7 @@ pub mod embed;
 pub mod graph;
 pub mod ingest;
 pub mod recall;
+pub mod sources;
 pub mod store;
 pub mod walker;
 

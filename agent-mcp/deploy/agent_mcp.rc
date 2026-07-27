@@ -22,8 +22,9 @@
 #   user          — user to run as (rc.subr su -m switch). Default tcovert.
 #   group         — primary group. Default = user.
 #   listen        — host:port to bind. Default 0.0.0.0:7700 (bind all; never a pinned IP).
-#   bin           — agent-mcp binary. Default /home/tcovert/.local/bin/agent-mcp
-#   agent_bin     — the `agent` binary it shells to (AGENT_BIN). Default /home/tcovert/.local/bin/agent
+#   bin           — agent-mcp binary. Default <run-user home>/.local/bin/agent-mcp
+#   agent_bin     — the `agent` binary it shells to (AGENT_BIN).
+#                   Default <run-user home>/.local/bin/agent
 #   db            — AGENT_DB override. Default empty (agent's default ~/.local/share/agent.sqlite, the central store).
 #   allow_writes  — YES exposes mutating tools (memory add/correct/...). Default NO.
 #                   Read-only until biscuit-scoped worker access lands; flip to YES
@@ -44,17 +45,20 @@ load_rc_config "$name"
 : ${agent_mcp_enable:="NO"}
 : ${agent_mcp_user:="tcovert"}
 : ${agent_mcp_listen:="0.0.0.0:7700"}
-: ${agent_mcp_bin:="/home/tcovert/.local/bin/agent-mcp"}
-: ${agent_mcp_agent_bin:="/home/tcovert/.local/bin/agent"}
 : ${agent_mcp_db:=""}
 : ${agent_mcp_allow_writes:="NO"}
 : ${agent_mcp_logfile:="/var/log/${name}.log"}
 
-# Resolve the run-user's home for HOME and chdir.
+# Resolve the run-user's home from passwd — never spell a home directory out
+# here. This script ships in the repo and runs on hosts that disagree about
+# where homes live; the binary path defaults below are derived from it.
 agent_mcp_home="$(getent passwd ${agent_mcp_user} 2>/dev/null | cut -d: -f6)"
-: ${agent_mcp_home:="/home/${agent_mcp_user}"}
+: ${agent_mcp_home:="$(eval echo ~${agent_mcp_user})"}
 : ${agent_mcp_group:="${agent_mcp_user}"}
 : ${agent_mcp_chdir:="${agent_mcp_home}"}
+
+: ${agent_mcp_bin:="${agent_mcp_home}/.local/bin/agent-mcp"}
+: ${agent_mcp_agent_bin:="${agent_mcp_home}/.local/bin/agent"}
 
 # Optional env, built conditionally so we never pass an empty AGENT_DB or a
 # spurious writes flag.
