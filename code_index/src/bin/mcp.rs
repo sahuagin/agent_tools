@@ -15,9 +15,8 @@ use rmcp::{schemars, tool, tool_handler, tool_router, ServerHandler, ServiceExt}
 
 use code_index::embed::select_embedder;
 use code_index::recall::{self, RecallMode, RecallTuning, DEFAULT_TEST_PENALTY};
+use code_index::sources::{self, Sources, MIN_POPULATED_DB_SIZE};
 use code_index::store::SqliteStore;
-
-const MIN_POPULATED_DB_SIZE: u64 = 100_000;
 
 fn db_is_populated(path: &Path) -> bool {
     path.metadata()
@@ -25,8 +24,13 @@ fn db_is_populated(path: &Path) -> bool {
 }
 
 fn resolve_db() -> PathBuf {
-    if let Some(p) = std::env::var_os("CODE_INDEX_DB") {
-        return PathBuf::from(p);
+    if let Some(p) = std::env::var("CODE_INDEX_DB")
+        .ok()
+        .filter(|s| !s.is_empty())
+    {
+        // Expanded, so a tilde in the service env never becomes a literal
+        // `~` directory (see sources::Sources::resolve).
+        return sources::expand_home(&p);
     }
     if let Some(p) = walk_up_for_marker() {
         return p;
@@ -48,17 +52,14 @@ fn walk_up_for_marker() -> Option<PathBuf> {
 }
 
 fn global_default_for_cwd() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
     let cwd = std::env::current_dir().ok();
     let stem = cwd
         .as_ref()
         .and_then(|c| c.file_name())
         .and_then(|s| s.to_str())
-        .unwrap_or("index");
-    PathBuf::from(home)
-        .join(".cache")
-        .join("code_index")
-        .join(format!("{stem}.db"))
+        .unwrap_or("index")
+        .to_string();
+    sources::default_cache_dir().join(format!("{stem}.db"))
 }
 
 // ─── Tool parameter types ───────────────────────────────────────────
@@ -89,11 +90,30 @@ fn default_mode() -> String {
     "hybrid".into()
 }
 
+#[derive(Debug, Default, serde::Deserialize, schemars::JsonSchema)]
+struct StatusParams {
+    /// Which index to report on: a source name (e.g. "mu") or an absolute
+    /// path. Omit for the service's default index.
+    #[serde(default)]
+    db: Option<String>,
+}
+
+#[derive(Debug, Default, serde::Deserialize, schemars::JsonSchema)]
+struct SourcesParams {
+    /// Machine-readable output: one TAB-separated
+    /// `name<TAB>managed|unmanaged<TAB>path<TAB>detail` row per index, no
+    /// header. For programmatic consumers (the mesh service); humans and
+    /// models want the default rendering.
+    #[serde(default)]
+    porcelain: bool,
+}
+
 // ─── Server ─────────────────────────────────────────────────────────
 
 #[derive(Clone)]
 struct CodeIndexServer {
     db_path: Arc<PathBuf>,
+    sources: Arc<Sources>,
 }
 
 #[tool_router]
@@ -101,6 +121,21 @@ impl CodeIndexServer {
     fn new(db_path: PathBuf) -> Self {
         Self {
             db_path: Arc::new(db_path),
+            sources: Arc::new(Sources::load()),
+        }
+    }
+
+    /// Resolve a caller-supplied `db` argument, or fall back to the default.
+    /// Errors are returned as text so the caller sees the resolved path and
+    /// the available alternatives instead of an empty result set.
+    fn resolve_arg(&self, db: Option<&String>) -> Result<Arc<PathBuf>, String> {
+        match db {
+            Some(name) => self
+                .sources
+                .resolve(name)
+                .map(Arc::new)
+                .map_err(|e| e.to_string()),
+            None => Ok(self.db_path.clone()),
         }
     }
 
@@ -111,17 +146,9 @@ impl CodeIndexServer {
         &self,
         Parameters(params): Parameters<RecallParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        let db_path = match &params.db {
-            Some(name) if name.starts_with('/') => Arc::new(PathBuf::from(name)),
-            Some(name) => {
-                let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-                Arc::new(
-                    PathBuf::from(home)
-                        .join(".cache/code_index")
-                        .join(format!("{name}.db")),
-                )
-            }
-            None => self.db_path.clone(),
+        let db_path = match self.resolve_arg(params.db.as_ref()) {
+            Ok(p) => p,
+            Err(e) => return Ok(CallToolResult::error(vec![Content::text(e)])),
         };
         let result = tokio::task::spawn_blocking(move || recall_blocking(&db_path, &params))
             .await
@@ -134,10 +161,16 @@ impl CodeIndexServer {
     }
 
     #[tool(
-        description = "Show code index status: DB path, file count, chunk count, embedding coverage."
+        description = "Show code index status: DB path, file count, chunk count, embedding coverage. Pass `db` to report on a specific index; omit for the default. Use code_sources to see which indexes exist."
     )]
-    async fn code_status(&self) -> Result<CallToolResult, rmcp::ErrorData> {
-        let db_path = self.db_path.clone();
+    async fn code_status(
+        &self,
+        Parameters(params): Parameters<StatusParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let db_path = match self.resolve_arg(params.db.as_ref()) {
+            Ok(p) => p,
+            Err(e) => return Ok(CallToolResult::error(vec![Content::text(e)])),
+        };
         let result = tokio::task::spawn_blocking(move || status_blocking(&db_path))
             .await
             .map_err(|e| rmcp::ErrorData::internal_error(format!("task join: {e}"), None))?;
@@ -146,6 +179,27 @@ impl CodeIndexServer {
             Ok(text) => Ok(CallToolResult::success(vec![Content::text(text)])),
             Err(e) => Ok(CallToolResult::error(vec![Content::text(e)])),
         }
+    }
+
+    #[tool(
+        description = "List the code indexes this server can serve: the name to pass as `db`, the repository it indexes, and how fresh it is. Call this first instead of guessing a repo name."
+    )]
+    async fn code_sources(
+        &self,
+        Parameters(params): Parameters<SourcesParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let sources = self.sources.clone();
+        let default = self.db_path.clone();
+        let text = tokio::task::spawn_blocking(move || {
+            if params.porcelain {
+                sources_porcelain(&sources)
+            } else {
+                sources_blocking(&sources, &default)
+            }
+        })
+        .await
+        .map_err(|e| rmcp::ErrorData::internal_error(format!("task join: {e}"), None))?;
+        Ok(CallToolResult::success(vec![Content::text(text)]))
     }
 }
 
@@ -156,7 +210,9 @@ impl ServerHandler for CodeIndexServer {
             .with_server_info(Implementation::new("code-index", env!("CARGO_PKG_VERSION")))
             .with_instructions(
                 "Code index server. Use code_recall to search for symbols, concepts, \
-                 or patterns in indexed repositories. Use code_status to check index health.",
+                 or patterns in indexed repositories. Call code_sources to see which \
+                 repositories are indexed and what to pass as `db` — do not guess a \
+                 repo name. Use code_status to check one index's health.",
             )
     }
 }
@@ -172,7 +228,7 @@ fn recall_blocking(db_path: &Path, params: &RecallParams) -> Result<String, Stri
         exclude_tests: params.exclude_tests,
     };
 
-    let store = SqliteStore::open_at(db_path).map_err(|e| format!("open db: {e}"))?;
+    let store = SqliteStore::open_existing_at(db_path).map_err(|e| format!("open db: {e}"))?;
     let embedder = select_embedder();
 
     let hits = recall::recall_tuned(
@@ -198,9 +254,14 @@ fn recall_blocking(db_path: &Path, params: &RecallParams) -> Result<String, Stri
     .map_err(|e| format!("recall error: {e}"))?;
 
     if hits.is_empty() {
-        return Ok(
-            "No results found. Has the repository been indexed? Run: code-index ingest .".into(),
-        );
+        // The index opened, so it exists and is populated — this is a genuine
+        // miss, not a missing database. (A missing one is a typed error now.)
+        return Ok(format!(
+            "No matches for {:?} in {}. Try different terms, mode=lexical for \
+             exact symbols, or code_sources to pick a different index.",
+            params.query,
+            db_path.display()
+        ));
     }
 
     let mut out = String::new();
@@ -225,9 +286,18 @@ fn recall_blocking(db_path: &Path, params: &RecallParams) -> Result<String, Stri
 }
 
 fn status_blocking(db_path: &Path) -> Result<String, String> {
-    let _store = SqliteStore::open_at(db_path).map_err(|e| format!("open db: {e}"))?;
-    let conn =
-        rusqlite::Connection::open(db_path).map_err(|e| format!("open db for status: {e}"))?;
+    if !db_path.is_file() {
+        return Err(format!(
+            "no index at {} (not creating it)",
+            db_path.display()
+        ));
+    }
+    let conn = rusqlite::Connection::open_with_flags(
+        db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .or_else(|_| rusqlite::Connection::open(db_path))
+    .map_err(|e| format!("open db for status: {e}"))?;
 
     let file_count: i64 = conn
         .query_row("SELECT COUNT(*) FROM file_manifest", [], |r| r.get(0))
@@ -270,6 +340,141 @@ fn status_blocking(db_path: &Path) -> Result<String, String> {
             embed_info
         }
     ))
+}
+
+/// Render the servable index set: configured sources first, then any other
+/// populated db already in the cache family (those still work, they are just
+/// unmanaged — no cron keeps them fresh).
+fn sources_blocking(sources: &Sources, default_db: &Path) -> String {
+    let mut out = String::new();
+    out.push_str(&format!(
+        "cache dir: {}\ndefault db: {}{}\n\n",
+        sources.cache_dir().display(),
+        default_db.display(),
+        if default_db.is_file() {
+            ""
+        } else {
+            "   [MISSING]"
+        },
+    ));
+
+    if sources.entries().is_empty() {
+        out.push_str(
+            "configured sources: none — add [[code_index.sources]] to \
+             ~/.config/agent/config.toml so the reindex cron and this service \
+             agree on what is indexed.\n\n",
+        );
+    } else {
+        out.push_str("configured sources:\n");
+        for s in sources.entries() {
+            let db = s.db_path(sources.cache_dir());
+            out.push_str(&format!(
+                "  {:<20} {:<10} {:<52} {}\n",
+                s.name,
+                if s.repo { "repo" } else { "content" },
+                s.path.display(),
+                describe_db(&db),
+            ));
+        }
+        out.push('\n');
+    }
+
+    let configured: Vec<&str> = sources.entries().iter().map(|s| s.name.as_str()).collect();
+    let extra: Vec<String> = sources
+        .discovered()
+        .into_iter()
+        .filter(|n| !configured.contains(&n.as_str()))
+        .collect();
+    if !extra.is_empty() {
+        out.push_str("unmanaged indexes in the cache dir (servable, not maintained):\n");
+        for name in extra {
+            let db = sources.cache_dir().join(format!("{name}.db"));
+            out.push_str(&format!("  {:<20} {}\n", name, describe_db(&db)));
+        }
+    }
+    out
+}
+
+/// Machine-readable source listing, one row per index:
+/// `name<TAB>managed|unmanaged<TAB>path<TAB>detail`.
+///
+/// `managed` = configured in `[[code_index.sources]]`, so the reindex cron
+/// keeps it fresh. `unmanaged` = present in the cache dir and servable, but
+/// nothing maintains it. For unmanaged rows `path` is the db itself, since
+/// there is no configured root to name.
+fn sources_porcelain(sources: &Sources) -> String {
+    let mut out = String::new();
+    for s in sources.entries() {
+        let db = s.db_path(sources.cache_dir());
+        out.push_str(&format!(
+            "{}\tmanaged\t{}\t{}\n",
+            s.name,
+            s.path.display(),
+            describe_db(&db),
+        ));
+    }
+    let configured: Vec<&str> = sources.entries().iter().map(|s| s.name.as_str()).collect();
+    for name in sources.discovered() {
+        if configured.contains(&name.as_str()) {
+            continue;
+        }
+        let db = sources.cache_dir().join(format!("{name}.db"));
+        out.push_str(&format!(
+            "{}\tunmanaged\t{}\t{}\n",
+            name,
+            db.display(),
+            describe_db(&db),
+        ));
+    }
+    out
+}
+
+/// One-line contents/freshness summary for a db file.
+///
+/// Counts rows rather than judging by file size: a small repo has a small
+/// index, and calling that an "empty shell" would be a false alarm. An index
+/// with zero chunks is the real defect — that is the open-created ghost.
+fn describe_db(db: &Path) -> String {
+    let Ok(meta) = db.metadata() else {
+        return "MISSING".to_string();
+    };
+    let age = meta
+        .modified()
+        .ok()
+        .and_then(|m| m.elapsed().ok())
+        .map(|d| {
+            let hours = d.as_secs() / 3600;
+            if hours < 48 {
+                format!("{hours}h ago")
+            } else {
+                format!("{}d ago", hours / 24)
+            }
+        })
+        .unwrap_or_else(|| "?".into());
+
+    let counts = rusqlite::Connection::open_with_flags(
+        db,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .ok()
+    .and_then(|c| {
+        let files: i64 = c
+            .query_row("SELECT COUNT(*) FROM file_manifest", [], |r| r.get(0))
+            .ok()?;
+        let chunks: i64 = c
+            .query_row("SELECT COUNT(*) FROM chunks", [], |r| r.get(0))
+            .ok()?;
+        Some((files, chunks))
+    });
+
+    match counts {
+        Some((0, 0)) => format!("EMPTY — never ingested ({age})"),
+        Some((files, chunks)) => {
+            format!("{files} files, {chunks} chunks, indexed {age}")
+        }
+        // Present but unreadable/not an index: worth seeing, not worth guessing.
+        None => format!("UNREADABLE ({} bytes, {age})", meta.len()),
+    }
 }
 
 // ─── Entry point ────────────────────────────────────────────────────

@@ -129,6 +129,43 @@ url = "http://localhost:7740/mcp"
 # Env override: CODE_INDEX_ALLOWED_HOSTS
 [code_index]
 # allowed_hosts = "10.0.0.5"
+#
+# Where the index family lives. One host location holds every index as
+# <name>.db; the MCP service serves out of it and the reindex cron maintains
+# it. Default: ~/.cache/code_index
+# cache_dir = "~/.cache/code_index"
+
+# The repositories/locations that get indexed. THIS LIST IS THE SINGLE SOURCE
+# OF TRUTH — it drives all three of:
+#   1. `reindex-if-changed` with no arguments (so cron needs ONE line:
+#        */15 * * * * ~/.local/bin/reindex-if-changed >/dev/null 2>&1
+#      adding a repo is a config edit, never a crontab edit)
+#   2. the `db` names `code_recall`/`code_status` accept over MCP
+#   3. `code-index sources`, which is how an agent discovers those names
+#      instead of guessing them
+#
+#   path : root directory to index (required)
+#   repo : true (default) — change detection via VCS head (jj, then git).
+#          false — the location need not be a repository; its file tree is
+#          hashed instead.
+#   name : optional key override. Defaults to the path's trailing component,
+#          which is a per-machine accident (the same repo checked out under
+#          two names indexes twice) — set it explicitly when that matters.
+#
+# An index already sitting in cache_dir but NOT listed here still resolves, so
+# nothing that works today stops working; it is simply unmaintained, and
+# `code-index sources` reports it separately.
+#
+# [[code_index.sources]]
+# path = "~/src/public_github/mu"
+#
+# [[code_index.sources]]
+# path = "~/src/public_github/agent_tools"
+#
+# [[code_index.sources]]
+# path = "~/notes"
+# repo = false
+# name = "notebook"
 
 # ── kx knowledge index (`agent kx`) ──────────────────────────────────────────
 # A kx entry is a POINTER (+ one-line summary + metadata + embedding) to one
@@ -192,7 +229,7 @@ url = "http://localhost:7740/mcp"
 #                  prefixes so --tag filters compose (ANDed, comma-anchored).
 #   category     : adds a cat:<category> tag.
 [[kx.sources]]
-path = "/home/you/notes"
+path = "~/notes"
 extensions = ["md"]
 exclude-globs = ["**/drafts/**"]
 scope = "work"

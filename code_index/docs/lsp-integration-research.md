@@ -870,7 +870,7 @@ Or, depending on the installed bridge:
       "command": "claude-code-lsps",
       "args": [
         "--config",
-        "/home/tcovert/src/agent_tools/code_index/lsp-config.json"
+        "~/src/agent_tools/code_index/lsp-config.json"
       ]
     }
   }
@@ -883,10 +883,10 @@ The LSP bridge config would then include `code-index-lsp` as a server:
 {
   "servers": {
     "code-index": {
-      "command": "/home/tcovert/src/agent_tools/code_index/target/release/code-index-lsp",
+      "command": "~/src/agent_tools/code_index/target/release/code-index-lsp",
       "args": [],
       "env": {
-        "CODE_INDEX_DB": "/home/tcovert/src/agent_tools/code_index/.code_index/index.sqlite"
+        "CODE_INDEX_DB": "~/src/agent_tools/code_index/.code_index/index.sqlite"
       },
       "languages": ["rust", "python"],
       "rootPatterns": [".git", "Cargo.toml", "pyproject.toml"]

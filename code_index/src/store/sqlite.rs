@@ -39,6 +39,33 @@ impl SqliteStore {
         Ok(Self { conn })
     }
 
+    /// Open an EXISTING index for reading. Never creates.
+    ///
+    /// `open_at` uses sqlite's default open semantics, which create the file
+    /// when it is missing — correct for `ingest`, wrong for every query path:
+    /// a typo'd or not-yet-copied db name became a permanent empty index that
+    /// shadowed the real error forever (at-jjw). The read paths call this
+    /// instead, so a miss is a typed error naming the resolved path.
+    ///
+    /// Prefers a read-only connection. A WAL database whose `-shm` is absent
+    /// or unwritable cannot be opened read-only, so we fall back to a normal
+    /// open — safe, because the file is already known to exist and no
+    /// migration runs here.
+    pub fn open_existing_at(path: &Path) -> Result<Self> {
+        if !path.is_file() {
+            anyhow::bail!("no index at {} (not creating it)", path.display());
+        }
+        let conn = Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX
+                | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+        )
+        .or_else(|_| Connection::open(path))
+        .with_context(|| format!("opening {}", path.display()))?;
+        Ok(Self { conn })
+    }
+
     /// Open an in-memory store. Intended for tests.
     pub fn open_in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;

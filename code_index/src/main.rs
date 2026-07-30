@@ -124,6 +124,17 @@ enum Command {
     /// instead of the global `~/.cache/code_index/<basename>.db`.
     #[command(after_long_help = INIT_AFTER_LONG_HELP)]
     Init,
+    /// List the `[[code_index.sources]]` configured in
+    /// `~/.config/agent/config.toml` — what the reindex cron maintains and
+    /// what the MCP service will serve. One config section, one parser: the
+    /// cron script reads this command's output rather than re-parsing TOML,
+    /// so the two can never disagree about what is indexed.
+    Sources {
+        /// Machine-readable: one TAB-separated `name<TAB>path<TAB>repo<TAB>db`
+        /// row per source, no header. For `reindex-if-changed` and friends.
+        #[arg(long)]
+        porcelain: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -464,6 +475,32 @@ OUTPUT (stdout)
 EXAMPLE
   cd <repo> && code-index init && code-index ingest .";
 
+const SOURCES_AI_TEXT: &str = "\
+# code-index sources — what is indexed (agent-oriented help)
+
+PURPOSE
+  List the `[[code_index.sources]]` configured in ~/.config/agent/config.toml.
+  That one section is the single source of truth for what the reindex cron
+  maintains AND what the code-index MCP service will serve, so you can find
+  the right `db` name instead of guessing one.
+
+USAGE
+  code-index sources              # human-readable
+  code-index sources --porcelain  # name<TAB>path<TAB>repo|content<TAB>db
+
+CONFIG
+  [[code_index.sources]]
+  path = \"~/src/public_github/mu\"
+  repo = true      # default; change detection via VCS head (jj/git)
+  # name = \"mu\"   # optional key override (default: path basename)
+
+NOTES
+  An unconfigured db already present in the cache dir still resolves — it is
+  just unmaintained. `code-index sources` reports those separately.
+
+EXAMPLE
+  code-index sources --porcelain | while IFS=\"\\t\" read -r name path _ _; do ...; done";
+
 /// Render agent-oriented help for the resolved (sub)command and return.
 /// `None` (no subcommand) renders the top-level overview; each subcommand
 /// renders its own doc. Graph subops all route to the consolidated graph
@@ -475,6 +512,7 @@ fn print_ai_help(command: Option<&Command>, json: bool) {
         Some(Command::Graph { .. }) => (GRAPH_AI_TEXT, graph_ai_json),
         Some(Command::Status) => (STATUS_AI_TEXT, status_ai_json),
         Some(Command::Init) => (INIT_AI_TEXT, init_ai_json),
+        Some(Command::Sources { .. }) => (SOURCES_AI_TEXT, sources_ai_json),
         None => (OVERVIEW_AI_TEXT, overview_ai_json),
     };
     if json {
@@ -682,6 +720,32 @@ fn init_ai_json() -> String {
     serde_json::to_string_pretty(&v).unwrap_or_else(|_| v.to_string())
 }
 
+fn sources_ai_json() -> String {
+    let v = serde_json::json!({
+        "command": "sources",
+        "purpose": "List the [[code_index.sources]] configured in ~/.config/agent/config.toml \
+                    — the single source of truth for what the reindex cron maintains and what \
+                    the code-index MCP service serves. Use it to find a valid `db` name.",
+        "usage": "code-index sources [--porcelain]",
+        "config_shape": {
+            "section": "[[code_index.sources]]",
+            "keys": {
+                "path": "root directory to index (required)",
+                "repo": "bool, default true — VCS-head change detection; false = content hash",
+                "name": "optional key override; default is the path basename"
+            }
+        },
+        "output_schema": {
+            "stream": "stdout",
+            "porcelain": "one row per source: name\\tpath\\trepo|content\\tdb"
+        },
+        "notes": "An unconfigured db already in the cache dir still resolves, but is \
+                  unmaintained; it is reported separately.",
+        "examples": ["code-index sources", "code-index sources --porcelain"]
+    });
+    serde_json::to_string_pretty(&v).unwrap_or_else(|_| v.to_string())
+}
+
 /// Resolve which DB path to use, in this precedence:
 ///   1. Explicit `--db` flag → use it verbatim.
 ///   2. `$CODE_INDEX_DB` env var → use it verbatim.
@@ -693,12 +757,17 @@ fn init_ai_json() -> String {
 /// directories — declare scope explicitly with an `init`-style marker
 /// directory, walk up to find it, and have a sensible per-tree fallback.
 fn resolve_db_path(explicit: Option<&Path>) -> Result<PathBuf> {
+    // Expand `~`/`$HOME` on both the flag and the env var. A quoted or
+    // config-supplied `--db '~/.cache/code_index/mu.db'` is NOT expanded by a
+    // shell, and `ingest` legitimately creates its parent — so an unexpanded
+    // tilde makes a literal `~` directory tree wherever the process happens to
+    // be running. That is the `~` directory that kept appearing in the cache.
     if let Some(p) = explicit {
-        return Ok(p.to_path_buf());
+        return Ok(code_index::sources::expand_home(&p.to_string_lossy()));
     }
     if let Ok(env) = std::env::var("CODE_INDEX_DB") {
         if !env.is_empty() {
-            return Ok(PathBuf::from(env));
+            return Ok(code_index::sources::expand_home(&env));
         }
     }
     if let Some(p) = walk_up_for_marker() {
@@ -987,8 +1056,45 @@ fn main() -> Result<()> {
         }
         Command::Status => {
             let path = resolve_db_path(cli.db.as_deref())?;
-            let store = SqliteStore::open_at(&path)?;
+            // Read path: never create. A missing db is a typed error naming
+            // the resolved path, not a silently-created empty index (at-jjw).
+            let store = SqliteStore::open_existing_at(&path)?;
             print_status(&path, &store)?;
+            Ok(())
+        }
+        Command::Sources { porcelain } => {
+            let sources = code_index::sources::Sources::load();
+            if porcelain {
+                for s in sources.entries() {
+                    println!(
+                        "{}\t{}\t{}\t{}",
+                        s.name,
+                        s.path.display(),
+                        if s.repo { "repo" } else { "content" },
+                        s.db_path(sources.cache_dir()).display(),
+                    );
+                }
+            } else if sources.entries().is_empty() {
+                println!(
+                    "no [[code_index.sources]] configured in ~/.config/agent/config.toml\n\
+                     cache dir: {}",
+                    sources.cache_dir().display()
+                );
+                let extra = sources.discovered();
+                if !extra.is_empty() {
+                    println!("\nunmanaged indexes present there: {}", extra.join(", "));
+                }
+            } else {
+                println!("cache dir: {}", sources.cache_dir().display());
+                for s in sources.entries() {
+                    println!(
+                        "{:<20} {:<8} {}",
+                        s.name,
+                        if s.repo { "repo" } else { "content" },
+                        s.path.display()
+                    );
+                }
+            }
             Ok(())
         }
         Command::Init => {

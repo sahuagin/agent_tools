@@ -703,7 +703,7 @@ fn tokenize(text: &str) -> Vec<String> {
 
 fn signals_from_cwd(cwd: &str) -> Vec<String> {
     // Extract terms from the last two path components so
-    // e.g. /home/tcovert/src/pi-claude-poc → ["pi", "claude", "poc", "src"]
+    // e.g. <home>/src/pi-claude-poc → ["pi", "claude", "poc", "src"]
     let parts: Vec<&str> = cwd.trim_end_matches('/').split('/').collect();
     let tail = parts
         .iter()
