@@ -144,7 +144,13 @@ url = "http://localhost:7740/mcp"
 #   3. `code-index sources`, which is how an agent discovers those names
 #      instead of guessing them
 #
-#   path : root directory to index (required)
+#   path : root directory to index (required). A STRING, or a LIST of
+#          candidate paths — the first one that exists on the machine running
+#          the ingest wins. Use a list when the same repo sits at different
+#          paths from different vantages: a host path like /jails/<j>/... is
+#          invisible from inside that jail, and the jail's own path is not the
+#          host's. With a single absolute path, every machine that cannot see
+#          it silently skips the source.
 #   repo : true (default) — change detection via VCS head (jj, then git).
 #          false — the location need not be a repository; its file tree is
 #          hashed instead.
@@ -161,6 +167,10 @@ url = "http://localhost:7740/mcp"
 #
 # [[code_index.sources]]
 # path = "~/src/public_github/agent_tools"
+#
+# Same repo, two vantages — indexed from whichever machine runs the cron:
+# [[code_index.sources]]
+# path = ["~/src/public_github/agent_tools", "/jails/aiteam/home/you/src/public_github/agent_tools"]
 #
 # [[code_index.sources]]
 # path = "~/notes"

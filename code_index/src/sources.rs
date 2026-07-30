@@ -50,6 +50,11 @@ pub struct Source {
     /// `true` (default): change detection via VCS head (jj/git).
     /// `false`: the location need not be a repository; hash its content.
     pub repo: bool,
+    /// Whether `path` actually exists on THIS machine. False means no
+    /// candidate resolved here — the source is real but belongs to another
+    /// vantage (a host path seen from inside a jail, or vice versa), so it is
+    /// reported rather than silently dropped.
+    pub resolved: bool,
 }
 
 impl Source {
@@ -129,15 +134,50 @@ struct CodeIndexSection {
 #[derive(Debug, Deserialize)]
 #[serde(default)]
 struct SourceEntry {
-    path: String,
+    path: PathSpec,
     name: Option<String>,
     repo: bool,
+}
+
+/// `path` accepts a single string or a list of candidates.
+///
+/// One repository does not live at one path across a fleet: the same checkout
+/// is `~/src/public_github/agent_tools` inside a jail and something else
+/// entirely from the host, and a host path like `/jails/spline/...` is simply
+/// invisible from within a jail. A single absolute path therefore assumes ONE
+/// vantage point, and every other machine reading the same config silently
+/// skips the source as "not present on this host".
+///
+/// A candidate list says "this repo, wherever it is here": the first entry
+/// that resolves wins, so one config works from every vantage. (Stable
+/// identity across vantages — so both produce the same `<name>.db` — is the
+/// separate at-lcn origin-URL work; `name` is the stopgap for that.)
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum PathSpec {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl PathSpec {
+    fn candidates(&self) -> Vec<&str> {
+        match self {
+            PathSpec::One(s) => vec![s.as_str()],
+            PathSpec::Many(v) => v.iter().map(String::as_str).collect(),
+        }
+    }
+}
+
+impl Default for PathSpec {
+    fn default() -> Self {
+        PathSpec::One(String::new())
+    }
 }
 
 impl Default for SourceEntry {
     fn default() -> Self {
         Self {
-            path: String::new(),
+            path: PathSpec::default(),
             // A source is a repository unless it says otherwise: that is the
             // common case and the stronger change detector.
             name: None,
@@ -212,15 +252,30 @@ impl Sources {
             .code_index
             .sources
             .into_iter()
-            .filter(|e| !e.path.trim().is_empty())
-            .map(|e| {
-                let path = expand_home(&e.path);
+            .filter_map(|e| {
+                let expanded: Vec<PathBuf> = e
+                    .path
+                    .candidates()
+                    .into_iter()
+                    .filter(|c| !c.trim().is_empty())
+                    .map(expand_home)
+                    .collect();
+                let first = expanded.first()?.clone();
+                // First candidate that actually exists HERE wins; otherwise
+                // keep the first so the source still reports itself (with a
+                // real path to name) instead of vanishing from the listing.
+                let resolved = expanded.iter().find(|p| p.is_dir()).cloned();
+                let path = resolved.clone().unwrap_or(first);
+                // Key off the chosen path, so the same repo keys identically
+                // whichever vantage resolved it — provided the candidates end
+                // in the same component, which is the normal case.
                 let name = e.name.unwrap_or_else(|| basename_key(&path));
-                Source {
+                Some(Source {
                     path,
                     name,
                     repo: e.repo,
-                }
+                    resolved: resolved.is_some(),
+                })
             })
             .collect();
 
@@ -463,6 +518,67 @@ name = "absolute"
         // And the derived key comes from the EXPANDED path, so `~/x/mu`
         // keys as "mu", not as something containing a tilde.
         assert!(s.get("mu").is_some());
+    }
+
+    /// A source may list candidate paths: one repo does not live at one path
+    /// across a fleet (jail vs host), and a single absolute path silently
+    /// skips the source everywhere else.
+    #[test]
+    fn path_list_picks_the_candidate_that_exists_here() {
+        let dir = std::env::temp_dir().join("ci-src-candidates-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        let real = dir.join("here/agent_tools");
+        std::fs::create_dir_all(&real).expect("mkdir");
+
+        let cfg = format!(
+            r#"
+[code_index]
+cache_dir = "{c}"
+
+[[code_index.sources]]
+path = ["{missing}", "{real}"]
+
+[[code_index.sources]]
+path = ["{missing}", "{missing2}"]
+name = "elsewhere"
+"#,
+            c = dir.display(),
+            missing = dir.join("nope/agent_tools").display(),
+            missing2 = dir.join("also-nope/agent_tools").display(),
+            real = real.display(),
+        );
+        let s = Sources::parse(&cfg).expect("parse");
+
+        // Second candidate resolves, and the key comes from the chosen path.
+        let found = s.get("agent_tools").expect("agent_tools");
+        assert_eq!(found.path, real);
+        assert!(found.resolved);
+
+        // No candidate resolves: the source is still REPORTED (with the first
+        // path, so the message can name something real) but marked unresolved
+        // rather than silently vanishing from the listing.
+        let missing = s.get("elsewhere").expect("still listed");
+        assert!(!missing.resolved);
+        assert_eq!(missing.path, dir.join("nope/agent_tools"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn single_string_path_still_parses() {
+        // Back-compat: every existing config uses the scalar form.
+        let s = Sources::parse(
+            r#"
+[[code_index.sources]]
+path = "/src/public_github/mu"
+"#,
+        )
+        .expect("parse");
+        assert_eq!(s.entries().len(), 1);
+        assert_eq!(
+            s.get("mu").expect("mu").path,
+            PathBuf::from("/src/public_github/mu")
+        );
     }
 
     #[test]

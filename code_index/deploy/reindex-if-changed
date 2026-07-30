@@ -67,7 +67,10 @@ reindex_one() {
     DB="$4"
 
     if [ ! -d "$ROOT" ]; then
-        logger -t code-index "skip ${NAME}: ${ROOT} not present on this host"
+        # Not an error: a source can legitimately belong to another vantage
+        # (a host path is invisible inside a jail, and vice versa). Give the
+        # source a `path` LIST if it should be indexable from here too.
+        logger -t code-index "skip ${NAME}: no configured path resolves here (${ROOT}) - add a candidate path for this machine if it should index"
         return 0
     fi
 
