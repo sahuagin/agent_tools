@@ -46,8 +46,15 @@ current_hash() {
     fi
     (
         cd "$_root" 2>/dev/null || exit 0
+        # `--verify --quiet` is load-bearing: plain `git rev-parse main` ECHOES
+        # the literal string "main" on stdout when it cannot resolve it, exiting
+        # non-zero. `2>/dev/null` hides the error but not the echo, so the
+        # caller silently accepted "main" as a commit id — the source indexed
+        # once, stored "main" as its marker, and then never reindexed again
+        # because "main" always equals "main". A frozen index that looks
+        # perfectly healthy.
         jj log -r main --no-graph -T 'commit_id' --limit 1 2>/dev/null ||
-            git rev-parse main 2>/dev/null ||
+            git rev-parse --verify --quiet main 2>/dev/null ||
             true
     )
 }
@@ -66,20 +73,60 @@ reindex_one() {
 
     HASH_FILE="$HOME/.cache/code_index/.${NAME}.last-hash"
 
-    # A per-repo .code_index/ still wins over the global cache.
+    # A per-repo .code_index/ still wins over the global cache. Track the
+    # resolved path too, not just the flag — the skip decision below needs to
+    # know whether the output still exists.
     if [ -d "$ROOT/.code_index" ]; then
+        DB_PATH="$ROOT/.code_index/index.db"
         DB_FLAG=""
     elif [ -n "$DB" ]; then
+        DB_PATH="$DB"
         DB_FLAG="--db $DB"
     else
-        DB_FLAG="--db $HOME/.cache/code_index/${NAME}.db"
+        DB_PATH="$HOME/.cache/code_index/${NAME}.db"
+        DB_FLAG="--db $DB_PATH"
     fi
 
     CURRENT="$(current_hash "$ROOT" "$KIND")"
-    [ -n "$CURRENT" ] || return 0
+    if [ -z "$CURRENT" ]; then
+        # Used to `return 0` in silence, which is indistinguishable from "up to
+        # date" — a source could sit unindexed forever with nothing in the
+        # journal to say why. The usual cause is a jj checkout with no LOCAL
+        # `main` bookmark (only `main@origin`), where both detectors come back
+        # empty.
+        logger -t code-index \
+            "skip ${NAME}: no VCS head at ${ROOT} — no local 'main' bookmark/branch? (jj: 'jj bookmark create main -r main@origin'; or set repo = false for a non-repo location)"
+        return 0
+    fi
 
     LAST="$(cat "$HASH_FILE" 2>/dev/null || true)"
-    [ "$CURRENT" != "$LAST" ] || return 0
+
+    # The hash means "nothing changed since the last ingest" — which is only
+    # a reason to skip if that ingest's OUTPUT is still there. Deleting a db
+    # is the documented recovery path (the cache is rebuildable by
+    # definition), and trusting the hash alone made that silently do nothing
+    # until the repo happened to change: the db stayed missing and every
+    # recall against it failed. Require both.
+    if [ "$CURRENT" = "$LAST" ] && [ -s "$DB_PATH" ]; then
+        return 0
+    fi
+    if [ ! -s "$DB_PATH" ] && [ -n "$LAST" ]; then
+        logger -t code-index "rebuilding ${NAME}: ${DB_PATH} is missing or empty despite an up-to-date hash"
+    fi
+
+    # A -wal/-shm with no db is orphaned by definition: a WAL is meaningless
+    # without the database it journals, and leaving one beside a fresh db of
+    # the same name invites sqlite to recover state that is not its own.
+    # Scoped deliberately to the db-absent case — never touch sidecars that
+    # still have their database, which may belong to a live writer.
+    if [ ! -f "$DB_PATH" ]; then
+        for _sidecar in "${DB_PATH}-wal" "${DB_PATH}-shm"; do
+            if [ -e "$_sidecar" ]; then
+                logger -t code-index "removing orphaned $(basename "$_sidecar") (no ${NAME} db)"
+                rm -f "$_sidecar"
+            fi
+        done
+    fi
 
     LOGTMP="$(mktemp -t code-index-ingest)"
 

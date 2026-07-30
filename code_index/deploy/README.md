@@ -27,19 +27,16 @@ install -m 0755 code-index-mcp-serve ~/.local/bin/code-index-mcp-serve
 install -m 0755 reindex-if-changed reindex-after-push ~/.local/bin/
 sudo sysrc code_index_mcp_enable="YES"
 sudo sysrc code_index_mcp_listen="10.1.1.172:7622"   # match the MCP client config URL
-sudo sysrc code_index_mcp_db="/home/tcovert/.cache/code_index/mu.db"  # serve from the cache family
 sudo service code_index_mcp start
 ```
 
-Reindex cron (one line per repo; `reindex-if-changed` no-ops unless the repo's
-main moved since the last successful ingest):
+The default served db needs no `sysrc`: it derives from the run-user's home as
+`<home>/.cache/code_index/mu.db`. Set `code_index_mcp_db` only to override that.
 
-```crontab
-*/15 * * * * /home/tcovert/.local/bin/reindex-if-changed /home/tcovert/src/public_github/mu >/dev/null 2>&1
-```
-
-`reindex-after-push` is the manual one-shot form of the same ingest (first
-index of a new repo, or force-refresh outside the cron cadence).
+For the reindex cron see [What is served](#what-is-served-code_indexsources)
+below — ONE line covers every configured source. `reindex-after-push` is the
+manual one-shot form of the same ingest (first index of a new repo, or a
+force-refresh outside the cron cadence).
 
 `rc.conf` knobs (all `code_index_mcp_`-prefixed): `enable`, `listen`, `user`
 (default `tcovert` — a script default is sufficient; rc.subr picks it up),
@@ -108,6 +105,14 @@ manual runs.
   as a bare NAME and joined under the cache dir, producing
   `<cache_dir>/~/.cache/code_index/mu.db.db` — and create-on-open then made
   that tree. That is where the literal `~` directory in the cache came from.
+- **Deleting a db is enough to force a rebuild.** `reindex-if-changed` skips a
+  source when the VCS head matches its `.<name>.last-hash` marker, but only if
+  the db is still there — a missing or empty output reindexes regardless of the
+  hash, and logs why. Without that check the documented recovery path (delete
+  the db, re-ingest) silently did nothing until the repo next changed. Orphaned
+  `-wal`/`-shm` sidecars are removed when their db is absent, since a WAL with
+  no database invites sqlite to recover state that is not its own; sidecars
+  that still have their db are never touched.
 - Beware: a repo with a per-repo `.code_index/index.db` (what the reindex cron
   refreshes when that dir exists) is NOT what its bare cache name resolves to
   — pass the absolute per-repo path for fresh data.
