@@ -1088,10 +1088,15 @@ fn main() -> Result<()> {
                 println!("cache dir: {}", sources.cache_dir().display());
                 for s in sources.entries() {
                     println!(
-                        "{:<20} {:<8} {}",
+                        "{:<20} {:<8} {}{}",
                         s.name,
                         if s.repo { "repo" } else { "content" },
-                        s.path.display()
+                        s.path.display(),
+                        if s.resolved {
+                            ""
+                        } else {
+                            "   [not on this machine - another vantage indexes it]"
+                        },
                     );
                 }
             }

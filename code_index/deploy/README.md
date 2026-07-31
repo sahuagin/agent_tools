@@ -105,6 +105,14 @@ manual runs.
   as a bare NAME and joined under the cache dir, producing
   `<cache_dir>/~/.cache/code_index/mu.db.db` — and create-on-open then made
   that tree. That is where the literal `~` directory in the cache came from.
+- **A source can list candidate paths.** `path` accepts a string or a list;
+  the first entry that exists on the machine running the ingest wins. One repo
+  does not live at one path across a fleet — a host path like
+  `/jails/<jail>/...` is invisible from inside that jail, and the jail's own
+  path is not the host's — so a single absolute path silently skips the source
+  on every other vantage. Unresolved sources are still listed (marked
+  `[not on this machine]`) rather than disappearing, and the cron logs which
+  ones it skipped and why.
 - **Deleting a db is enough to force a rebuild.** `reindex-if-changed` skips a
   source when the VCS head matches its `.<name>.last-hash` marker, but only if
   the db is still there — a missing or empty output reindexes regardless of the
