@@ -30,5 +30,23 @@ build+deploy from their own packages/repos; checking them in is wrong.
   *consumers* of sprint-start/end: load it by sourcing from `~/.bashrc` (interactive
   bash) or by giving a consumer script a `#!/usr/bin/env bash` shebang and
   `. ~/.bashrc` near the top.
+- **hooks/dialogue-rewake.sh** — Claude Code `Stop` hook (asyncRewake). Long-polls
+  the mu-dialogue mailbox while a session is idle and wakes the model when a peer
+  writes. Deploys to `~/.claude/hooks/dialogue-rewake.sh` rather than `~/.local/bin`
+  (it is a hook, not a PATH tool), and is wired up in `~/.claude/settings.json`
+  under `hooks.Stop`.
+
+  It declines to arm when `CLAUDE_CODE_ENTRYPOINT` starts with `sdk-`, which is
+  what `claude -p` and the SDKs report. A one-shot run exits when its turn ends,
+  so an idle watch armed for it has nobody to wake and the caller waits on it —
+  that was the nested-claude hang, and it cost up to the 30-minute cap. The check
+  is a deny-list on purpose: an unrecognised or unset entrypoint still arms,
+  because a wasted background poll is cheaper than silently disabling inter-agent
+  messaging for a real user.
+
+  `DIALOGUE_REWAKE_FORCE=1` arms regardless of entrypoint, and
+  `DIALOGUE_REWAKE_DEBUG=<file>` records the arm/skip decision. Both exist for
+  testing this specific behaviour.
+
 - **jj-orphan-audit** — categorize jj loose heads vs a base revision; a recovery
   aid referenced by the `jj-runbook` skill.
