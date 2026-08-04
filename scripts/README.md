@@ -9,6 +9,13 @@ points the on-PATH name at the versioned source.
 (`sparklines`), built binaries (`beads`, `beadsd`, `bw`), etc. Those install or
 build+deploy from their own packages/repos; checking them in is wrong.
 
+**`hooks/` deploys to `~/.claude/hooks/`,** not `~/.local/bin` — these are Claude
+Code hooks, wired by absolute path in `~/.claude/settings.json`. Symlink them
+*relatively* (`../../src/public_github/agent_tools/scripts/hooks/<hook>`).
+`~/.claude` is itself a repo (`dotclaude`) checked out under more than one home,
+and that relative path resolves in each of them; an absolute target would dangle
+in every home but the one it was written for (at-cj2).
+
 ## Tools
 
 - **sprint-start** — claim a bead + enter a unique per-bead jj workspace,
@@ -48,5 +55,14 @@ build+deploy from their own packages/repos; checking them in is wrong.
   `DIALOGUE_REWAKE_DEBUG=<file>` records the arm/skip decision. Both exist for
   testing this specific behaviour.
 
+- **hooks/dialogue-session-start.sh** — `SessionStart` half of the same dialogue
+  mechanism: registers the session as a peer and seeds the rewake watermark to
+  session-start time. Its watermark path and epoch-ms form must match
+  `dialogue-rewake.sh` exactly, which is why the two are vendored together.
+- **hooks/jj-colocated-git-nudge.sh** — `PreToolUse(Bash)` guard: denies mutating
+  raw `git` in a jj repo, and raw `jj git push` to a github remote, steering to
+  `sprint-start` / `bot-jj` — both of which live here.
+- **hooks/kx-recall.sh** — `UserPromptSubmit` hook; runs a semantic `agent memory`
+  recall on the prompt and injects only above-threshold hits.
 - **jj-orphan-audit** — categorize jj loose heads vs a base revision; a recovery
   aid referenced by the `jj-runbook` skill.
