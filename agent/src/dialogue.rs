@@ -86,6 +86,10 @@ struct Say {
     /// Optional thread id to group a multi-turn conversation.
     #[arg(long)]
     thread: Option<String>,
+    /// One-line summary shown in the receiver's wake. Write it so the receiver
+    /// can decide whether to read the body without opening it.
+    #[arg(long)]
+    subject: Option<String>,
     #[arg(long)]
     url: Option<String>,
 }
@@ -197,6 +201,9 @@ pub fn run(cmd: DialogueCmd) -> Result<()> {
             let mut args = json!({"from": s.from, "to": s.to, "content": s.content});
             if let Some(t) = &s.thread {
                 args["session_thread"] = json!(t);
+            }
+            if let Some(subj) = &s.subject {
+                args["subject"] = json!(subj);
             }
             let text = mcp::call_tool(&endpoint(&s.url), "dialogue_say", args, None)?;
             println!("{text}");
