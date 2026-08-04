@@ -93,12 +93,21 @@ JJ_ROOT=$(jj root 2>/dev/null) || {
     echo "bot-jj: not inside a jj repository" >&2
     exit 1
 }
-SIDECAR="$JJ_ROOT/.jj/repo/.bot-jj.restore"
+# .jj/repo is a directory in a primary checkout, but in a secondary workspace it
+# is a file naming the real repo dir relative to .jj/. The sidecar belongs in the
+# shared repo dir either way — it guards `jj config set --repo`, which is
+# repo-scoped, not per-workspace.
+JJ_REPO="$JJ_ROOT/.jj/repo"
+[ -f "$JJ_REPO" ] && JJ_REPO="$JJ_ROOT/.jj/$(cat "$JJ_REPO")"
+SIDECAR="$JJ_REPO/.bot-jj.restore"
 
 # --- preflight for git push (run BEFORE mutating jj config; if this fails
 #     we exit cleanly without ever touching repo identity) ---
 if is_push "$sub" "${2:-}"; then
-    ORIGIN=$(git -C "$JJ_ROOT" config --get remote.origin.url 2>/dev/null || true)
+    # Ask jj, not git: a secondary workspace has no colocated .git, so
+    # `git -C "$JJ_ROOT" config` there returns nothing and the preflight
+    # aborted a push that was otherwise fine.
+    ORIGIN=$(jj git remote list 2>/dev/null | awk '$1 == "origin" { print $2; exit }')
     if [ -z "$ORIGIN" ]; then
         echo "bot-jj: cannot determine origin URL for preflight" >&2
         exit 1
