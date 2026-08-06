@@ -6,6 +6,11 @@
 # is exactly the failure this whole effort exists to prevent), so it requires
 # --close. Refuses while the workspace has uncommitted changes unless --force.
 #
+# Finishing work? Use `sprint-end --close`. Do NOT close the bead separately and
+# then run bare sprint-end: unclaim sets status -> open, so that used to reopen
+# what you just closed (at-bes). An already-closed bead is now left alone, but
+# --close remains the one-step way to say "this is done".
+#
 # Usage:
 #   sprint-end                 release the bead for the CURRENT workspace
 #   sprint-end <bead-id>       release a specific bead's workspace
@@ -21,6 +26,14 @@ set -eu
 . "$HOME/.local/lib/sprint-lib.sh"
 
 die() { printf 'sprint-end: %s\n' "$1" >&2; exit 1; }
+
+# _bead_field <json> <field> — pull one field out of a beads/br record, which
+# may be a bare object or a single-element list. Empty on anything unexpected.
+_bead_field() {
+    printf '%s' "$1" | python3 -c \
+        "import json,sys;i=json.load(sys.stdin);i=i if isinstance(i,dict) else i[0];print(i.get('$2') or '')" \
+        2>/dev/null || true
+}
 
 BEAD=""; MODE="unclaim"; KEEP=0; FORCE=0; KEEPNAME=0
 while [ $# -gt 0 ]; do
@@ -87,34 +100,48 @@ if [ -n "$BEAD" ]; then
     ENDPOINT=$(beads_endpoint "$REPO" 2>/dev/null) || ENDPOINT=""
     if [ -n "$ENDPOINT" ]; then
         # Centralized: release through the beadsd service.
-        held=$(beads --url "$ENDPOINT" show "$BEAD" 2>/dev/null | \
-            python3 -c "import json,sys;i=json.load(sys.stdin);i=i if isinstance(i,dict) else i[0];print(i.get('assignee') or '')" 2>/dev/null || true)
+        _rec=$(beads --url "$ENDPOINT" show "$BEAD" 2>/dev/null || true)
+        held=$(_bead_field "$_rec" assignee)
+        state=$(_bead_field "$_rec" status)
         if [ -n "$held" ] && [ "$held" != "$ACTOR" ]; then
             die "bead $BEAD is held by '$held', not this session — refusing to release it"
         fi
         if [ "$MODE" = "close" ]; then
             beads --url "$ENDPOINT" close "$BEAD" --reason "sprint-end" --actor "$ACTOR" >/dev/null 2>&1 \
                 && printf 'sprint-end: closed %s\n' "$BEAD"
+        elif [ "$state" = "closed" ]; then
+            # at-bes: unclaim sets status -> open, so unclaiming an already
+            # closed bead RESURRECTS it. Tearing a workspace down must never
+            # undo a close someone did deliberately.
+            printf 'sprint-end: %s is already closed — left closed\n' "$BEAD"
         else
             beads --url "$ENDPOINT" unclaim "$BEAD" --actor "$ACTOR" >/dev/null 2>&1 \
                 && printf 'sprint-end: unclaimed %s (back to open)\n' "$BEAD"
         fi
+        _after=$(_bead_field "$(beads --url "$ENDPOINT" show "$BEAD" 2>/dev/null || true)" status)
+        printf 'sprint-end: %s is now %s\n' "$BEAD" "${_after:-unknown}"
     elif [ -f "$ROOT/.beads/beads.db" ]; then
         # Local-DB path (repo not centralized into beadsd) — mirrors the
         # sprint-start local claim branch; restored with at-0up.
         DB="$ROOT/.beads/beads.db"
-        held=$(br show "$BEAD" --db "$DB" --json 2>/dev/null | \
-            python3 -c "import json,sys;i=json.load(sys.stdin);i=i if isinstance(i,dict) else i[0];print(i.get('assignee') or '')" 2>/dev/null || true)
+        _rec=$(br show "$BEAD" --db "$DB" --json 2>/dev/null || true)
+        held=$(_bead_field "$_rec" assignee)
+        state=$(_bead_field "$_rec" status)
         if [ -n "$held" ] && [ "$held" != "$ACTOR" ]; then
             die "bead $BEAD is held by '$held', not this session — refusing to release it"
         fi
         if [ "$MODE" = "close" ]; then
             br close "$BEAD" --db "$DB" --session "${CLAUDE_CODE_SESSION_ID:-}" >/dev/null 2>&1 \
                 && printf 'sprint-end: closed %s\n' "$BEAD"
+        elif [ "$state" = "closed" ]; then
+            # at-bes: see the centralized branch above.
+            printf 'sprint-end: %s is already closed — left closed\n' "$BEAD"
         else
             br update "$BEAD" --assignee "" -s open --db "$DB" >/dev/null 2>&1 \
                 && printf 'sprint-end: unclaimed %s (back to open)\n' "$BEAD"
         fi
+        _after=$(_bead_field "$(br show "$BEAD" --db "$DB" --json 2>/dev/null || true)" status)
+        printf 'sprint-end: %s is now %s\n' "$BEAD" "${_after:-unknown}"
     fi
 fi
 

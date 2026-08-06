@@ -15,6 +15,11 @@
 #                                     identity + use it as the beads claim actor
 #
 # Run it from anywhere inside the target repo. It prints the `cd` to run.
+#
+# FINISHING: `sprint-end --close` releases the bead AND closes it, in one step.
+# Bare `sprint-end` unclaims instead (status -> open), which is what you want
+# when parking unfinished work — not when the work landed. Tear down from the
+# repo root, not from inside the workspace.
 set -eu
 . "$HOME/.local/lib/sprint-lib.sh"
 
