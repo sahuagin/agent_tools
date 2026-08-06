@@ -1,0 +1,183 @@
+#!/bin/sh
+# deploy-local — bring THIS host's deployed tooling up to trunk, and say what
+# it actually did (at-g0s).
+#
+# The problem it solves: merged is not deployed, and the three artifact classes
+# here fail differently and silently.
+#
+#   scripts   ~/.local/bin/<x> -> <repo>/scripts/<x>     the WORKING COPY, so a
+#             checkout parked on an old change serves old content forever.
+#   binaries  ~/.local/bin/agent -> <repo>/target/release/agent
+#             advancing the checkout does nothing; it needs a build.
+#   emu tools ~/.local/bin/mu, t4c, ... -> <repo>/.mu/emu
+#             self-building on invoke, so the checkout IS the deploy.
+#   services  a running process. Even a fresh binary changes nothing until it
+#             restarts — which is NOT done here, see below.
+#
+# Usage:
+#   deploy-local                 advance every discovered repo, build, report
+#   deploy-local --status        report only: what is this host running?
+#   deploy-local --dry-run       say what would happen, change nothing
+#   deploy-local <repo>...       limit to named repos (agent_tools, mu, ...)
+#
+# SERVICES ARE NEVER RESTARTED HERE. mu-dialogue serves every cc session's wake;
+# bouncing it is an operator decision, not a side effect of deploying. Staleness
+# is reported so the decision is informed.
+#
+# Safe to re-run. Refuses to advance a checkout whose working copy has content —
+# that is someone's work in progress, not a deploy target. Also safe to run from
+# a checkout it is about to advance (the obvious way to use it after checking
+# out a branch): it re-execs from a copy first.
+set -eu
+
+BIN="${HOME}/.local/bin"
+SRC_ROOT="${DEPLOY_SRC_ROOT:-${HOME}/src/public_github}"
+STAMP_DIR="${HOME}/.local/share/agent-deploy"
+
+# This script usually LIVES in a repo it is about to advance — and advancing a
+# checkout rewrites the working copy, swapping this file out from under the
+# shell while it is still being read. Run from a copy instead. (Checking out a
+# branch that carries deploy-local and running it in place is the obvious way
+# to use this, so it has to survive that.)
+_self=$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")
+case "$_self" in
+    "$SRC_ROOT"/*)
+        if [ -z "${DEPLOY_LOCAL_DETACHED:-}" ]; then
+            _copy=$(mktemp "${TMPDIR:-/tmp}/deploy-local.XXXXXX") || exit 1
+            cat "$_self" > "$_copy" && chmod +x "$_copy" || exit 1
+            DEPLOY_LOCAL_DETACHED=1; export DEPLOY_LOCAL_DETACHED
+            "$_copy" "$@"; _rc=$?
+            rm -f "$_copy"
+            exit $_rc
+        fi
+        ;;
+esac
+
+MODE="deploy"
+WANT=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --status)  MODE="status" ;;
+        --dry-run) MODE="dry" ;;
+        -h|--help) sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -*) printf 'deploy-local: unknown option %s\n' "$1" >&2; exit 2 ;;
+        *)  WANT="$WANT $1" ;;
+    esac
+    shift
+done
+
+say() { printf '%s\n' "$*"; }
+
+# Every repo under SRC_ROOT that something in ~/.local/bin points into, and the
+# binaries it is expected to have built. Derived from the symlinks themselves so
+# adding a tool needs no edit here.
+discover() {
+    for f in "$BIN"/*; do
+        [ -L "$f" ] || continue
+        t=$(readlink -f "$f" 2>/dev/null) || continue
+        case "$t" in "$SRC_ROOT"/*) ;; *) continue ;; esac
+        rest=${t#"$SRC_ROOT"/}
+        repo=${rest%%/*}
+        path=${rest#*/}
+        # An emu-backed tool builds itself on invoke; nothing to do but keep the
+        # checkout current.
+        case "$path" in
+            .mu/emu) printf '%s\temu\t%s\n' "$repo" "$(basename "$f")" ;;
+            target/release/*) printf '%s\tbin\t%s\n' "$repo" "${path##*/}" ;;
+            *) printf '%s\tscript\t%s\n' "$repo" "$(basename "$f")" ;;
+        esac
+    done | sort -u
+}
+
+repos() { discover | cut -f1 | sort -u; }
+binaries_of() { discover | awk -F'\t' -v r="$1" '$1==r && $2=="bin" {print $3}' | sort -u; }
+counts_of() { discover | awk -F'\t' -v r="$1" '$1==r {c[$2]++} END {
+    printf "%d script, %d binary, %d emu", c["script"], c["bin"], c["emu"] }'; }
+
+wanted() {
+    [ -n "$WANT" ] || return 0
+    for w in $WANT; do [ "$w" = "$1" ] && return 0; done
+    return 1
+}
+
+# Short revision + subject of a revset, or empty if the repo is unreadable.
+rev_of() { ( cd "$1" 2>/dev/null && jj log -r "$2" --no-graph \
+    -T 'change_id.short() ++ " " ++ description.first_line()' 2>/dev/null ) || true; }
+
+# Does the working copy carry content someone would be upset to lose?
+wc_dirty() { [ "$( ( cd "$1" && jj diff --stat 2>/dev/null ) | wc -l )" -gt 1 ]; }
+
+stamp_read() { [ -f "$STAMP_DIR/$1" ] && cat "$STAMP_DIR/$1" || printf 'never deployed by this tool\n'; }
+
+status_one() {
+    repo=$1; dir="$SRC_ROOT/$repo"
+    say "  $repo  ($(counts_of "$repo"))"
+    say "    checkout : $(rev_of "$dir" '@-' | sed 's/^/ /' | cut -c1-72)"
+    say "    trunk    : $(rev_of "$dir" 'main' | sed 's/^/ /' | cut -c1-72)"
+    if [ "$(rev_of "$dir" '@-')" = "$(rev_of "$dir" 'main')" ]; then
+        say "    state    : up to date"
+    else
+        say "    state    : STALE — scripts and emu tools here serve old content"
+    fi
+    say "    last run : $(stamp_read "$repo")"
+}
+
+deploy_one() {
+    repo=$1; dir="$SRC_ROOT/$repo"
+    [ -d "$dir" ] || { say "  $repo: no checkout at $dir — skipped"; return 0; }
+    say "  $repo"
+
+    ( cd "$dir" && jj git fetch >/dev/null 2>&1 ) || say "    fetch: failed (offline?), using what is local"
+
+    before=$(rev_of "$dir" '@-')
+    trunk=$(rev_of "$dir" 'main')
+    if [ "$before" = "$trunk" ]; then
+        say "    checkout: already at trunk"
+    elif wc_dirty "$dir"; then
+        say "    checkout: REFUSED — working copy has changes (someone's work in progress)"
+        say "              leave it, or land that work first"
+        return 0
+    elif [ "$MODE" = "dry" ]; then
+        say "    checkout: would advance to $trunk"
+    else
+        ( cd "$dir" && jj new main >/dev/null 2>&1 )
+        say "    checkout: advanced to $trunk"
+    fi
+
+    for b in $(binaries_of "$repo"); do
+        if [ "$MODE" = "dry" ]; then
+            say "    build:    would build $b (plain symlink — no auto-build wrapper)"
+            continue
+        fi
+        if ( cd "$dir" && cargo build --release --bin "$b" 2>&1 | tail -1 | grep -q .); then
+            say "    build:    $b rebuilt"
+        else
+            say "    build:    $b FAILED — the old binary is still in place"
+        fi
+    done
+
+    if [ "$MODE" != "dry" ]; then
+        mkdir -p "$STAMP_DIR"
+        printf '%s  %s\n' "$(date -u +%Y-%m-%dT%H:%MZ)" "$trunk" > "$STAMP_DIR/$repo"
+    fi
+}
+
+say "deploy-local: $(hostname) — src $SRC_ROOT"
+say ""
+for r in $(repos); do
+    wanted "$r" || continue
+    case "$MODE" in
+        status) status_one "$r" ;;
+        *)      deploy_one "$r" ;;
+    esac
+    say ""
+done
+
+# Services: report, never touch.
+if pgrep -f 'mu-dialogue' >/dev/null 2>&1; then
+    say "services:"
+    say "  mu-dialogue is RUNNING. A rebuilt binary does not reach it until restart,"
+    say "  and it serves every cc session's wake — restart deliberately, not as"
+    say "  part of a deploy. Check what it is actually serving with:"
+    say "      agent dialogue peers | head -c 200"
+fi
