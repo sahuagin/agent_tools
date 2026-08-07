@@ -28,9 +28,9 @@
 # is reported so the decision is informed.
 #
 # Build parameters MATTER: cargo rebuilds from scratch whenever the invocation
-# changes, so a by-hand `--all-targets` build and this script's `--bin` build
-# will thrash each other. This prints the exact command it runs — match it, or
-# just use this script.
+# changes, so two different build commands thrash each other. This runs the
+# repo's own `just build` where there is one, so the flags live in ONE place
+# per repo, and prints whatever it ran.
 #
 # Safe to re-run. Refuses to advance a checkout whose working copy has content —
 # that is someone's work in progress, not a deploy target. Also safe to run from
@@ -152,22 +152,32 @@ deploy_one() {
         say "    checkout: advanced to $trunk"
     fi
 
-    # ONE cargo invocation for every binary in the repo, not one per binary.
-    # Cargo fingerprints the invocation, so differing ones rebuild the world
-    # each time they alternate — `--all-targets` especially, because it pulls
-    # dev-dependencies in and unifies features differently. The exact command is
-    # printed so a by-hand build can match it and stay warm.
+    # Prefer the repo's OWN build recipe. `just build` is the release build in
+    # both mu and agent_tools, and it carries repo-specific knowledge this
+    # script should not copy — agent_tools' clears RUSTC_WRAPPER and depends on
+    # a _tmpdir recipe. Duplicating flags here is what caused the rebuild
+    # thrash in the first place: two commands, two cargo fingerprints, a full
+    # rebuild every time they alternate.
+    #
+    # The cargo fallback is for repos with no justfile (beadsd today). It builds
+    # every discovered binary in ONE invocation for the same fingerprint reason.
     bins=""
     for b in $(binaries_of "$repo"); do
         bins="$bins --bin $b"
     done
-    if [ -n "$bins" ]; then
+    if [ -f "$dir/justfile" ] && ( cd "$dir" && just --show build >/dev/null 2>&1 ); then
+        cmd="just build"
+    elif [ -n "$bins" ]; then
         cmd="cargo build --release$bins"
+    else
+        cmd=""
+    fi
+    if [ -n "$cmd" ]; then
         if [ "$MODE" = "dry" ]; then
             say "    build:    would run $cmd"
         else
             say "    build:    $cmd"
-            if ( cd "$dir" && cargo build --release $bins >/dev/null 2>&1 ); then
+            if ( cd "$dir" && eval "$cmd" >/dev/null 2>&1 ); then
                 say "              ok"
             else
                 say "              FAILED — the old binaries are still in place"
