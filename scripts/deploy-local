@@ -10,7 +10,10 @@
 #   binaries  ~/.local/bin/agent -> <repo>/target/release/agent
 #             advancing the checkout does nothing; it needs a build.
 #   emu tools ~/.local/bin/mu, t4c, ... -> <repo>/.mu/emu
-#             self-building on invoke, so the checkout IS the deploy.
+#             emu execs a PREBUILT binary. Its header still claims it
+#             auto-builds; that was disabled 2026-07-10 because the shared
+#             checkout carries concurrent WIP and build-on-launch could compile
+#             an unintended tree. So these need a deliberate build too (at-dk1).
 #   services  a running process. Even a fresh binary changes nothing until it
 #             restarts — which is NOT done here, see below.
 #
@@ -79,10 +82,10 @@ discover() {
         rest=${t#"$SRC_ROOT"/}
         repo=${rest%%/*}
         path=${rest#*/}
-        # An emu-backed tool builds itself on invoke; nothing to do but keep the
-        # checkout current.
+        # An emu tool execs a prebuilt binary, so it needs building like any
+        # other — the symlink name IS its --bin name (at-dk1).
         case "$path" in
-            .mu/emu) printf '%s\temu\t%s\n' "$repo" "$(basename "$f")" ;;
+            .mu/emu) printf '%s\tbin\t%s\n' "$repo" "$(basename "$f")" ;;
             target/release/*) printf '%s\tbin\t%s\n' "$repo" "${path##*/}" ;;
             *) printf '%s\tscript\t%s\n' "$repo" "$(basename "$f")" ;;
         esac
@@ -92,7 +95,7 @@ discover() {
 repos() { discover | cut -f1 | sort -u; }
 binaries_of() { discover | awk -F'\t' -v r="$1" '$1==r && $2=="bin" {print $3}' | sort -u; }
 counts_of() { discover | awk -F'\t' -v r="$1" '$1==r {c[$2]++} END {
-    printf "%d script, %d binary, %d emu", c["script"], c["bin"], c["emu"] }'; }
+    printf "%d script, %d binary", c["script"], c["bin"] }'; }
 
 wanted() {
     [ -n "$WANT" ] || return 0
@@ -146,7 +149,7 @@ deploy_one() {
 
     for b in $(binaries_of "$repo"); do
         if [ "$MODE" = "dry" ]; then
-            say "    build:    would build $b (plain symlink — no auto-build wrapper)"
+            say "    build:    would build $b"
             continue
         fi
         if ( cd "$dir" && cargo build --release --bin "$b" 2>&1 | tail -1 | grep -q .); then
