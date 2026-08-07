@@ -27,6 +27,11 @@
 # bouncing it is an operator decision, not a side effect of deploying. Staleness
 # is reported so the decision is informed.
 #
+# Build parameters MATTER: cargo rebuilds from scratch whenever the invocation
+# changes, so a by-hand `--all-targets` build and this script's `--bin` build
+# will thrash each other. This prints the exact command it runs — match it, or
+# just use this script.
+#
 # Safe to re-run. Refuses to advance a checkout whose working copy has content —
 # that is someone's work in progress, not a deploy target. Also safe to run from
 # a checkout it is about to advance (the obvious way to use it after checking
@@ -147,17 +152,29 @@ deploy_one() {
         say "    checkout: advanced to $trunk"
     fi
 
+    # ONE cargo invocation for every binary in the repo, not one per binary.
+    # Cargo fingerprints the invocation, so differing ones rebuild the world
+    # each time they alternate — `--all-targets` especially, because it pulls
+    # dev-dependencies in and unifies features differently. The exact command is
+    # printed so a by-hand build can match it and stay warm.
+    bins=""
     for b in $(binaries_of "$repo"); do
-        if [ "$MODE" = "dry" ]; then
-            say "    build:    would build $b"
-            continue
-        fi
-        if ( cd "$dir" && cargo build --release --bin "$b" 2>&1 | tail -1 | grep -q .); then
-            say "    build:    $b rebuilt"
-        else
-            say "    build:    $b FAILED — the old binary is still in place"
-        fi
+        bins="$bins --bin $b"
     done
+    if [ -n "$bins" ]; then
+        cmd="cargo build --release$bins"
+        if [ "$MODE" = "dry" ]; then
+            say "    build:    would run $cmd"
+        else
+            say "    build:    $cmd"
+            if ( cd "$dir" && cargo build --release $bins >/dev/null 2>&1 ); then
+                say "              ok"
+            else
+                say "              FAILED — the old binaries are still in place"
+                say "              rerun by hand to see why: (cd $dir && $cmd)"
+            fi
+        fi
+    fi
 
     if [ "$MODE" != "dry" ]; then
         mkdir -p "$STAMP_DIR"
