@@ -21,6 +21,12 @@ in every home but the one it was written for (at-cj2).
 - **sprint-start** — claim a bead + enter a unique per-bead jj workspace,
   atomically (correct-by-construction isolation: atomic beads claim + a sibling jj
   workspace, so two sessions can't collide). Pairs with `sprint-end`.
+- **deploy-local** — bring THIS host's deployed tooling up to trunk and report
+  what it did (at-g0s). Merged is not deployed: scripts symlink to a working
+  copy, plain binaries need a build, `emu` tools self-build from their checkout,
+  and services need a restart. `--status` answers "what is this host running?";
+  `--dry-run` shows the plan. Refuses to advance a checkout with work in it, and
+  never restarts a service.
 - **sprint-end** — release a sprint's bead and tear down its jj workspace
   (`--close` closes the bead instead of unclaiming; refuses while the workspace is
   dirty unless `--force`). Run bare from *inside* a workspace it refuses with a
