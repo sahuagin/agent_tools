@@ -25,6 +25,8 @@ import sys, os, json, re, subprocess
 
 GIT_INVOCATION = re.compile(r'(?:^|[;&|()\n])\s*git(?=\s|$)')
 RAW_JJ_PUSH = re.compile(r'(?:^|[;&|()\n])\s*jj\s+git\s+push\b')  # raw; not `bot-jj git push`
+# Raw `gh pr create|merge` — not `bot-gh` (its 'gh' follows '-', no separator).
+RAW_GH_PR = re.compile(r'(?:^|[;&|()\n])\s*gh\s+pr\s+(create|merge)\b')
 
 GIT_ONLY = {"worktree", "push", "am", "apply", "filter-repo", "filter-branch"}
 MUTATING_JJ = {
@@ -50,6 +52,41 @@ DENY_PUSH = ("BLOCKED: raw `jj git push`. Push via `bot-jj git push` (the sancti
              "`JJ_PUSH_NO_APP=1 jj git push ...` (operator-approved 2026-07-13). A "
              "general pre-push leak gate (`jj-hp push`, design: bead mu-8puo.2) was "
              "planned but never built — do not go looking for it.")
+DENY_GH_PR = ("BLOCKED: raw `gh pr {sub}` on a sahuagin/* repo. Author PRs via "
+              "`bot-gh pr create` (the App identity, so the operator can APPROVE instead "
+              "of admin-overriding his own PR), and NEVER self-merge — merging is the "
+              "operator's. Scar: mu #531/#532/#537 were opened raw despite three feedback "
+              "memories, forcing force-merges. Repos OUTSIDE sahuagin/* (work repos, no "
+              "App) are not guarded — raw gh is the sanctioned path there. Override if "
+              "truly needed: `GH_PR_NO_APP=1 gh pr {sub} ...`.")
+
+
+SAHUAGIN_TARGET = re.compile(r'(?:^|\s)-R\s+sahuagin/|github\.com[:/]sahuagin/')
+
+
+def gh_targets_sahuagin(cmd, dirs):
+    """Confirm-only: True when -R names sahuagin/* or a candidate dir's github
+    remote is sahuagin/*. Fail-open (False) otherwise — work repos without the
+    App must keep raw gh."""
+    if SAHUAGIN_TARGET.search(cmd):
+        return True
+    if re.search(r'(?:^|\s)-R\s+\S', cmd):
+        return False  # explicit non-sahuagin target
+    for d in dirs:
+        r = find_root(d)
+        if not r:
+            continue
+        try:
+            if os.path.exists(os.path.join(r, ".git")):
+                c = ["git", "-C", r, "config", "--get-regexp", r"^remote\..*\.url$"]
+            else:
+                c = ["jj", "git", "remote", "list"]
+            out = subprocess.run(c, cwd=r, timeout=3, capture_output=True, text=True).stdout
+            if re.search(r'github\.com[:/]sahuagin/', out):
+                return True
+        except Exception:
+            pass
+    return False
 
 
 def allow_silently():
@@ -154,6 +191,15 @@ def main():
     cwd = data.get("cwd") or os.getcwd()
     scan = strip_literals(cmd)
     dirs = candidate_dirs(scan, cwd)
+
+    # 0) Raw `gh pr create|merge` -> steer to bot-gh (App authorship so the
+    #    operator can approve; self-merge is never the agent's). Same designed
+    #    escape shape as the push guard: GH_PR_NO_APP=1 acknowledges a repo
+    #    the App is not installed on.
+    if "GH_PR_NO_APP=1" not in cmd:
+        m = RAW_GH_PR.search(scan)
+        if m and gh_targets_sahuagin(cmd, dirs):
+            emit_deny(DENY_GH_PR.replace("{sub}", m.group(1)))
 
     # 1) Raw `jj git push` to a github remote -> steer to `bot-jj git push`.
     #    Non-github remotes: bot-jj can't serve them; raw push is the path.
