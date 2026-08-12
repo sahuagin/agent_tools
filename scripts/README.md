@@ -70,5 +70,9 @@ in every home but the one it was written for (at-cj2).
   `sprint-start` / `bot-jj` — both of which live here.
 - **hooks/kx-recall.sh** — `UserPromptSubmit` hook; runs a semantic `agent memory`
   recall on the prompt and injects only above-threshold hits.
+- **hooks/search-scope-guard.py** — `PreToolUse(Bash|Grep|Glob)` guard: denies
+  recursive find/fd/grep/rg rooted at `/`, `/home`, a bare home dir, or another
+  root-level dir, steering to a scoped path; otherwise injects `find -x` /
+  `fd --one-file-system` (ported from the retired bash-guard V2.1).
 - **jj-orphan-audit** — categorize jj loose heads vs a base revision; a recovery
   aid referenced by the `jj-runbook` skill.
