@@ -17,11 +17,32 @@ use clap::{Parser, Subcommand};
 #[command(
     name = "agent",
     about = "Agent memory, tasks, and metrics store",
+    version = build_version(),
     after_long_help = ROOT_AFTER_LONG_HELP
 )]
 struct Cli {
     #[command(subcommand)]
     command: Command,
+}
+
+/// at-g5u: the version string includes build provenance (change id + build
+/// time) so "is this binary current with source?" is one command. The
+/// deployed `~/.local/bin/agent` is a symlink into the checkout's
+/// `target/release/agent`, so "deployed" silently tracks whatever was last
+/// built there — the provenance makes staleness checkable instead of
+/// guessable.
+fn build_version() -> &'static str {
+    // Baked in by build.rs (AGENT_CHANGE_ID, AGENT_BUILD_TIME, AGENT_DIRTY).
+    // Fallback to the Cargo.toml version if the env vars aren't set
+    // (e.g. a stale binary built before at-g5u).
+    static VERSION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    VERSION.get_or_init(|| {
+        let change_id = std::option_env!("AGENT_CHANGE_ID").unwrap_or("unknown");
+        let build_time = std::option_env!("AGENT_BUILD_TIME").unwrap_or("unknown");
+        let dirty = std::option_env!("AGENT_DIRTY").unwrap_or("unknown");
+        format!("0.1.0 ({change_id}, {build_time}, {dirty})")
+    })
+    .as_str()
 }
 
 #[derive(Subcommand)]
