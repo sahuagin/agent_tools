@@ -2371,10 +2371,15 @@ fn context(conn: &Connection, args: ContextArgs) -> Result<()> {
     let scope = ScopeFilter::for_context(args.scope.as_deref());
 
     // at-0q9: the identity tier short-circuits the four-section wall.
+    // at-6jt: the index tier emits a one-line row per entry (name, description,
+    // id) with full body ONLY for entries tagged `session-start` — the
+    // session-start injection budget. References never inline regardless of
+    // tag. Total output target <4KB.
     match args.tier.as_str() {
         "identity" => return context_identity(conn, &args, &scope),
+        "index" => return context_index(conn, &args, &scope),
         "full" => {}
-        other => bail!("invalid --tier: {other} (expected 'identity' or 'full')"),
+        other => bail!("invalid --tier: {other} (expected 'identity', 'index', or 'full')"),
     }
 
     // feedback and user: always all-active, no scoring needed
@@ -2567,6 +2572,122 @@ fn context_identity(conn: &Connection, args: &ContextArgs, scope: &ScopeFilter) 
             user.len(),
             feedback.len(),
             chars / 4
+        );
+    }
+
+    Ok(())
+}
+
+/// at-6jt: the tag that marks a memory as session-start-pinned. Entries
+/// tagged `session-start` get their full body in the index tier; all
+/// other entries get a one-line row. References never inline regardless
+/// of tag.
+const SESSION_START_TAG: &str = "session-start";
+
+/// True iff `m` carries the [`SESSION_START_TAG`].
+fn has_session_start_tag(m: &Memory) -> bool {
+    m.tags.split(',').any(|t| t.trim() == SESSION_START_TAG)
+}
+
+/// at-6jt: the index tier — a one-line row per active entry (name,
+/// description, id for `agent memory show`), full body ONLY for entries
+/// tagged `session-start`, references NEVER inlined regardless of tag.
+/// Total output target <4KB. This is the session-start injection budget:
+/// the hook switches to `--tier index` so rules past the fold pay one-line
+/// cost and are visible (the cc harness no longer truncates a 62KB wall to
+/// a 2KB preview).
+fn context_index(conn: &Connection, args: &ContextArgs, scope: &ScopeFilter) -> Result<()> {
+    // All active entries by type (no scoring — the index is a flat
+    // enumeration, not a relevance-ranked subset).
+    let feedback = query_by_type(conn, "feedback", 50, scope)?;
+    let user = query_by_type(conn, "user", 20, scope)?;
+    let project = query_by_type(conn, "project", 50, scope)?;
+    let reference = query_by_type(conn, "reference", 50, scope)?;
+
+    let total = feedback.len() + user.len() + project.len() + reference.len();
+    if total == 0 {
+        return Ok(());
+    }
+
+    // Log this call for tuning.
+    let injected: Vec<(String, String, f64)> = feedback
+        .iter()
+        .chain(user.iter())
+        .chain(project.iter())
+        .chain(reference.iter())
+        .map(|m| (m.id.clone(), m.name.clone(), 0.0))
+        .collect();
+    let _ = log_context_call(conn, &args.cwd, &["tier:index".to_string()], 0, &injected);
+
+    println!("## Memory Index\n");
+    println!(
+        "*One line per entry. Full body for `session-start`-tagged entries \
+         (non-reference). `agent memory show <id>` for any full body. \
+         `agent memory recall \"<topic>\"` for semantic search.*\n"
+    );
+
+    // Helper: render one entry. Pinned (session-start tag, non-reference)
+    // gets full body; everything else gets a one-line row.
+    let render = |m: &Memory, is_reference: bool| {
+        if !is_reference && has_session_start_tag(m) {
+            // Pinned: full body.
+            println!("**{}** [{}]: {}", m.name, m.id, m.description);
+            println!("*{}*", memory_trust_label(m));
+            println!("{}\n", m.content);
+        } else {
+            // One-line row: name — description [id].
+            println!("- **{}** [{}]: {}", m.name, m.id, m.description);
+        }
+    };
+
+    if !feedback.is_empty() {
+        println!("### Rules (Feedback)\n");
+        for m in &feedback {
+            render(m, false);
+        }
+        println!();
+    }
+
+    if !user.is_empty() {
+        println!("### User Profile\n");
+        for m in &user {
+            render(m, false);
+        }
+        println!();
+    }
+
+    if !project.is_empty() {
+        println!("### Project\n");
+        for m in &project {
+            render(m, false);
+        }
+        println!();
+    }
+
+    if !reference.is_empty() {
+        // References NEVER inline regardless of tag — one-line row only.
+        println!("### References\n");
+        for m in &reference {
+            render(m, true);
+        }
+        println!();
+    }
+
+    if args.verbose {
+        // Estimate what was actually printed.
+        let pinned: Vec<&Memory> = feedback
+            .iter()
+            .chain(user.iter())
+            .chain(project.iter())
+            .filter(|m| has_session_start_tag(m))
+            .collect();
+        let chars: usize = pinned.iter().map(|m| m.content.len()).sum::<usize>()
+            + (feedback.len() + user.len() + project.len() + reference.len()) * 80; // ~80 chars per one-line row
+        eprintln!(
+            "[context] tier=index: {} entries ({} pinned) ≈ {} bytes (target <4096)",
+            total,
+            pinned.len(),
+            chars
         );
     }
 
@@ -4478,6 +4599,102 @@ mod tests {
         let stats = kernel_injection_stats(&conn).unwrap();
         assert_eq!(stats.get("u1").map(|s| s.0), Some(1));
         assert_eq!(stats.get("fb1").map(|s| s.0), Some(1));
+    }
+
+    // at-6jt: the index tier emits a one-line row per entry, full body ONLY
+    // for session-start-tagged non-reference entries, references never inline.
+    #[test]
+    fn context_index_one_line_rows_and_pinned_full_body() {
+        let conn = crate::db::open_in_memory().unwrap();
+        // Pinned feedback (session-start tag) — gets full body.
+        seed_typed(
+            &conn,
+            "fb-pinned",
+            "feedback",
+            "pinned-rule",
+            "session-start",
+        );
+        // Non-pinned feedback — one-line row only.
+        seed_typed(&conn, "fb-plain", "feedback", "plain-rule", "");
+        // Pinned reference (session-start tag) — still one-line row (references
+        // never inline regardless of tag).
+        seed_typed(
+            &conn,
+            "ref-pinned",
+            "reference",
+            "pinned-ref",
+            "session-start",
+        );
+        // Plain project — one-line row only.
+        seed_typed(&conn, "pr-plain", "project", "plain-project", "");
+
+        let args = ContextArgs {
+            cwd: String::new(),
+            signals: String::new(),
+            limit: 5,
+            verbose: false,
+            scope: None,
+            tier: "index".to_string(),
+        };
+        context_index(&conn, &args, &ScopeFilter::All).unwrap();
+
+        // The tuning log records the index-tier call with all 4 ids.
+        let returned: String = conn
+            .query_row(
+                "SELECT returned FROM memory_context_log WHERE signals LIKE '%tier:index%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            returned.contains("\"fb-pinned\""),
+            "pinned feedback id must be logged"
+        );
+        assert!(
+            returned.contains("\"fb-plain\""),
+            "plain feedback id must be logged"
+        );
+        assert!(
+            returned.contains("\"ref-pinned\""),
+            "pinned reference id must be logged"
+        );
+        assert!(
+            returned.contains("\"pr-plain\""),
+            "plain project id must be logged"
+        );
+    }
+
+    // at-6jt: the session-start tag helper.
+    #[test]
+    fn has_session_start_tag_matches_only_session_start() {
+        let base = |tags: &str| Memory {
+            id: "x".into(),
+            type_: "feedback".into(),
+            name: "x".into(),
+            description: "x".into(),
+            content: "x".into(),
+            source: "curated".into(),
+            tags: tags.into(),
+            cwd: String::new(),
+            is_active: true,
+            lifecycle: "active".into(),
+            created_at: 0,
+            updated_at: 0,
+            verified_at: None,
+            author: "test".into(),
+        };
+        assert!(
+            has_session_start_tag(&base("session-start,tone")),
+            "session-start tag must match"
+        );
+        assert!(
+            !has_session_start_tag(&base("identity,tone")),
+            "identity tag must NOT match session-start"
+        );
+        assert!(
+            !has_session_start_tag(&base("")),
+            "empty tags must NOT match session-start"
+        );
     }
 
     #[test]
