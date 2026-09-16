@@ -94,8 +94,8 @@ if [ -n "$BEAD" ]; then
         # repo's canonical .beads DB (never a workspace-local one). Restored with
         # at-0up: an earlier revision dropped this in favor of die-unless-
         # centralized, but local-beads repos are a supported steady state.
-        DB="$ROOT/.beads/beads.db"
-        [ -f "$DB" ] || die "repo $REPO has no beadsd endpoint and no .beads DB ($DB); centralize it (remotes.env) or use: sprint-start --no-bead <label>"
+        DB=$(canonical_db "$ROOT") || DB="$ROOT/.beads/beads.db"
+        [ -f "$DB" ] || die "repo $REPO has no beadsd endpoint and no beads DB ($DB); centralize it (remotes.env), map it (local.env), or use: sprint-start --no-bead <label>"
         br show "$BEAD" --db "$DB" >/dev/null 2>&1 || die "bead $BEAD not found in canonical DB"
 
         held=$(br show "$BEAD" --db "$DB" --json 2>/dev/null | \
@@ -198,7 +198,7 @@ if [ -n "$BEAD" ]; then
         RECALL_QUERY=$(beads --url "$ENDPOINT" show "$BEAD" 2>/dev/null | \
             python3 -c "import json,sys;i=json.load(sys.stdin);i=i if isinstance(i,dict) else i[0];print(i.get('title') or '')" 2>/dev/null || true)
     else
-        RECALL_QUERY=$(br show "$BEAD" --db "$ROOT/.beads/beads.db" --json 2>/dev/null | \
+        RECALL_QUERY=$(br show "$BEAD" --db "$(canonical_db "$ROOT" 2>/dev/null || printf '%s/.beads/beads.db' "$ROOT")" --json 2>/dev/null | \
             python3 -c "import json,sys;i=json.load(sys.stdin);i=i if isinstance(i,dict) else i[0];print(i.get('title') or '')" 2>/dev/null || true)
     fi
 fi

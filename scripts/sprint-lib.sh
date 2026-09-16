@@ -32,10 +32,18 @@ backing_root() {
 }
 
 # canonical_db [start-dir] -> path to the backing repo's canonical beads DB.
+# A local.env override (beads_local_dir below) wins over the in-repo location:
+# for repos whose tracker moved out of the repo, the canonical DB is the
+# external one and the in-repo path is at best a stale copy.
 canonical_db() {
     r=$(backing_root "$1") || return 1
     [ -n "$r" ] || return 1
-    printf '%s/.beads/beads.db\n' "$r"
+    ld=$(beads_local_dir "$(basename "$r")")
+    if [ -n "$ld" ]; then
+        printf '%s/beads.db\n' "$ld"
+    else
+        printf '%s/.beads/beads.db\n' "$r"
+    fi
 }
 
 # beads_endpoint <repo> -> the beadsd MCP url for that project, or empty.
@@ -45,6 +53,19 @@ canonical_db() {
 # line in ~/.config/beads/remotes.env.
 beads_endpoint() {
     f="${XDG_CONFIG_HOME:-$HOME/.config}/beads/remotes.env"
+    [ -f "$f" ] || return 0
+    sed -n "s/^$1=//p" "$f" | head -n1
+}
+
+# beads_local_dir <repo> -> absolute .beads directory for a repo whose tracker
+# lives OUTSIDE the repo (operator decision 2026-08-21: in-repo .beads means
+# every jj workspace carries a stale copy, which is how orphan beads happen).
+# One `repo=/abs/path/.beads` per line in ~/.config/beads/local.env. Empty for
+# repos without an entry — callers fall back to $ROOT/.beads as before. When a
+# repo later centralizes into beadsd, its remotes.env entry wins upstream of
+# every caller's local-dir check and the local.env line just gets removed.
+beads_local_dir() {
+    f="${XDG_CONFIG_HOME:-$HOME/.config}/beads/local.env"
     [ -f "$f" ] || return 0
     sed -n "s/^$1=//p" "$f" | head -n1
 }
