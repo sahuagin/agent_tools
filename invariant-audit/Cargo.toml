@@ -1,0 +1,27 @@
+[package]
+name = "invariant-audit"
+version = "0.1.0"
+edition = "2021"
+license = "BSD-3-Clause"
+description = "Enumerate every site of an architecture-invariant violation shape and ratchet the count; test regions from the tree-sitter parse tree."
+repository = "https://github.com/sahuagin/agent_tools"
+
+[[bin]]
+name = "invariant-audit"
+path = "src/main.rs"
+
+[dependencies]
+tree-regions = { path = "../tree-regions" }
+anyhow = "1"
+clap = { version = "4", features = ["derive", "env"] }
+globset = "0.4"
+ignore = "0.4"
+rayon = "1"
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+sha2 = "0.10"
+serde_json = "1"
+
+[dev-dependencies]
+tempfile = "3"

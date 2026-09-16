@@ -51,6 +51,7 @@ pub(super) fn collect_chunks_and_references(
     root: Node<'_>,
     source: &[u8],
     file: &Path,
+    cfg_test: &[tree_regions::Region],
 ) -> ExtractResult {
     let capture_names = query.capture_names();
 
@@ -90,7 +91,15 @@ pub(super) fn collect_chunks_and_references(
             let Ok(span_text) = span.utf8_text(source) else {
                 continue;
             };
-            let kind = chunk_kind_from_tag(tag);
+            let mut kind = chunk_kind_from_tag(tag);
+            // A definition inside a `#[cfg(test)]`-attributed item is test
+            // code whatever its name or path says: the parse tree decided
+            // (tree-regions, at-zzb). Recall's `looks_like_test` reads the
+            // kind, so inline test modules get the test weighting without
+            // heuristics.
+            if cfg_test.iter().any(|r| r.contains(span.start_byte())) {
+                kind = ChunkKind::Test;
+            }
 
             // Skip oversize module chunks — see MODULE_CHUNK_LIMIT_BYTES
             // doc for rationale. Inner items appear as their own chunks
