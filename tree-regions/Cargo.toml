@@ -1,0 +1,15 @@
+[package]
+name = "tree-regions"
+version = "0.1.0"
+edition = "2021"
+license = "BSD-3-Clause"
+description = "Regions of source files found from the tree-sitter parse tree: cfg(test) items in Rust, and the file's parse errors."
+repository = "https://github.com/sahuagin/agent_tools"
+
+[lib]
+name = "tree_regions"
+path = "src/lib.rs"
+
+[dependencies]
+tree-sitter = "0.25"
+tree-sitter-rust = "0.24"

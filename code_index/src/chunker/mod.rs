@@ -108,12 +108,20 @@ impl Chunker {
             .parse(source, None)
             .context("tree-sitter failed to parse source")?;
         let mut cursor = QueryCursor::new();
+        // `#[cfg(test)]` regions from the same tree, so test chunks are
+        // classified by the grammar (see extract.rs). A file the grammar
+        // could not fully parse still chunks; regions are then best effort.
+        let cfg_test = match self.language {
+            SupportedLanguage::Rust => tree_regions::cfg_test_regions(source, &tree),
+            SupportedLanguage::Python => Vec::new(),
+        };
         Ok(extract::collect_chunks_and_references(
             &self.query,
             &mut cursor,
             tree.root_node(),
             source,
             file,
+            &cfg_test,
         ))
     }
 }
@@ -246,6 +254,22 @@ mod tests {
             .expect("rs is supported")
             .expect("compiles");
         assert_eq!(r.language(), SupportedLanguage::Rust);
+    }
+
+    /// A definition inside an inline `#[cfg(test)]` module is a Test chunk
+    /// by the tree, whatever it is named (at-zzb); its product sibling is not.
+    #[test]
+    fn rust_cfg_test_module_items_are_test_chunks() {
+        let src =
+            "pub fn compute() {}\n#[cfg(test)]\nmod checks {\n    fn compute_roundtrip() {}\n}\n";
+        let chunks = Chunker::for_language(SupportedLanguage::Rust)
+            .unwrap()
+            .extract(src.as_bytes(), &PathBuf::from("src/lib.rs"))
+            .unwrap();
+        let kind_of = |n: &str| chunks.iter().find(|c| c.name == n).map(|c| c.kind).unwrap();
+        assert_eq!(kind_of("compute"), ChunkKind::Function);
+        assert_eq!(kind_of("compute_roundtrip"), ChunkKind::Test);
+        assert_eq!(kind_of("checks"), ChunkKind::Test);
     }
 
     #[test]
