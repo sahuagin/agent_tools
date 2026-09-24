@@ -9,23 +9,30 @@ The question is not "what is tree-sitter". It is **which engine, if any, do we
 adopt, and what is left for us to build** — including the answer "we write no
 query engine at all".
 
-## Platform decides most of the field
+## What actually runs here
 
-None of the candidates ship a FreeBSD binary. That is not fatal for the ones
-written in Rust, which build from source; it is fatal for the rest.
+Prebuilt binaries are the wrong question on FreeBSD — nobody ships them and
+open source gets built. The real question per engine is which toolchain the
+build needs and whether that toolchain is available.
 
-| engine | language | FreeBSD | verdict here |
+| engine | language | build path here | verdict |
 | --- | --- | --- | --- |
-| **ast-grep** | Rust | no prebuilt asset; **builds from source, verified** (`cargo install ast-grep --locked` → 0.45.3, exit 0) | usable |
-| **Semgrep** | Python wrapper over an OCaml core | wheels are macos / manylinux / musllinux / win only (1.178.0); sdist needs the OCaml toolchain, which is not installed | not usable without a Linux host |
-| **Comby** | OCaml | 2 release assets, no FreeBSD | not usable |
-| **CodeQL CLI** | prebuilt only | 10 assets, no FreeBSD | not usable |
-| **Joern** | JVM | 15 assets, no FreeBSD-specific; no `java` on PATH here | not usable as installed |
+| **ast-grep** | Rust | `cargo install ast-grep --locked` → 0.45.3, **built and verified** | usable today |
+| **Semgrep** | Python wrapper over an OCaml core | no port; `ocaml-4.14.2` and `ocaml-opam-2.5.2` ARE in ports, so semgrep-core is an opam source build, with `wheelfs` available to present the Python half | buildable, not attempted |
+| **Comby** | OCaml | no port; same opam route | buildable, not attempted |
+| **CodeQL CLI** | prebuilt, closed | no source build | not available |
+| **Joern** | JVM | would need a JDK; the operator does not want Java installed | ruled out by choice |
 | **dylint** | Rust | builds from source | usable; type-aware, see below |
-| **raw tree-sitter** | Rust, already vendored | `tree-regions` already depends on tree-sitter 0.25 + tree-sitter-rust 0.24 | usable; it is the build-it-ourselves baseline |
+| **raw tree-sitter** | Rust, already vendored | `tree-regions` already depends on tree-sitter 0.25 + tree-sitter-rust 0.24 | usable; the build-it-ourselves baseline |
 
-The review gate runs on this jail, so an engine that only runs on the Linux GPU
-box is an engine we cannot put in `pre-pr-check.sh`.
+"Not attempted" is the honest status for Semgrep and Comby: an opam build of
+someone else's OCaml project is a day of work with an uncertain end, and
+ast-grep already satisfies the requirement at 0.2 s. If ast-grep's rule
+language ever proves too weak, Semgrep's registry of existing rules is the
+reason to spend that day, and this row is where to start rather than
+re-deriving that it "has no FreeBSD wheel" — there are never FreeBSD wheels.
+
+The review gate runs on this jail, so whatever is chosen has to build here.
 
 ## What ast-grep actually does on our code
 
@@ -97,6 +104,17 @@ compiled against rustc's HIR; clippy's `await_holding_lock` is the prior art for
 exactly that shape) or a language server. Shapes that need taint — "does a
 transcript ever reach a cloud provider" — need CodeQL or Joern, neither of which
 runs here. Routing per shape is bead at-ast-query-detection-t4u.2.
+
+## On the macro ceiling, in proportion
+
+The blind spot is real but it is not a reason to withhold the capability. We
+have none of this utility today; a shape that catches most of its instances is
+a large improvement over a prose rule that catches none. The ceiling matters
+for how a shape is GRADED — enforcement may not claim completeness — not for
+whether it is worth having. The case to watch is a codebase where macros carry
+real logic rather than assertions and formatting: operator and comparison impls
+generated to remove boilerplate, for instance, are invisible in exactly the way
+that matters.
 
 ## Recommendation
 
