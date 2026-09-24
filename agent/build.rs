@@ -26,7 +26,11 @@ fn main() {
     let hh = secs_of_day / 3600;
     let mm = (secs_of_day % 3600) / 60;
     let ss = secs_of_day % 60;
-    let z = if days >= 0 { days + 719468 } else { days + 719468 - 1 };
+    let z = if days >= 0 {
+        days + 719468
+    } else {
+        days + 719468 - 1
+    };
     let era = if z >= 0 { z } else { z - 146096 } / 146097;
     let doe = (if z >= 0 { z } else { z - 146096 }) - era * 146097;
     let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
@@ -40,20 +44,36 @@ fn main() {
     println!("cargo:rustc-env=AGENT_BUILD_TIME={build_time_str}");
 
     // Change id: prefer jj (the repo's VCS), fall back to git.
-    let change_id = command_output("jj", &["log", "-r", "@-", "-T", "change_id.short()", "--no-graph"])
-        .or_else(|| command_output("git", &["rev-parse", "--short", "HEAD"]))
-        .unwrap_or_else(|| "unknown".to_string());
+    let change_id = command_output(
+        "jj",
+        &["log", "-r", "@-", "-T", "change_id.short()", "--no-graph"],
+    )
+    .or_else(|| command_output("git", &["rev-parse", "--short", "HEAD"]))
+    .unwrap_or_else(|| "unknown".to_string());
     println!("cargo:rustc-env=AGENT_CHANGE_ID={change_id}");
 
     // Dirty flag: jj status (working copy has changes) or git status --porcelain.
-    let dirty = if let Some(out) = command_output("jj", &["log", "-r", "@", "-T", "description.first_line()", "--no-graph"]) {
+    let dirty = if let Some(out) = command_output(
+        "jj",
+        &[
+            "log",
+            "-r",
+            "@",
+            "-T",
+            "description.first_line()",
+            "--no-graph",
+        ],
+    ) {
         // jj: clean if the description is "(empty)" or "(no description set)".
         out.contains("(empty)") || out.contains("(no description set)")
     } else {
         // git: clean if status --porcelain is empty.
-        command_output("git", &["status", "--porcelain"]).map_or(true, |s| s.is_empty())
+        command_output("git", &["status", "--porcelain"]).is_none_or(|s| s.is_empty())
     };
-    println!("cargo:rustc-env=AGENT_DIRTY={}", if dirty { "clean" } else { "dirty" });
+    println!(
+        "cargo:rustc-env=AGENT_DIRTY={}",
+        if dirty { "clean" } else { "dirty" }
+    );
 }
 
 fn command_output(program: &str, args: &[&str]) -> Option<String> {

@@ -36,13 +36,14 @@ fn build_version() -> &'static str {
     // Fallback to the Cargo.toml version if the env vars aren't set
     // (e.g. a stale binary built before at-g5u).
     static VERSION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    VERSION.get_or_init(|| {
-        let change_id = std::option_env!("AGENT_CHANGE_ID").unwrap_or("unknown");
-        let build_time = std::option_env!("AGENT_BUILD_TIME").unwrap_or("unknown");
-        let dirty = std::option_env!("AGENT_DIRTY").unwrap_or("unknown");
-        format!("0.1.0 ({change_id}, {build_time}, {dirty})")
-    })
-    .as_str()
+    VERSION
+        .get_or_init(|| {
+            let change_id = std::option_env!("AGENT_CHANGE_ID").unwrap_or("unknown");
+            let build_time = std::option_env!("AGENT_BUILD_TIME").unwrap_or("unknown");
+            let dirty = std::option_env!("AGENT_DIRTY").unwrap_or("unknown");
+            format!("0.1.0 ({change_id}, {build_time}, {dirty})")
+        })
+        .as_str()
 }
 
 #[derive(Subcommand)]
