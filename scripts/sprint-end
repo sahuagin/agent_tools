@@ -120,10 +120,11 @@ if [ -n "$BEAD" ]; then
         fi
         _after=$(_bead_field "$(beads --url "$ENDPOINT" show "$BEAD" 2>/dev/null || true)" status)
         printf 'sprint-end: %s is now %s\n' "$BEAD" "${_after:-unknown}"
-    elif [ -f "$ROOT/.beads/beads.db" ]; then
+    elif DB=$(canonical_db "$ROOT") && [ -f "$DB" ]; then
         # Local-DB path (repo not centralized into beadsd) — mirrors the
-        # sprint-start local claim branch; restored with at-0up.
-        DB="$ROOT/.beads/beads.db"
+        # sprint-start local claim branch; restored with at-0up. canonical_db
+        # honors a local.env external-tracker mapping before the in-repo path.
+        :
         _rec=$(br show "$BEAD" --db "$DB" --json 2>/dev/null || true)
         held=$(_bead_field "$_rec" assignee)
         state=$(_bead_field "$_rec" status)
