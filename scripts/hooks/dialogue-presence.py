@@ -27,6 +27,14 @@ CONTRACT WITH THE READER (presence.rs):
         anyway so `dialogue_peers` reports a registered_at.
   truth the key exists <=> the peer is live NOW.
 
+LABEL. If ~/.cache/dialogue-label-<session-id> exists, its text goes into the
+value as `label`, which `agent dialogue peers` shows: a few words saying what
+the session is working on. Anything may write that file (sprint-start, a slash
+command, the operator by hand), so this holder knows nothing about beads or
+titles. It is re-read on every renew, and a change is put under the SAME lease,
+so relabelling never touches liveness. The reader bounds and sanitizes the
+label again, since this is not the only writer of these keys.
+
 FAIL-OPEN, the same convention presence.rs uses on its read side: anything
 unconfigured or unreachable exits quietly and leaves activity-derived presence
 to carry on. A monitoring gap must never break messaging.
@@ -49,6 +57,7 @@ import base64
 import json
 import os
 import signal
+import stat
 import subprocess
 import sys
 import time
@@ -61,6 +70,11 @@ DEFAULT_PREFIX = "/mu/dialogue/v1/peers/"
 # enough that one missed keepalive is survivable.
 LEASE_TTL_SECS = 120
 HTTP_TIMEOUT_SECS = 5
+# `label_max_chars` in [dialogue.presence] is the same setting mu-dialogue's
+# presence.rs (in the mu repo) cuts at, with the same default. The file is read
+# only LABEL_READ_BYTES far, so a runaway write cannot bloat the key.
+DEFAULT_LABEL_MAX_CHARS = 64
+LABEL_READ_BYTES = 4096
 
 
 def log(msg: str) -> None:
@@ -82,8 +96,9 @@ def config_candidates() -> list[str]:
     ]
 
 
-def load_presence() -> tuple[list[str], str] | None:
-    """`[dialogue.presence]` as (endpoints, prefix), or None when not enabled.
+def load_presence() -> tuple[list[str], str, int] | None:
+    """`[dialogue.presence]` as (endpoints, prefix, label_max_chars), or None
+    when not enabled.
 
     Mirrors presence.rs::load: every "not configured" shape -- no file, no
     section, enabled false, no endpoints -- means run exactly as before.
@@ -103,8 +118,12 @@ def load_presence() -> tuple[list[str], str] | None:
         if not endpoints:
             return None
         prefix = section.get("prefix") or DEFAULT_PREFIX
+        label_max = section.get("label_max_chars", DEFAULT_LABEL_MAX_CHARS)
+        if not isinstance(label_max, int) or isinstance(label_max, bool) or label_max < 0:
+            log(f"label_max_chars {label_max!r} is not a count; using {DEFAULT_LABEL_MAX_CHARS}")
+            label_max = DEFAULT_LABEL_MAX_CHARS
         log(f"presence from {path}: {len(endpoints)} endpoint(s), prefix {prefix}")
-        return endpoints, prefix
+        return endpoints, prefix, label_max
     return None
 
 
@@ -127,6 +146,41 @@ def etcd_post(endpoints: list[str], path: str, payload: dict) -> dict | None:
 
 def b64(raw: str) -> str:
     return base64.b64encode(raw.encode()).decode()
+
+
+def label_path(sid: str) -> str:
+    return os.path.join(os.environ.get("HOME", "/tmp"), ".cache", f"dialogue-label-{sid}")
+
+
+def clean_label(raw: str, max_chars: int) -> str | None:
+    """Same rule as mu-dialogue's presence.rs::clean_label (mu repo): control characters read as
+    spaces, whitespace collapsed, ends trimmed, at most max_chars."""
+    spaced = "".join(" " if (ord(c) < 32 or 127 <= ord(c) < 160) else c for c in raw)
+    cut = " ".join(spaced.split())[:max_chars].rstrip()
+    return cut or None
+
+
+def read_label(sid: str, max_chars: int) -> str | None:
+    """The session's label, or None when there is no usable one.
+
+    A missing, unreadable or empty file all mean "no label"; none of them is a
+    reason to stop holding presence. Only a regular file is read, opened
+    non-blocking: anyone can put something at that path, and a FIFO there
+    would otherwise block the renew loop until the lease lapsed.
+    """
+    try:
+        fd = os.open(label_path(sid), os.O_RDONLY | os.O_NONBLOCK)
+    except OSError:
+        return None
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None
+        raw = os.read(fd, LABEL_READ_BYTES)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+    return clean_label(raw.decode("utf-8", errors="replace"), max_chars)
 
 
 def _ps_field(pid: int, field: str) -> str | None:
@@ -261,7 +315,7 @@ def main() -> int:
     if presence is None:
         log("presence not enabled; leaving activity-derived presence alone")
         return 0
-    endpoints, prefix = presence
+    endpoints, prefix, label_max = presence
 
     peer_id = f"cc:{sid}"
     key = f"{prefix}{peer_id}"
@@ -295,20 +349,29 @@ def main() -> int:
         log("lease grant failed; falling back to activity-derived presence")
         return 0
 
-    value = json.dumps(
-        {
+    registered_at = int(time.time() * 1000)
+
+    def value_for(label: str | None) -> str:
+        fields = {
             "peer_id": peer_id,
             "role": "cc",
-            "registered_at_unix_ms": int(time.time() * 1000),
+            "registered_at_unix_ms": registered_at,
             "host": os.uname().nodename,
             "pid": os.getpid(),
         }
-    )
-    put = etcd_post(
-        endpoints,
-        "/v3/kv/put",
-        {"key": b64(key), "value": b64(value), "lease": str(lease_id)},
-    )
+        if label is not None:
+            fields["label"] = label
+        return json.dumps(fields)
+
+    def put_key(lease: str, label: str | None) -> dict | None:
+        return etcd_post(
+            endpoints,
+            "/v3/kv/put",
+            {"key": b64(key), "value": b64(value_for(label)), "lease": str(lease)},
+        )
+
+    label = read_label(sid, label_max)
+    put = put_key(lease_id, label)
     if put is None:
         log("put failed; revoking the lease so nothing half-registered is left")
         etcd_post(endpoints, "/v3/lease/revoke", {"ID": str(lease_id)})
@@ -369,12 +432,25 @@ def main() -> int:
             new_id = (granted or {}).get("ID")
             if not new_id:
                 continue
+            new_label = read_label(sid, label_max)
+            if put_key(new_id, new_label) is None:
+                # Keep nothing from this attempt. lease_id stays the expired
+                # lease, so the next keepalive fails and this branch runs
+                # again; the new lease is revoked rather than left to renew
+                # with no key on it.
+                etcd_post(endpoints, "/v3/lease/revoke", {"ID": str(new_id)})
+                log("re-register put failed; will retry next cycle")
+                continue
             lease_id = new_id
-            etcd_post(
-                endpoints,
-                "/v3/kv/put",
-                {"key": b64(key), "value": b64(value), "lease": str(lease_id)},
-            )
+            label = new_label
+            continue
+        # The lease is fine; carry a changed label onto it. Same lease, so the
+        # key never lapses. On a failed put `label` keeps its old value and
+        # the next cycle tries again.
+        now_label = read_label(sid, label_max)
+        if now_label != label and put_key(lease_id, now_label) is not None:
+            log(f"label now {now_label!r}")
+            label = now_label
 
 
 if __name__ == "__main__":
