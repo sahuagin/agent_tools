@@ -6,3 +6,7 @@
 
 # local beads mirror — central beadsd is canonical
 .beads/
+
+# Python bytecode from the hook scripts (and from importing them in tests).
+__pycache__/
+*.pyc

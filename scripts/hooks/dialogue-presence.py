@@ -143,8 +143,45 @@ def _ps_field(pid: int, field: str) -> str | None:
 
 
 def process_command(pid: int) -> str | None:
-    """The pid's command line, or None when the process is gone."""
+    """The pid's command line, or None when `ps` could not answer.
+
+    NOT a liveness test. `ps` is a subprocess that can fail or time out under
+    load, and an unanswered question is not a dead process — reading it as one
+    is what dropped a live session's presence key twice (2026-10-08/09). Use
+    [`is_alive`] to decide whether a process exists; this is only for
+    identifying one.
+    """
     return _ps_field(pid, "command")
+
+
+def process_started(pid: int) -> str | None:
+    """When the process started, as `ps` reports it.
+
+    The identity check against pid REUSE. Unlike the command line this is not
+    something a process can change about itself: Claude Code rewrites its own
+    title (`claude … (JSCWarmUp)`), so matching on the title is matching on a
+    moving target.
+    """
+    return _ps_field(pid, "lstart")
+
+
+def is_alive(pid: int) -> bool:
+    """Does `pid` exist? Definitive, and no subprocess involved.
+
+    `os.kill(pid, 0)` sends nothing and reports existence. `ProcessLookupError`
+    is a real answer — the process is gone. `PermissionError` means it exists
+    and belongs to someone else, which still counts as alive.
+    """
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        # Anything else is inconclusive; never conclude death from it.
+        return True
+    return True
 
 
 def parent_of(pid: int) -> int:
@@ -248,6 +285,9 @@ def main() -> int:
     verified = watch_pid > 0
     if not verified:
         log("no Claude Code process to follow; will register without holding")
+    # Pin the identity ONCE, by start time, so pid reuse is caught without
+    # re-reading a title the process rewrites as it works.
+    watch_started = process_started(watch_pid) if verified else None
 
     granted = etcd_post(endpoints, "/v3/lease/grant", {"TTL": str(args.ttl)})
     lease_id = (granted or {}).get("ID")
@@ -300,10 +340,21 @@ def main() -> int:
 
     while True:
         time.sleep(interval)
-        cmd = process_command(watch_pid)
-        if cmd is None or "claude" not in cmd:
-            log(f"watched pid {watch_pid} is gone; dropping the lease")
+        # Existence first, and only a definitive answer ends the hold. The
+        # earlier version asked `ps` for the command line and treated a blank
+        # reply as death, so one failed subprocess dropped a live session's
+        # key — twice, observed.
+        if not is_alive(watch_pid):
+            log(f"watched pid {watch_pid} no longer exists; dropping the lease")
             drop()
+        # Then identity, against pid reuse. A start time that CHANGED means a
+        # different process now holds the number; a start time we simply could
+        # not read means nothing and is ignored.
+        if watch_started is not None:
+            now_started = process_started(watch_pid)
+            if now_started is not None and now_started != watch_started:
+                log(f"pid {watch_pid} was reused by another process; dropping the lease")
+                drop()
         alive = etcd_post(endpoints, "/v3/lease/keepalive", {"ID": str(lease_id)})
         # etcd answers a keepalive for an expired lease with a zero TTL. Treat
         # that as the registration being gone and put it back, rather than
