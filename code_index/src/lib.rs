@@ -130,6 +130,24 @@ pub trait Store {
     /// `default`); the caller decides how to disambiguate.
     fn find_chunks_by_name(&self, name: &str) -> Result<Vec<Chunk>>;
 
+    /// Adjacency lookup for one chunk, both directions, gated by
+    /// `min_confidence` — the read path behind "who calls this / what
+    /// does this call" (CLI `graph neighbors`, MCP `code_neighbors`).
+    /// Returns `(edge, other_chunk)` pairs ranked by `confidence DESC`
+    /// so the AST-certain edges surface before inferred ones, capped at
+    /// `limit` total. Direction is carried by the edge itself
+    /// (`from == chunk_id` → outgoing/callees; else incoming/callers).
+    /// Neighbor chunks come back fully materialized — unlike
+    /// `recall_top_k`'s scatter, the limit makes the join bounded and
+    /// a second `get_chunk` per row would just be a slower way to ask
+    /// the same query.
+    fn neighbors(
+        &self,
+        chunk_id: ChunkId,
+        min_confidence: f32,
+        limit: usize,
+    ) -> Result<Vec<(Edge, Chunk)>>;
+
     // manifest / staleness
     fn file_signature(&self, file: &Path) -> Result<Option<u64>>;
     fn set_file_signature(&mut self, file: &Path, hash: u64) -> Result<()>;

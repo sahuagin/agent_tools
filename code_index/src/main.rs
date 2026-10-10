@@ -166,6 +166,28 @@ enum GraphOp {
         after_long_help = "EXAMPLE:\n  code-index graph path 1421 8842   # chunk IDs from `recall` or sqlite\n\nDetail: code-index graph --help-ai"
     )]
     Path { from: i64, to: i64 },
+    /// Neighbors (callers/callees) of a symbol or chunk ID.
+    #[command(
+        after_long_help = "EXAMPLE:\n  code-index graph neighbors build_edges\n  code-index graph neighbors 1421 --min-confidence 0.8\n\nDetail: code-index graph --help-ai"
+    )]
+    Neighbors {
+        /// Exact chunk name (e.g. a function name) or numeric ChunkId.
+        /// Names are NOT unique in the chunk table — several definitions
+        /// can share one. An exact-unique name resolves automatically;
+        /// an ambiguous name prints the candidates and exits without
+        /// guessing, so re-run with the ChunkId you meant.
+        #[arg(value_name = "SYMBOL_OR_ID")]
+        symbol: String,
+        /// Drop edges below this confidence before ranking. The v1
+        /// resolver emits exactly three tiers: 1.0 same-file, 0.85
+        /// cross-file-unambiguous, 0.6 ambiguous-name. Default 0.0
+        /// (keep everything); 1.0 keeps only same-file-certain edges.
+        #[arg(long, default_value_t = 0.0)]
+        min_confidence: f32,
+        /// Max neighbors to print.
+        #[arg(short = 'n', long, default_value_t = 20)]
+        limit: usize,
+    },
     /// PageRank-style centrality. Prints top-N chunks by score.
     #[command(
         after_long_help = "EXAMPLE:\n  code-index graph centrality -n 20\n\nDetail: code-index graph --help-ai"
@@ -238,8 +260,12 @@ TYPICAL ARC (after `code-index ingest .`):
   code-index graph centrality -n 20               # PageRank top-N
   code-index graph communities -n 10 --min-size 10
   code-index graph path <from-id> <to-id>         # shortest path between two chunk IDs
+  code-index graph neighbors <symbol-or-id>       # callers/callees of one symbol
+                                                  # --min-confidence 1.0 = AST-certain only
 
 Find chunk IDs via `code-index recall ... --full` or sqlite on the chunks table.
+`neighbors` takes an exact symbol name too: ambiguous names (e.g. `new`) print
+candidate IDs instead of guessing.
 
 AGENT-ORIENTED HELP:
   code-index graph --help-ai [--json]";
@@ -1025,6 +1051,79 @@ fn main() -> Result<()> {
                                 }
                             }
                         }
+                    }
+                    Ok(())
+                }
+                GraphOp::Neighbors {
+                    symbol,
+                    min_confidence,
+                    limit,
+                } => {
+                    let store = open_store(cli.db.as_deref())?;
+                    // Numeric argument → ChunkId directly; otherwise an
+                    // exact-name lookup that refuses to disambiguate.
+                    let targets: Vec<code_index::Chunk> = if let Ok(id) = symbol.parse::<i64>() {
+                        match store.get_chunk(ChunkId(id))? {
+                            Some(c) => vec![c],
+                            None => {
+                                println!("no chunk with ChunkId({id})");
+                                return Ok(());
+                            }
+                        }
+                    } else {
+                        store.find_chunks_by_name(&symbol)?
+                    };
+                    if targets.is_empty() {
+                        println!(
+                            "no chunk named {:?} — check spelling, or find the id via `recall --full`",
+                            symbol
+                        );
+                        return Ok(());
+                    }
+                    if targets.len() > 1 {
+                        println!(
+                            "{:?} is defined by {} chunks — re-run with one of the ChunkIds:",
+                            symbol,
+                            targets.len()
+                        );
+                        for c in &targets {
+                            println!(
+                                "  {}  {:?} {}:{}-{}",
+                                c.id.0,
+                                c.kind,
+                                c.file.display(),
+                                c.lines.start,
+                                c.lines.end,
+                            );
+                        }
+                        return Ok(());
+                    }
+                    let target = &targets[0];
+                    let neighbors = store.neighbors(target.id, min_confidence, limit)?;
+                    let outgoing = neighbors.iter().filter(|(e, _)| e.from == target.id).count();
+                    println!(
+                        "neighbors of {:?} {} {}:{}-{} ({} outgoing, {} incoming, conf >= {min_confidence}):",
+                        target.kind,
+                        target.name,
+                        target.file.display(),
+                        target.lines.start,
+                        target.lines.end,
+                        outgoing,
+                        neighbors.len() - outgoing,
+                    );
+                    for (e, c) in &neighbors {
+                        let dir = if e.from == target.id { "calls->" } else { "<-called" };
+                        println!(
+                            "  {} {:?} {:.2} {} {:?} {}:{}-{}",
+                            dir,
+                            e.kind,
+                            e.confidence,
+                            c.name,
+                            c.kind,
+                            c.file.display(),
+                            c.lines.start,
+                            c.lines.end,
+                        );
                     }
                     Ok(())
                 }
