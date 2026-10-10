@@ -1,0 +1,4 @@
+{
+  "project_desc": "agent_tools (the agent CLI, its MCP server, and the Claude Code hooks and scripts that wire sessions into the mu mesh)",
+  "spec": { "id_pattern": "at-[a-z0-9]+", "dir": "specs/" }
+}
