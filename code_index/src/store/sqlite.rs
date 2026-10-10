@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
-use rusqlite::{params, Connection};
+use rusqlite::{named_params, params, Connection};
 
 use super::schema::{SCHEMA_V1, SCHEMA_V2};
 use crate::{Chunk, ChunkId, ChunkKind, Edge, EdgeKind, Store};
@@ -576,6 +576,72 @@ impl Store for SqliteStore {
         Ok(out)
     }
 
+    fn neighbors(
+        &self,
+        chunk_id: ChunkId,
+        min_confidence: f32,
+        limit: usize,
+    ) -> Result<Vec<(Edge, Chunk)>> {
+        // Both directions in one pass: the edge's `other` endpoint is
+        // whichever side isn't the queried chunk. ix_edges_from /
+        // ix_edges_to cover the two halves of the UNION ALL. Self-edges
+        // (recursion) appear once from the outgoing arm; the incoming
+        // arm is excluded for them so callers don't see duplicates.
+        let mut stmt = self.conn.prepare(
+            "SELECT e.from_id, e.to_id, e.kind, e.confidence,
+                    c.file, c.line_start, c.line_end, c.kind, c.name, c.signature_hash, c.text
+             FROM edges e JOIN chunks c
+               ON c.id = CASE WHEN e.from_id = :q THEN e.to_id ELSE e.from_id END
+             WHERE (e.from_id = :q OR (e.to_id = :q AND e.from_id != :q))
+               AND e.confidence >= :minc
+             ORDER BY e.confidence DESC
+             LIMIT :lim",
+        )?;
+        let rows = stmt.query_map(
+            named_params![
+                ":q": chunk_id.0,
+                ":minc": min_confidence as f64,
+                ":lim": limit as i64,
+            ],
+            |row| {
+                let from: i64 = row.get(0)?;
+                let to: i64 = row.get(1)?;
+                let kind: String = row.get(2)?;
+                let conf: f64 = row.get(3)?;
+                let file: String = row.get(4)?;
+                let line_start: i64 = row.get(5)?;
+                let line_end: i64 = row.get(6)?;
+                let ckind: String = row.get(7)?;
+                let name: String = row.get(8)?;
+                let sig: i64 = row.get(9)?;
+                let text: String = row.get(10)?;
+                Ok((
+                    Edge {
+                        from: ChunkId(from),
+                        to: ChunkId(to),
+                        kind: edge_kind_from_str(&kind)
+                            .unwrap_or(EdgeKind::References),
+                        confidence: conf as f32,
+                    },
+                    Chunk {
+                        id: ChunkId(if from == chunk_id.0 { to } else { from }),
+                        file: PathBuf::from(file),
+                        lines: (line_start as usize)..(line_end as usize),
+                        kind: chunk_kind_from_str(&ckind),
+                        name,
+                        signature_hash: sig as u64,
+                        text,
+                    },
+                ))
+            },
+        )?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
     fn file_signature(&self, file: &Path) -> Result<Option<u64>> {
         let f = file.to_string_lossy().to_string();
         let result: Result<i64, _> = self.conn.query_row(
@@ -718,6 +784,68 @@ mod tests {
         assert_eq!(s.iter_edges().unwrap().len(), 0);
         let no_recall = s.recall_top_k("test-model", &[0.1, 0.2, 0.3], 5).unwrap();
         assert!(no_recall.is_empty());
+    }
+
+    #[test]
+    fn neighbors_returns_both_directions_ranked_by_confidence() {
+        let mut s = SqliteStore::open_in_memory().expect("open");
+        let id_a = s
+            .upsert_chunk(&tmp_chunk("a", "x.rs", ChunkKind::Function))
+            .unwrap();
+        let id_b = s
+            .upsert_chunk(&tmp_chunk("b", "y.rs", ChunkKind::Function))
+            .unwrap();
+        let id_c = s
+            .upsert_chunk(&tmp_chunk("c", "z.rs", ChunkKind::Function))
+            .unwrap();
+        let id_d = s
+            .upsert_chunk(&tmp_chunk("d", "z.rs", ChunkKind::Function))
+            .unwrap();
+
+        // b -> a (0.85 cross-file), a -> c (1.0 same-file), d -> a (0.6)
+        for (from, to, conf) in [(id_b, id_a, 0.85), (id_a, id_c, 1.0), (id_d, id_a, 0.6)] {
+            s.upsert_edge(&Edge {
+                from,
+                to,
+                kind: EdgeKind::Calls,
+                confidence: conf,
+            })
+            .unwrap();
+        }
+
+        let n = s.neighbors(id_a, 0.0, 10).unwrap();
+        assert_eq!(n.len(), 3, "both directions");
+        // Ranked by confidence desc: c (1.0), b (0.85), d (0.6)
+        assert_eq!(n[0].1.name, "c");
+        assert_eq!(n[1].1.name, "b");
+        assert_eq!(n[2].1.name, "d");
+        // Direction lives on the edge: a->c is outgoing from a.
+        assert_eq!(n[0].0.from, id_a);
+        assert_eq!(n[1].0.to, id_a);
+
+        // Confidence gate drops the ambiguous edge.
+        let gated = s.neighbors(id_a, 0.8, 10).unwrap();
+        assert_eq!(gated.len(), 2);
+        // Limit binds.
+        assert_eq!(s.neighbors(id_a, 0.0, 1).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn neighbors_self_edge_appears_once() {
+        let mut s = SqliteStore::open_in_memory().expect("open");
+        let id_a = s
+            .upsert_chunk(&tmp_chunk("rec", "x.rs", ChunkKind::Function))
+            .unwrap();
+        s.upsert_edge(&Edge {
+            from: id_a,
+            to: id_a,
+            kind: EdgeKind::Calls,
+            confidence: 1.0,
+        })
+        .unwrap();
+        let n = s.neighbors(id_a, 0.0, 10).unwrap();
+        assert_eq!(n.len(), 1, "recursion shows once, not twice");
+        assert_eq!(n[0].0.from, id_a);
     }
 
     #[test]

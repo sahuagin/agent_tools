@@ -17,6 +17,7 @@ use code_index::embed::select_embedder;
 use code_index::recall::{self, RecallMode, RecallTuning, DEFAULT_TEST_PENALTY};
 use code_index::sources::{self, Sources, MIN_POPULATED_DB_SIZE};
 use code_index::store::SqliteStore;
+use code_index::Store;
 
 fn db_is_populated(path: &Path) -> bool {
     path.metadata()
@@ -98,6 +99,30 @@ struct StatusParams {
     db: Option<String>,
 }
 
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct NeighborsParams {
+    /// Exact symbol (function/method name) or numeric chunk id to expand.
+    /// Names are not unique across a codebase; an ambiguous name returns
+    /// the candidate chunk ids to disambiguate with.
+    symbol: String,
+    /// Drop edges below this resolver confidence. v1 emits 1.0 (same-file),
+    /// 0.85 (cross-file unambiguous), 0.6 (ambiguous name). Default 0.0
+    /// keeps all; raise to 0.85+ to ignore coin-flip edges.
+    #[serde(default)]
+    min_confidence: f32,
+    /// Max neighbors to return (default 20)
+    #[serde(default = "default_neighbor_limit")]
+    limit: usize,
+    /// Override the default DB path. Use a repo name (e.g. "mu") to
+    /// resolve ~/.cache/code_index/<name>.db, or an absolute path.
+    #[serde(default)]
+    db: Option<String>,
+}
+
+fn default_neighbor_limit() -> usize {
+    20
+}
+
 #[derive(Debug, Default, serde::Deserialize, schemars::JsonSchema)]
 struct SourcesParams {
     /// Machine-readable output: one TAB-separated
@@ -136,6 +161,26 @@ impl CodeIndexServer {
                 .map(Arc::new)
                 .map_err(|e| e.to_string()),
             None => Ok(self.db_path.clone()),
+        }
+    }
+
+    #[tool(
+        description = "Who calls this symbol and what it calls, from the indexed call/reference graph. Complements code_recall: recall finds code by meaning, code_neighbors follows structure (callers/callees) exactly. Ambiguous symbol names return candidate chunk ids instead of guessing."
+    )]
+    async fn code_neighbors(
+        &self,
+        Parameters(params): Parameters<NeighborsParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let db_path = match self.resolve_arg(params.db.as_ref()) {
+            Ok(p) => p,
+            Err(e) => return Ok(CallToolResult::error(vec![Content::text(e)])),
+        };
+        let result = tokio::task::spawn_blocking(move || neighbors_blocking(&db_path, &params))
+            .await
+            .map_err(|e| rmcp::ErrorData::internal_error(format!("task join: {e}"), None))?;
+        match result {
+            Ok(text) => Ok(CallToolResult::success(vec![Content::text(text)])),
+            Err(e) => Ok(CallToolResult::error(vec![Content::text(e)])),
         }
     }
 
@@ -212,7 +257,10 @@ impl ServerHandler for CodeIndexServer {
                 "Code index server. Use code_recall to search for symbols, concepts, \
                  or patterns in indexed repositories. Call code_sources to see which \
                  repositories are indexed and what to pass as `db` — do not guess a \
-                 repo name. Use code_status to check one index's health.",
+                 repo name. Use code_status to check one index's health. Use \
+                 code_neighbors to follow call/reference structure once you know a \
+                 symbol (who calls it, what it calls); recall finds the symbol, \
+                 neighbors shows its edges.",
             )
     }
 }
@@ -340,6 +388,95 @@ fn status_blocking(db_path: &Path) -> Result<String, String> {
             embed_info
         }
     ))
+}
+
+fn neighbors_blocking(db_path: &Path, params: &NeighborsParams) -> Result<String, String> {
+    if !db_path.is_file() {
+        return Err(format!(
+            "no index at {} (not creating it)",
+            db_path.display()
+        ));
+    }
+    let store = SqliteStore::open_existing_at(db_path).map_err(|e| format!("open db: {e}"))?;
+
+    let targets: Vec<code_index::Chunk> = if let Ok(id) = params.symbol.parse::<i64>() {
+        store
+            .get_chunk(code_index::ChunkId(id))
+            .map_err(|e| format!("get_chunk: {e}"))?
+            .map(|c| vec![c])
+            .unwrap_or_default()
+    } else {
+        store
+            .find_chunks_by_name(&params.symbol)
+            .map_err(|e| format!("find_chunks_by_name: {e}"))?
+    };
+    if targets.is_empty() {
+        return Ok(format!(
+            "no chunk named {:?} in {} — check the exact symbol name, or locate it with code_recall first.",
+            params.symbol,
+            db_path.display()
+        ));
+    }
+    if targets.len() > 1 {
+        // Refuse to guess: the name is defined multiple times. Surface
+        // candidate ids (metadata only, no bodies) for re-query.
+        let mut out = format!(
+            "{:?} is defined by {} chunks — re-run code_neighbors with one of the ids:\n",
+            params.symbol,
+            targets.len()
+        );
+        for c in targets.iter().take(20) {
+            out.push_str(&format!(
+                "  {}  {:?} {}:{}-{} {}\n",
+                c.id.0,
+                c.kind,
+                c.file.display(),
+                c.lines.start,
+                c.lines.end,
+                c.name,
+            ));
+        }
+        return Ok(out);
+    }
+
+    let target = &targets[0];
+    let neighbors = store
+        .neighbors(target.id, params.min_confidence, params.limit)
+        .map_err(|e| format!("neighbors: {e}"))?;
+    if neighbors.is_empty() {
+        return Ok(format!(
+            "{} {:?} ({}:{}-{}) has no edges at confidence >= {} in {} — if edges are missing entirely, `code-index graph build` was never run on this index (check code_status).",
+            target.name, target.kind, target.file.display(), target.lines.start, target.lines.end,
+            params.min_confidence, db_path.display(),
+        ));
+    }
+    let outgoing = neighbors
+        .iter()
+        .filter(|(e, _)| e.from == target.id)
+        .count();
+    let mut out = format!(
+        "neighbors of {:?} {} ({}:{}-{}): {} outgoing, {} incoming (min_confidence {})\n",
+        target.kind,
+        target.name,
+        target.file.display(),
+        target.lines.start,
+        target.lines.end,
+        outgoing,
+        neighbors.len() - outgoing,
+        params.min_confidence,
+    );
+    for (e, c) in &neighbors {
+        let dir = if e.from == target.id {
+            "calls->"
+        } else {
+            "<-called"
+        };
+        out.push_str(&format!(
+            "  {} {:?} {:.2} {:?} {} {}:{}-{}\n",
+            dir, e.kind, e.confidence, c.kind, c.name, c.file.display(), c.lines.start, c.lines.end,
+        ));
+    }
+    Ok(out)
 }
 
 /// Render the servable index set: configured sources first, then any other
