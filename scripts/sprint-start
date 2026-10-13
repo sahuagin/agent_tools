@@ -204,6 +204,15 @@ if [ -n "$BEAD" ]; then
 fi
 task_start_recall "$RECALL_QUERY" || true
 
+# Label the session with what it is now working on: "<bead>: <title>", or the
+# --no-bead label. The presence holder publishes it; the IRC gateway makes it
+# the session channel's topic. sprint-end takes it back.
+if [ -n "$BEAD" ]; then
+    sprint_set_label "$WS" "$BEAD${RECALL_QUERY:+: $RECALL_QUERY}"
+else
+    sprint_set_label "$WS" "$LABEL"
+fi
+
 printf '\n  repo:      %s\n  bead:      %s\n  actor:     %s\n  workspace: %s\n\n' \
     "$REPO" "${BEAD:-<none, label=$LABEL>}" "$ACTOR" "$WS"
 printf 'cd %s\n' "$WS"

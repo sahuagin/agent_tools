@@ -146,6 +146,11 @@ if [ -n "$BEAD" ]; then
     fi
 fi
 
+# The bead is released, so the session is no longer working on it: take its
+# label back (only if it is still this sprint's). Before teardown, which deletes
+# the sidecar that says which label that was; and with --keep too.
+sprint_clear_label "$WS"
+
 # Drop the etcd session identity (default) unless asked to keep it for further
 # sprints. Best-effort and idempotent: unregister only removes our own name, and
 # the lease would self-expire regardless.
