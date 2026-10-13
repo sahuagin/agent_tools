@@ -127,6 +127,44 @@ sprint_registered() {
     printf '%s\n' "${r:-0}"
 }
 
+# The label file the dialogue presence holder publishes for a Claude Code
+# session (scripts/hooks/dialogue-presence.py re-reads it on every renew). The
+# IRC gateway shows it as the session channel's topic.
+session_label_path() {
+    printf '%s/.cache/dialogue-label-%s\n' "${HOME:-/tmp}" "$1"
+}
+
+# sprint_set_label <workspace-dir> <label> -> label this session with <label>,
+# and record in the sidecar which session and which label, so sprint-end takes
+# back exactly this one. No session id, no label: a pid-based actor has no
+# presence key for it to appear on.
+sprint_set_label() {
+    sid="${CLAUDE_CODE_SESSION_ID:-}"
+    label=$(printf '%s' "$2" | head -n1 | tr -d '\r')
+    [ -n "$sid" ] && [ -n "$label" ] || return 0
+    f=$(session_label_path "$sid")
+    mkdir -p "$(dirname "$f")" || return 0
+    # Write-then-rename: the holder may read the file mid-write.
+    printf '%s\n' "$label" > "$f.$$" && mv "$f.$$" "$f" || { rm -f "$f.$$"; return 0; }
+    printf 'label_session=%s\nlabel=%s\n' "$sid" "$label" >> "$(sprint_sidecar "$1")"
+}
+
+# sprint_clear_label <workspace-dir> -> remove the label sprint_set_label wrote,
+# but only while the session still carries exactly that label. A later sprint in
+# the same session, or a label set by hand, is someone else's and stays.
+sprint_clear_label() {
+    f=$(sprint_sidecar "$1")
+    [ -f "$f" ] || return 0
+    sid=$(sed -n 's/^label_session=//p' "$f" | head -n1)
+    want=$(sed -n 's/^label=//p' "$f" | head -n1)
+    [ -n "$sid" ] && [ -n "$want" ] || return 0
+    lf=$(session_label_path "$sid")
+    if [ -f "$lf" ] && [ "$(head -n1 "$lf")" = "$want" ]; then
+        rm -f "$lf" && printf 'sprint-end: cleared session label\n'
+    fi
+    return 0
+}
+
 # sprint_clear_actor <workspace-dir> -> remove the sidecar (sprint-end teardown).
 sprint_clear_actor() {
     rm -f "$(sprint_sidecar "$1")" 2>/dev/null || true
