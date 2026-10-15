@@ -95,7 +95,55 @@ pub fn build_edges(store: &mut dyn Store) -> Result<EdgeBuildStats> {
                 }
             };
 
+            // Self-receiver veto (at-edges-receiver-scope-0ub). A
+            // `self.…` receiver inside an impl block targets a method of
+            // the enclosing type (or, via field access `self.field.m()`,
+            // of the field's type — unresolvable without types). Name
+            // matching alone resolves such calls to the WRONG type's
+            // method when the correct target is an external type's
+            // (never-ingested): the canonical case is graph.rs's
+            // `self.inner.neighbors()` (petgraph's Graph::neighbors)
+            // resolving to SqliteStore::neighbors — a single, unrelated
+            // Method candidate in the whole corpus.
+            //
+            // The veto fires only in the un-attributable geometry:
+            //   - reference carries a `self…` receiver text, AND
+            //   - the enclosing def is a Method (impl-block context —
+            //     `self` is bound to a real type here), AND
+            //   - there is exactly ONE candidate, it is kind=Method, and
+            //     it is cross-file.
+            // Same-file candidates survive (the file's own type owns the
+            // method); multi-candidate cases keep old tiebreak (choosing
+            // among candidates is at least *a* defensible read); a
+            // single Function-shaped candidate survives (path-style
+            // qualified calls, e.g. `Self::helper()` to an associated fn
+            // defined in the same file's other items). Everything else —
+            // ordinary `store.method()` cross-file edges to user types —
+            // is untouched: receiver-to-type resolution for non-self
+            // receivers needs binding analysis and stays future work;
+            // the @receiver capture now carries the text for it.
+            let enclosing_is_method = raw_ref
+                .containing_chunk_idx
+                .and_then(|i| parsed.chunks.get(i))
+                .map(|c| matches!(
+                    c.kind,
+                    crate::ChunkKind::Method
+                ))
+                .unwrap_or(false);
             let candidates = store.find_chunks_by_name(&raw_ref.name)?;
+            if raw_ref.kind == crate::EdgeKind::Calls
+                && enclosing_is_method
+                && raw_ref
+                    .receiver
+                    .as_deref()
+                    .is_some_and(|r| r.trim().trim_start_matches('&').starts_with("self"))
+                && candidates.len() == 1
+                && candidates[0].kind == crate::ChunkKind::Method
+                && candidates[0].file != file
+            {
+                stats.references_unresolved += 1;
+                continue;
+            }
             let (target, confidence) = pick_target(&file, &candidates);
 
             match target {
@@ -213,6 +261,57 @@ fn inner_call() {}
             .expect("call site captured");
         assert_eq!(ref_from_outer.containing_chunk_idx, Some(outer_idx));
         assert_eq!(ref_from_outer.kind, EdgeKind::Calls);
+    }
+
+    #[test]
+    fn self_receiver_refuses_single_crossfile_method_candidate() {
+        // at-edges-receiver-scope-0ub ground truth (field-observed):
+        // graph.rs does `self.inner.neighbors()` — a petgraph method on
+        // an external (never-ingested) type — while SqliteStore::neighbors
+        // in another file is the ONLY chunk named `neighbors`. Pre-fix a
+        // 0.85 false edge was emitted; the veto must refuse it.
+        let dir = tempdir();
+        write(
+            &dir.join("graph.rs"),
+            "impl G {\n    fn stats(&self) { self.inner.neighbors(); }\n}\n",
+        );
+        write(
+            &dir.join("sqlite.rs"),
+            "impl SqliteStore {\n    pub fn neighbors(&self) {}\n}\n",
+        );
+        let mut s = SqliteStore::open_in_memory().unwrap();
+        ingest(&dir, &mut s, None).unwrap();
+
+        let stats = build_edges(&mut s).unwrap();
+        let edges = s.iter_edges().unwrap();
+        assert!(
+            edges.is_empty(),
+            "expected NO edge from graph.rs into sqlite::neighbors, got {edges:?}"
+        );
+        assert!(stats.references_unresolved >= 1);
+    }
+
+    #[test]
+    fn self_receiver_keeps_same_file_method() {
+        // The veto must NOT refuse same-file methods: `self.helper()`
+        // hitting the file's own method is what `self.` usually means.
+        let dir = tempdir();
+        write(
+            &dir.join("a.rs"),
+            "impl A {\n    fn helper(&self) {}\n    fn run(&self) { self.helper(); }\n}\n",
+        );
+        let mut s = SqliteStore::open_in_memory().unwrap();
+        ingest(&dir, &mut s, None).unwrap();
+
+        let stats = build_edges(&mut s).unwrap();
+        let edges = s.iter_edges().unwrap();
+        assert_eq!(
+            edges.len(),
+            1,
+            "self.helper() -> same-file helper should still resolve"
+        );
+        // (the lone unresolved ref is the traitless `impl A` type
+        // reference — pre-existing behavior, unrelated to the veto)
     }
 
     #[test]
