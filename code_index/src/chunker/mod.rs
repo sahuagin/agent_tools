@@ -147,6 +147,12 @@ pub struct RawReference {
     /// Index into `ExtractResult.chunks`; the chunk whose span contains
     /// this reference. `None` for file-level references.
     pub containing_chunk_idx: Option<usize>,
+    /// For qualified member calls (`x.foo()`, Python `obj.bar()`): the
+    /// receiver expression text as written (e.g. "self.inner", "store").
+    /// `None` for bare `foo()` references. Captured by the `@receiver`
+    /// pattern in the tags queries; consumed by edge resolution for
+    /// same-file definition veto (at-edges-receiver-scope-0ub).
+    pub receiver: Option<String>,
 }
 
 pub(crate) fn edge_kind_from_reference_tag(tag: &str) -> EdgeKind {

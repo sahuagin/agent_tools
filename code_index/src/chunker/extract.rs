@@ -64,6 +64,7 @@ pub(super) fn collect_chunks_and_references(
     while let Some(m) = matches.next() {
         let mut name_node: Option<Node<'_>> = None;
         let mut span_node: Option<Node<'_>> = None;
+        let mut receiver_node: Option<Node<'_>> = None;
         let mut def_tag: Option<&str> = None;
         let mut ref_tag: Option<&str> = None;
 
@@ -77,6 +78,11 @@ pub(super) fn collect_chunks_and_references(
             } else if let Some(rest) = capname.strip_prefix("reference.") {
                 span_node = Some(cap.node);
                 ref_tag = Some(rest);
+            } else if capname == "receiver" {
+                // Qualified-call receiver expression (may be a complex
+                // expr — `self.inner`, `ctx.client`); keep the node, the
+                // text is materialized per reference below.
+                receiver_node = Some(cap.node);
             }
         }
 
@@ -131,11 +137,15 @@ pub(super) fn collect_chunks_and_references(
         } else if let Some(tag) = ref_tag {
             // Reference: keep the byte position so we can attribute it
             // to a containing chunk after definitions are finalized.
+            let receiver = receiver_node
+                .and_then(|n| n.utf8_text(source).ok())
+                .map(|t| t.trim().to_string());
             raw_refs.push((
                 RawReference {
                     name: name_text.to_string(),
                     kind: edge_kind_from_reference_tag(tag),
                     containing_chunk_idx: None,
+                    receiver,
                 },
                 span.start_byte(),
             ));
