@@ -79,6 +79,20 @@ pub fn build_edges(store: &mut dyn Store) -> Result<EdgeBuildStats> {
             })
             .collect();
 
+        // Ghost-edge prevention (at-edges-ghost-stale-build-f70): clear
+        // this file's outgoing edges before re-emitting them. build_edges
+        // upserts per reference, so an edge emitted by an OLDER resolver
+        // (before a veto/rule change) would otherwise survive forever even
+        // though the current resolver refuses to emit it — the observed
+        // case was the three graph.rs petgraph false edges outliving the
+        // #80 self-receiver veto by a full rebuild. Deletion is keyed by
+        // the from-side chunk, which is always one of this file's chunks
+        // (edges are emitted from a containing chunk of the parsed file),
+        // so per-file delete-then-emit is complete.
+        for d in &db_chunks {
+            store.delete_edges_from(d.id)?;
+        }
+
         stats.files_processed += 1;
 
         for raw_ref in &parsed.references {
@@ -203,7 +217,7 @@ mod tests {
     use crate::chunker::{Chunker, SupportedLanguage};
     use crate::ingest::ingest;
     use crate::store::SqliteStore;
-    use crate::EdgeKind;
+    use crate::{ChunkKind, EdgeKind};
     use std::path::Path;
 
     fn write(path: &Path, content: &str) {
@@ -443,6 +457,62 @@ fn inner_call() {}
             edges_first.len(),
             edges_second.len(),
             "second build_edges run must not duplicate edges (UNIQUE on from_id, to_id, kind)"
+        );
+    }
+
+    #[test]
+    fn build_edges_removes_ghosts_from_older_resolvers() {
+        // The at-edges-ghost-stale-build regression: build_edges upserted,
+        // so an edge emitted by an older resolver survived forever even
+        // after the current resolver refused to emit it (observed live:
+        // the three graph.rs petgraph false edges outlived the #80
+        // self-receiver veto by a full rebuild). Inject a ghost — an edge
+        // whose reference the current resolver will not reproduce — and
+        // require that a rebuild deletes it.
+        let dir = tempdir();
+        write(
+            &dir.join("a.rs"),
+            "fn caller() {\n    callee();\n}\nfn callee() {}\n",
+        );
+        let mut s = SqliteStore::open_in_memory().unwrap();
+        ingest(&dir, &mut s, None).unwrap();
+
+        build_edges(&mut s).unwrap();
+        let caller = s
+            .find_chunks_by_name("caller")
+            .unwrap()
+            .into_iter()
+            .find(|c| c.kind == ChunkKind::Function)
+            .unwrap()
+            .id;
+        let ghost_target = s
+            .find_chunks_by_name("callee")
+            .unwrap()
+            .into_iter()
+            .find(|c| c.kind == ChunkKind::Function)
+            .unwrap()
+            .id;
+        // Simulate an edge that only an older, more-gullible resolver
+        // would have emitted: same from/to, but a kind+confidence pair
+        // current resolution never produces for this reference.
+        s.upsert_edge(&Edge {
+            from: caller,
+            to: ghost_target,
+            kind: EdgeKind::Implements,
+            confidence: 0.42,
+        })
+        .unwrap();
+        let before = s.iter_edges().unwrap().len();
+        assert!(
+            before >= 2,
+            "ghost injected on top of the real edge (before={before})"
+        );
+
+        build_edges(&mut s).unwrap();
+        let after = s.iter_edges().unwrap();
+        assert!(
+            !after.iter().any(|e| e.confidence == 0.42),
+            "ghost edge (confidence 0.42) survived a rebuild — delete-then-emit per file is not happening"
         );
     }
 }
